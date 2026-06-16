@@ -17,7 +17,6 @@ Use-cases include:
 * Reclaiming raw capacity by converting from replication to erasure coding
 * Reclaiming raw capacity by converting EC pool files to a wider EC profile
 
-
 Two scripts are provided:
 
 * `vcephfs-transcode-setup.sh` sets up a CephFS volume for migration of existing files,
@@ -39,10 +38,12 @@ Two scripts are provided:
 
 Note that both require a CephX client user with the `p` [capability flag](https://docs.ceph.com/en/latest/cephfs/client-auth/).
 
+Some feel that what this utility accomplishes does not qualify as transcoding.
+Tough. Marcan42 called it that, and so it remains.
+
 Usage:
 
 ```
-# /usr/local/sbin/vcephfs-transcode-setup.sh
 Usage:
   vcephfs-transcode-setup.sh [OPTIONS]
 
@@ -64,6 +65,7 @@ Options:
     profile:  ec<k>.<m><class>       e.g. ec8.2hdd
     rule:     ec<k>.<m>-rule-<class> e.g. ec8.2-rule-hdd
     pool:     cephfs.<vol>.ec<k>.<m>.<class>.data
+  --pg-num INT           PG count for new pool (default: 128)
   --tmpdir PATH          Temp dir for transcoder (default: mount/tmp)
   --fastec               Enable allow_ec_optimizations (FastEC)
   --compression MODE     Compression mode for new pool (default: aggressive)
@@ -82,43 +84,38 @@ Options:
   --execute              Actually run commands (default: dry-run)
   --help                 Show this help
 
-# /usr/local/sbin/vcephfs-transcode-setup.sh
-Usage:
-  vcephfs-transcode-setup.sh [OPTIONS]
-
-Options:
-  --mount PATH           Mount point for the volume
-                         (e.g. /shared/cephlab/howie)
-                         Volume name is derived from the last path
-                         component (e.g. "howie").
-  --ec-k INT             EC data chunks
-  --ec-m INT             EC parity chunks
-  --ec-plugin NAME       EC plugin (default: isa)
-  --crush-device-class CLASS
-                         Device class: ssd or hdd
-
-  EC profile, CRUSH rule, and pool name are derived automatically:
-    profile:  ec<k>.<m><class>       e.g. ec8.2hdd
-    rule:     ec<k>.<m>-rule-<class> e.g. ec8.2-rule-hdd
-    pool:     cephfs.<vol>.ec<k>.<m>.<class>.data
-  --tmpdir PATH          Temp dir for transcoder (default: mount/tmp)
-  --fastec               Enable allow_ec_optimizations (FastEC)
-  --compression MODE     Compression mode for new pool (default: aggressive)
-                         (e.g. "aggressive", "force", "passive", "none")
-  --compression-algorithm ALG
-                         Compression algorithm (default: snappy)
-                         (e.g. "snappy", "zstd", "lz4", "zlib")
-  --min-age DAYS         Min file age in days (default: 1)
-  --min-size SIZE        Min file size (e.g. "1M", "300K")
-  --subdir PATH           Subdirectory under mount to transcode
-                         (e.g. "ethel/merman")
-  --log-file PATH        Log file for transcoder
-  --skip-pool-setup      Skip pool creation (already done)
-  --skip-layout          Skip layout / setfattr steps
-  --transcode            Run the transcoder (off by default)
-  --execute              Actually run commands (default: dry-run)
-  --help                 Show this help
 ```
+
+
+```
+usage: vcephfs_transcoder.py [-h] [--tmpdir TMPDIR] [--process-hardlinks] [--debug] [--min-age MIN_AGE] [--min-size SIZE] [--max-size SIZE] [--threads THREADS] [--dry-run] [--log-file LOG_FILE] [--no-copy-file-range]
+                             [--max-files MAX_FILES]
+                             dirs [dirs ...]
+
+Transcode cephfs files to their directory layout
+
+positional arguments:
+  dirs                  Directories to scan
+
+options:
+  -h, --help            show this help message and exit
+  --tmpdir TMPDIR       Temporary directory to which to copy files. Important: This directory should have its layout set to the *default* data pool for the FS, to avoid excess backtrace objects.
+  --process-hardlinks   Process files with nlink > 1, which is potentially dangerous
+  --debug, -d
+  --min-age MIN_AGE, -m MIN_AGE
+                        Minimum age of file before transcoding, in days
+  --min-size SIZE       Skip files smaller than this size. Suffix B/K/M/G (binary); plain number means bytes. 0 disables.
+  --max-size SIZE       Skip files larger than this size (same format as --min-size). Omit for no upper limit.
+  --threads THREADS, -t THREADS
+                        Number of threads for data copying
+  --dry-run, -n         Perform transcode but do not replace files
+  --log-file LOG_FILE   Also log to this file
+  --no-copy-file-range  Disable use of copy_file_range and always use userspace copy
+  --max-files MAX_FILES
+                        Stop after submitting this many files for transcoding
+```
+
+
 
 Example invocations:
 ```

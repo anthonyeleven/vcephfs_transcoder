@@ -7,7 +7,7 @@
 #
 # MIT license (https://opensource.org/license/mit)
 
-import errno
+import errno, shlex
 import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
 import threading, uuid, argparse
@@ -20,6 +20,106 @@ thread_count = None
 # We check explicitly rather than hardcoding 61, which means ECONNREFUSED on
 # macOS/BSD.
 ENODATA = getattr(errno, "ENODATA", 61)
+
+# ---------------------------------------------------------------------------
+# copy_file_range support
+# ---------------------------------------------------------------------------
+# On CephFS the kernel client can turn copy_file_range into OSD-to-OSD object
+# copies, so data never transits the client.  We try three strategies:
+#
+#  1. os.copy_file_range  (Python >= 3.12)
+#  2. glibc wrapper via ctypes  (glibc >= 2.27, i.e. any distro from ~2018+)
+#  3. shutil.copyfileobj  (universal fallback)
+
+import ctypes
+import ctypes.util
+
+def _probe_copy_file_range():
+    """Return a (cfr_func, label) tuple or (None, None)."""
+    # Strategy 1 – native Python (3.12+)
+    if hasattr(os, "copy_file_range"):
+        return os.copy_file_range, "os.copy_file_range"
+
+    # Strategy 2 – ctypes into glibc
+    libc_name = ctypes.util.find_library("c")
+    if libc_name:
+        try:
+            libc = ctypes.CDLL(libc_name, use_errno=True)
+            _cfr = libc.copy_file_range
+            # ssize_t copy_file_range(int fd_in, off64_t *off_in,
+            #                         int fd_out, off64_t *off_out,
+            #                         size_t len, unsigned int flags)
+            _cfr.argtypes = [
+                ctypes.c_int,                        # fd_in
+                ctypes.POINTER(ctypes.c_int64),      # off_in  (NULL → use fd offset)
+                ctypes.c_int,                        # fd_out
+                ctypes.POINTER(ctypes.c_int64),      # off_out (NULL → use fd offset)
+                ctypes.c_size_t,                     # len
+                ctypes.c_uint,                       # flags
+            ]
+            _cfr.restype = ctypes.c_ssize_t
+
+            def _ctypes_cfr(fd_in, fd_out, count):
+                n = _cfr(fd_in, None, fd_out, None, count, 0)
+                if n < 0:
+                    err = ctypes.get_errno()
+                    raise OSError(err, os.strerror(err))
+                return n
+
+            return _ctypes_cfr, "ctypes/glibc"
+        except (OSError, AttributeError):
+            pass
+
+    return None, None
+
+
+_cfr_func, _cfr_label = _probe_copy_file_range()
+
+# Errors that mean copy_file_range can't handle this particular fd pair and we
+# should fall back to a userspace copy.
+_CFR_FALLBACK_ERRNOS = frozenset({
+    getattr(errno, "ENOSYS", None),     # syscall not available
+    getattr(errno, "EXDEV", None),      # cross-device
+    getattr(errno, "EOPNOTSUPP", None), # FS doesn't implement it
+    getattr(errno, "EINVAL", None),     # layout incompatibility / bad range
+    getattr(errno, "EBADF", None),      # fd type not supported
+} - {None})
+
+
+def _copy_file_data(ifd, ofd, file_size, buf_size):
+    """Copy file data, preferring copy_file_range for potential server-side
+    copies on CephFS, with automatic fallback to shutil.copyfileobj.
+    Returns a short string describing the strategy used."""
+    if _cfr_func is None or file_size == 0:
+        shutil.copyfileobj(ifd, ofd, buf_size)
+        return "userspace"
+
+    copied = 0
+    try:
+        while copied < file_size:
+            chunk = min(file_size - copied, buf_size)
+            n = _cfr_func(ifd.fileno(), ofd.fileno(), chunk)
+            if n == 0:
+                # EOF earlier than expected (file may have been truncated)
+                break
+            copied += n
+        return "copy_file_range"
+    except OSError as e:
+        if e.errno not in _CFR_FALLBACK_ERRNOS:
+            raise
+        # Partial data may already have been written; seek both fds to the
+        # same offset and finish with a userspace copy.
+        logging.debug(
+            f"copy_file_range fell back after {copied} bytes "
+            f"(errno {e.errno}: {os.strerror(e.errno)}), "
+            f"finishing with userspace copy"
+        )
+        ofd.seek(copied)
+        ifd.seek(copied)
+        shutil.copyfileobj(ifd, ofd, buf_size)
+        if copied > 0:
+            return f"copy_file_range+userspace (fallback at {copied} bytes)"
+        return "userspace (copy_file_range unsupported)"
 
 
 def parse_byte_size(s):
@@ -59,6 +159,17 @@ def validate_age_bounds(min_age):
         raise ValueError("--min-age must be greater than 0")
 
 
+def positive_int(value):
+    """Argparse type for a strictly positive integer."""
+    try:
+        n = int(value)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError(f"invalid positive integer: {value!r}")
+    if n <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {n}")
+    return n
+
+
 @dataclasses.dataclass
 class Stats:
     files_submitted: int = 0
@@ -72,14 +183,24 @@ class Stats:
     files_skipped_large: int = 0
     files_failed: int = 0
     bytes_copied: int = 0
+    copy_seconds: float = 0.0
     _lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
     def log_progress(self):
+        avg = self._avg_throughput_str()
         logging.info(
             f"Progress: {self.files_transcoded} transcoded, "
             f"{self.files_failed} failed, "
             f"{self.bytes_copied / (1024**3):.1f} GiB copied"
+            f"{avg}"
         )
+
+    def _avg_throughput_str(self):
+        """Return a formatted aggregate throughput suffix, or '' if no data."""
+        if self.copy_seconds > 0:
+            mbps = (self.bytes_copied / (1024**2)) / self.copy_seconds
+            return f", avg {mbps:.1f} MiB/s"
+        return ""
 
 
 stats = Stats()
@@ -197,14 +318,27 @@ def process_file(args, filepaths, st, layout, file_layout):
                         stats.files_skipped_open += 1
                     os.unlink(tmp_file)
                     return
-                shutil.copyfileobj(ifd, ofd, layout.object_size)
+                copy_start = time.monotonic()
+                copy_method = _copy_file_data(ifd, ofd, st.st_size, layout.object_size)
                 # Flush to disk before we compare stats
                 ofd.flush()
                 os.fsync(ofd.fileno())
+                copy_elapsed = time.monotonic() - copy_start
                 # Lock released when ifd is closed
 
         shutil.copystat(filepaths[0], tmp_file, follow_symlinks=False)
         os.chown(tmp_file, st.st_uid, st.st_gid)
+
+        if copy_elapsed > 0:
+            mbps = (st.st_size / (1024**2)) / copy_elapsed
+            logging.info(
+                f"Copied {filepaths[0]} [{st.st_size} bytes] in {copy_elapsed:.2f}s "
+                f"({mbps:.1f} MiB/s) via {copy_method}"
+            )
+        else:
+            logging.info(
+                f"Copied {filepaths[0]} [{st.st_size} bytes] in <1ms via {copy_method}"
+            )
 
     except Exception:
         # Clean up temp file on any failure during copy
@@ -265,6 +399,7 @@ def process_file(args, filepaths, st, layout, file_layout):
             with stats._lock:
                 stats.files_transcoded += 1
                 stats.bytes_copied += st.st_size
+                stats.copy_seconds += copy_elapsed
 
         except Exception:
             # If we fail mid-rename, attempt to clean up the temp file
@@ -289,8 +424,11 @@ def handler(future):
 
 
 def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts):
+    def _limit_reached():
+        return args.max_files is not None and stats.files_submitted >= args.max_files
+
     for dirpath, dirnames, filenames in os.walk(start_dir, topdown=True):
-        if do_exit.is_set():
+        if do_exit.is_set() or _limit_reached():
             return
         if dirpath in mountpoints:
             logging.warning(f"Skipping {dirpath}: path is a mountpoint")
@@ -323,7 +461,7 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
         dir_layouts[dirpath] = layout
 
         def submit(filepaths, st, file_layout, _layout=layout):
-            if do_exit.is_set():
+            if do_exit.is_set() or _limit_reached():
                 return
             thread_count.acquire()
             try:
@@ -338,7 +476,7 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
         last_progress = time.monotonic()
 
         for filename in filenames:
-            if do_exit.is_set():
+            if do_exit.is_set() or _limit_reached():
                 return
 
             if time.monotonic() - last_progress > 60:
@@ -564,6 +702,17 @@ def main():
         help="Perform transcode but do not replace files",
     )
     parser.add_argument("--log-file", help="Also log to this file")
+    parser.add_argument(
+        "--no-copy-file-range",
+        action="store_true",
+        help="Disable use of copy_file_range and always use userspace copy",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=positive_int,
+        default=None,
+        help="Stop after submitting this many files for transcoding",
+    )
 
     args = parser.parse_args()
     try:
@@ -587,11 +736,28 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=handlers,
     )
+    cmdline = shlex.join(sys.argv)
+    logging.info(f"Starting: {cmdline}")
+
     if os.geteuid() != 0:
         logging.error("This tool must be run as root (requires chown).")
         sys.exit(1)
 
+    global _cfr_func, _cfr_label
+    if args.no_copy_file_range:
+        _cfr_func, _cfr_label = None, None
+
+    if _cfr_label:
+        logging.info(f"Using copy_file_range via {_cfr_label} (server-side copy when supported by CephFS)")
+    elif args.no_copy_file_range:
+        logging.info("copy_file_range disabled via --no-copy-file-range, using userspace copy")
+    else:
+        logging.info("copy_file_range not available, using userspace copy")
+
     layout = get_layout_walking_up(args.tmpdir)
+
+    if args.max_files is not None:
+        logging.info(f"Will stop after transcoding {args.max_files} file(s)")
 
     if layout is None:
         logging.error(
@@ -620,6 +786,9 @@ def main():
 
     process_files(args)
 
+    if args.max_files is not None and stats.files_submitted >= args.max_files:
+        logging.info(f"Stopped early: --max-files limit of {args.max_files} reached")
+
     logging.info(
         f"Complete: {stats.files_transcoded} transcoded, "
         f"{stats.files_failed} failed, "
@@ -631,7 +800,9 @@ def main():
         f"{stats.files_skipped_small} below min-size, "
         f"{stats.files_skipped_large} above max-size, "
         f"{stats.bytes_copied / (1024**3):.1f} GiB copied"
+        f"{stats._avg_throughput_str()}"
     )
+    logging.info(f"Finished: {cmdline}")
 
 
 if __name__ == "__main__":
