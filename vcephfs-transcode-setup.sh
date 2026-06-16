@@ -42,6 +42,7 @@
 #     profile:  ec<k>.<m><class>       e.g. ec8.2hdd
 #     rule:     ec<k>.<m>-rule-<class> e.g. ec8.2-rule-hdd
 #     pool:     cephfs.<vol>.ec<k>.<m>.<class>.data
+#   --pg-num INT           PG count for new pool (default: 128)
 #   --tmpdir PATH          Temp dir for transcoder (default: mount/tmp)
 #   --fastec               Enable allow_ec_optimizations (FastEC)
 #   --compression MODE     Compression mode for new pool (default: aggressive)
@@ -82,6 +83,7 @@ EC_K=""
 EC_M=""
 CRUSH_DEVICE_CLASS=""
 REPLICATED=false
+PG_NUM=128
 
 # --- Helpers ----------------------------------------------------------------
 usage() {
@@ -143,6 +145,7 @@ while [ $# -gt 0 ]; do
         --ec-plugin)         EC_PLUGIN="$2";           shift 2 ;;
         --crush-device-class) CRUSH_DEVICE_CLASS="$2"; shift 2 ;;
         --replicated)        REPLICATED=true;          shift   ;;
+        --pg-num)            PG_NUM="$2";              shift 2 ;;
         --tmpdir)            TRANSCODE_TMPDIR_OVERRIDE="$2";     shift 2 ;;
         --fastec)          FASTEC=true;            shift   ;;
         --compression)       COMPRESSION="$2";         shift 2 ;;
@@ -163,6 +166,8 @@ done
 # --- Validate ---------------------------------------------------------------
 require_arg MOUNT
 [[ "$MIN_AGE" =~ ^[1-9][0-9]*$ ]] || { log_err "--min-age must be a positive integer"; exit 1; }
+[[ "$PG_NUM" =~ ^[1-9][0-9]*$ ]] || { log_err "--pg-num must be a positive integer"; exit 1; }
+(( (PG_NUM & (PG_NUM - 1)) == 0 )) || { log_err "--pg-num must be a power of 2 (got ${PG_NUM})"; exit 1; }
 
 # Derive volume name from the last component of the mount path
 # e.g. /shared/cephlab/howie -> howie
@@ -265,6 +270,7 @@ echo "  Device class:     ${CRUSH_DEVICE_CLASS}"
 echo "  CRUSH rule:       ${CRUSH_RULE}"
 fi
 echo "  Pool name:        ${POOL_NAME}"
+echo "  PG num:           ${PG_NUM}"
 echo "  Compression:      ${COMPRESSION} (${COMPRESSION_ALG})"
 echo "  Temp dir:         ${TRANSCODE_TMPDIR}"
 if [ "$REPLICATED" = false ]; then
@@ -303,8 +309,8 @@ if [ "$SKIP_POOL_SETUP" = false ]; then
         if pool_exists "${POOL_NAME}"; then
             log_info "Pool '${POOL_NAME}' already exists, skipping creation"
         else
-            log_info "Pool 1: Create replicated data pool '${POOL_NAME}'"
-            run ceph osd pool create "${POOL_NAME}" replicated
+            log_info "Pool 1: Create replicated data pool '${POOL_NAME}' (pg_num=${PG_NUM})"
+            run ceph osd pool create "${POOL_NAME}" "${PG_NUM}" "${PG_NUM}" replicated
         fi
 
         log_info "Pool 2: Add data pool to filesystem '${VOLUME}'"
@@ -334,8 +340,8 @@ if [ "$SKIP_POOL_SETUP" = false ]; then
         if pool_exists "${POOL_NAME}"; then
             log_info "Pool '${POOL_NAME}' already exists, skipping creation"
         else
-            log_info "Pool 3: Create EC data pool '${POOL_NAME}'"
-            run ceph osd pool create "${POOL_NAME}" erasure "${EC_PROFILE}"
+            log_info "Pool 3: Create EC data pool '${POOL_NAME}' (pg_num=${PG_NUM})"
+            run ceph osd pool create "${POOL_NAME}" "${PG_NUM}" "${PG_NUM}" erasure "${EC_PROFILE}"
 
             log_info "Pool 4: Set pool CRUSH rule to '${CRUSH_RULE}' and remove auto-created rule"
             run ceph osd pool set "${POOL_NAME}" crush_rule "${CRUSH_RULE}"
