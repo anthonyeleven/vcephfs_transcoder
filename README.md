@@ -88,8 +88,8 @@ Options:
 
 
 ```
-usage: vcephfs_transcoder.py [-h] [--tmpdir TMPDIR] [--process-hardlinks] [--debug] [--min-age MIN_AGE] [--min-size SIZE] [--max-size SIZE] [--threads THREADS] [--dry-run] [--log-file LOG_FILE] [--no-copy-file-range]
-                             [--max-files MAX_FILES]
+usage: vcephfs_transcoder.py [-h] [--tmpdir TMPDIR] [--process-hardlinks] [--debug] [--min-age MIN_AGE] [--min-size SIZE] [--max-size SIZE] [--threads THREADS] [--dry-run] [--log-file LOG_FILE] [--log-rotate-lines LOG_ROTATE_LINES]
+                             [--log-rotate-time LOG_ROTATE_TIME] [--log-rotate-size GIB] [--no-copy-file-range] [--max-files MAX_FILES]
                              dirs [dirs ...]
 
 Transcode cephfs files to their directory layout
@@ -97,7 +97,7 @@ Transcode cephfs files to their directory layout
 positional arguments:
   dirs                  Directories to scan
 
-options:
+optional arguments:
   -h, --help            show this help message and exit
   --tmpdir TMPDIR       Temporary directory to which to copy files. Important: This directory should have its layout set to the *default* data pool for the FS, to avoid excess backtrace objects.
   --process-hardlinks   Process files with nlink > 1, which is potentially dangerous
@@ -110,6 +110,12 @@ options:
                         Number of threads for data copying
   --dry-run, -n         Perform transcode but do not replace files
   --log-file LOG_FILE   Also log to this file
+  --log-rotate-lines LOG_ROTATE_LINES
+                        Rotate the log file after this many lines (requires --log-file)
+  --log-rotate-time LOG_ROTATE_TIME
+                        Rotate the log file after this duration, e.g. 30m, 2h, 1d (requires --log-file)
+  --log-rotate-size GIB
+                        Rotate the log file when it reaches this size in GiB (requires --log-file)
   --no-copy-file-range  Disable use of copy_file_range and always use userspace copy
   --max-files MAX_FILES
                         Stop after submitting this many files for transcoding
