@@ -16,6 +16,54 @@ replace_lock = threading.Lock()
 do_exit = threading.Event()
 thread_count = None
 
+# Upper bound for ThreadPoolExecutor max_workers.  The DynamicSemaphore is the
+# real concurrency gate; this just ensures the executor has enough worker
+# threads available when the operator increases concurrency at runtime via
+# SIGUSR1.  Idle threads are cheap (just a stack), so a generous ceiling is
+# fine for I/O-bound work.
+_EXECUTOR_MAX_WORKERS = 128
+
+
+class DynamicSemaphore:
+    """A semaphore whose permit count can be changed at runtime.
+
+    Unlike threading.BoundedSemaphore, the limit can be raised or lowered
+    while the semaphore is in use.  Lowering the limit below the number of
+    currently-held permits is safe — it just means no new acquires will
+    succeed until enough releases bring usage below the new limit.
+    """
+
+    def __init__(self, value=1):
+        self._cond = threading.Condition(threading.Lock())
+        self._limit = value
+        self._value = value  # available permits
+
+    def acquire(self):
+        with self._cond:
+            while self._value <= 0:
+                self._cond.wait()
+            self._value -= 1
+
+    def release(self):
+        with self._cond:
+            self._value += 1
+            self._cond.notify()
+
+    @property
+    def limit(self):
+        with self._cond:
+            return self._limit
+
+    def set_limit(self, new_limit):
+        """Change the permit count.  If raised, blocked acquires may wake."""
+        with self._cond:
+            delta = new_limit - self._limit
+            self._limit = new_limit
+            self._value += delta
+            # Wake waiters if we added permits
+            if delta > 0:
+                self._cond.notify_all()
+
 # errno for "no data available" — ENODATA on Linux.
 # We check explicitly rather than hardcoding 61, which means ECONNREFUSED on
 # macOS/BSD.
@@ -168,6 +216,103 @@ def positive_int(value):
     if n <= 0:
         raise argparse.ArgumentTypeError(f"must be a positive integer, got {n}")
     return n
+
+
+def parse_duration(s):
+    """Parse a duration string: digits plus optional s/m/h/d suffix.
+
+    Returns seconds as a float.  Examples: '30s', '5m', '2h', '1d', '3600'.
+    """
+    t = str(s).strip()
+    if not t:
+        raise argparse.ArgumentTypeError("empty duration")
+    m = re.fullmatch(r"(?i)(\d+(?:\.\d+)?)\s*([smhd])?", t)
+    if not m:
+        raise argparse.ArgumentTypeError(
+            f"invalid duration {s!r} (expected e.g. 60, 30s, 5m, 2h, 1d)"
+        )
+    n = float(m.group(1))
+    suffix = (m.group(2) or "s").lower()
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[suffix]
+    result = n * mult
+    if result <= 0:
+        raise argparse.ArgumentTypeError("duration must be positive")
+    return result
+
+
+class RotatingLogHandler(logging.Handler):
+    """A file logging handler that rotates after a line count, time interval,
+    or file size.
+
+    File naming: given base path ``app.log``, successive files are named
+    ``app.1.log``, ``app.2.log``, etc.  Without an extension (``app``),
+    they become ``app.1``, ``app.2``, etc.
+    """
+
+    def __init__(self, base_path, max_lines=None, max_seconds=None,
+                 max_bytes=None, level=logging.NOTSET):
+        super().__init__(level)
+        self._base_path = base_path
+        stem, ext = os.path.splitext(base_path)
+        self._stem = stem
+        self._ext = ext  # e.g. ".log" or ""
+        self._max_lines = max_lines
+        self._max_seconds = max_seconds
+        self._max_bytes = max_bytes
+        self._file_index = 0
+        self._line_count = 0
+        self._byte_count = 0
+        self._rotate_lock = threading.Lock()
+        self._stream = None
+        self._open_time = None
+        self._open_file(base_path)
+
+    def _open_file(self, path):
+        self._stream = open(path, "a")
+        self._line_count = 0
+        self._byte_count = 0
+        self._open_time = time.monotonic()
+        self._current_path = path
+
+    def _make_path(self, index):
+        if index == 0:
+            return self._base_path
+        return f"{self._stem}.{index}{self._ext}"
+
+    def _should_rotate(self):
+        if self._max_lines is not None and self._line_count >= self._max_lines:
+            return True
+        if self._max_seconds is not None:
+            elapsed = time.monotonic() - self._open_time
+            if elapsed >= self._max_seconds:
+                return True
+        if self._max_bytes is not None and self._byte_count >= self._max_bytes:
+            return True
+        return False
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            with self._rotate_lock:
+                if self._should_rotate():
+                    self._stream.close()
+                    self._file_index += 1
+                    new_path = self._make_path(self._file_index)
+                    self._open_file(new_path)
+                data = msg + "\n"
+                self._stream.write(data)
+                self._stream.flush()
+                self._line_count += 1
+                self._byte_count += len(data.encode("utf-8"))
+        except Exception:
+            self.handleError(record)
+
+    def close(self):
+        with self._rotate_lock:
+            if self._stream:
+                self._stream.close()
+                self._stream = None
+        super().close()
 
 
 @dataclasses.dataclass
@@ -607,7 +752,7 @@ def process_files(args):
         for line in f:
             mountpoints.add(line.split()[1])
 
-    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+    with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
         tmpdir_dev = os.stat(args.tmpdir).st_dev
         for start_dir in args.dirs:
             start_dir = os.path.abspath(start_dir)
@@ -703,6 +848,25 @@ def main():
     )
     parser.add_argument("--log-file", help="Also log to this file")
     parser.add_argument(
+        "--log-rotate-lines",
+        type=positive_int,
+        default=None,
+        help="Rotate the log file after this many lines (requires --log-file)",
+    )
+    parser.add_argument(
+        "--log-rotate-time",
+        type=parse_duration,
+        default=None,
+        help="Rotate the log file after this duration, e.g. 30m, 2h, 1d (requires --log-file)",
+    )
+    parser.add_argument(
+        "--log-rotate-size",
+        type=float,
+        default=None,
+        metavar="GIB",
+        help="Rotate the log file when it reaches this size in GiB (requires --log-file)",
+    )
+    parser.add_argument(
         "--no-copy-file-range",
         action="store_true",
         help="Disable use of copy_file_range and always use userspace copy",
@@ -725,19 +889,50 @@ def main():
     except ValueError as e:
         parser.error(str(e))
 
-    thread_count = threading.BoundedSemaphore(args.threads)
+    thread_count = DynamicSemaphore(args.threads)
+
+    has_rotation = (
+        args.log_rotate_lines is not None
+        or args.log_rotate_time is not None
+        or args.log_rotate_size is not None
+    )
+    if has_rotation and not args.log_file:
+        parser.error("--log-rotate-lines, --log-rotate-time, and --log-rotate-size require --log-file")
+    if args.log_rotate_size is not None and args.log_rotate_size <= 0:
+        parser.error("--log-rotate-size must be a positive number")
 
     log_level = logging.DEBUG if args.debug else logging.INFO
-    handlers = [logging.StreamHandler()]
+    log_handlers = [logging.StreamHandler()]
     if args.log_file:
-        handlers.append(logging.FileHandler(args.log_file))
+        if has_rotation:
+            max_bytes = int(args.log_rotate_size * 1024**3) if args.log_rotate_size is not None else None
+            log_handlers.append(
+                RotatingLogHandler(
+                    args.log_file,
+                    max_lines=args.log_rotate_lines,
+                    max_seconds=args.log_rotate_time,
+                    max_bytes=max_bytes,
+                )
+            )
+        else:
+            log_handlers.append(logging.FileHandler(args.log_file))
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=handlers,
+        handlers=log_handlers,
     )
     cmdline = shlex.join(sys.argv)
     logging.info(f"Starting: {cmdline}")
+
+    if has_rotation:
+        parts = []
+        if args.log_rotate_lines is not None:
+            parts.append(f"{args.log_rotate_lines} lines")
+        if args.log_rotate_time is not None:
+            parts.append(f"{args.log_rotate_time:.0f}s")
+        if args.log_rotate_size is not None:
+            parts.append(f"{args.log_rotate_size} GiB")
+        logging.info(f"Log rotation enabled: every {' or '.join(parts)}")
 
     if os.geteuid() != 0:
         logging.error("This tool must be run as root (requires chown).")
@@ -782,7 +977,29 @@ def main():
         logging.error("SIGINT received, exiting cleanly...")
         do_exit.set()
 
+    def sigusr1_handler(sig, frame):
+        old = thread_count.limit
+        new = min(old + 1, _EXECUTOR_MAX_WORKERS)
+        if new != old:
+            thread_count.set_limit(new)
+            logging.info(f"SIGUSR1 received, thread limit: {old} -> {new}")
+        else:
+            logging.warning(f"SIGUSR1 received, already at maximum ({_EXECUTOR_MAX_WORKERS})")
+
+    def sigusr2_handler(sig, frame):
+        old = thread_count.limit
+        new = max(old - 1, 1)
+        if new != old:
+            thread_count.set_limit(new)
+            logging.info(f"SIGUSR2 received, thread limit: {old} -> {new}")
+        else:
+            logging.warning(f"SIGUSR2 received, already at minimum (1)")
+
     signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGUSR1, sigusr1_handler)
+    signal.signal(signal.SIGUSR2, sigusr2_handler)
+
+    logging.info(f"PID {os.getpid()}: send SIGUSR1 to increase threads, SIGUSR2 to decrease")
 
     process_files(args)
 
