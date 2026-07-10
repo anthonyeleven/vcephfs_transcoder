@@ -39,11 +39,22 @@ class DynamicSemaphore:
         self._limit = value
         self._value = value  # available permits
 
-    def acquire(self):
+    def acquire(self, cancel=None):
+        """Acquire a permit, blocking until one is available.
+
+        If *cancel* is a callable, it is checked each iteration; when it
+        returns True the acquire is abandoned and this method returns False.
+        A bounded wait (0.5 s) guarantees that signals (SIGINT, etc.) and the
+        cancel callback are always serviced promptly, even when no other
+        thread calls release() or set_limit().
+        """
         with self._cond:
             while self._value <= 0:
-                self._cond.wait()
+                self._cond.wait(timeout=0.5)
+                if cancel is not None and cancel():
+                    return False
             self._value -= 1
+            return True
 
     def release(self):
         with self._cond:
@@ -609,7 +620,8 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
         def submit(filepaths, st, file_layout, _layout=layout):
             if do_exit.is_set() or _limit_reached():
                 return
-            thread_count.acquire()
+            if not thread_count.acquire(cancel=lambda: do_exit.is_set() or _limit_reached()):
+                return
             try:
                 future = executor.submit(
                     process_file, args, filepaths, st, _layout, file_layout
