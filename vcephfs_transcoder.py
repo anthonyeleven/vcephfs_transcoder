@@ -15,6 +15,7 @@ import threading, uuid, argparse
 replace_lock = threading.Lock()
 do_exit = threading.Event()
 thread_count = None
+file_delay_ms = 0
 
 # Upper bound for ThreadPoolExecutor max_workers.  The DynamicSemaphore is the
 # real concurrency gate; this just ensures the executor has enough worker
@@ -624,6 +625,10 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             if do_exit.is_set() or _limit_reached():
                 return
 
+            delay = file_delay_ms
+            if delay > 0:
+                time.sleep(delay / 1000.0)
+
             if time.monotonic() - last_progress > 60:
                 stats.log_progress()
                 last_progress = time.monotonic()
@@ -797,7 +802,16 @@ def process_files(args):
 def main():
     global thread_count
     parser = argparse.ArgumentParser(
-        description="Transcode cephfs files to their directory layout"
+        description="Transcode cephfs files to their directory layout",
+        epilog=(
+            "runtime signals:\n"
+            "  SIGUSR1  (10)  increase thread count by 1 (resumes from pause)\n"
+            "  SIGUSR2  (12)  decrease thread count by 1 (0 = pause)\n"
+            "  SIGTSTP  (20)  throttle to 1 thread (Ctrl+Z)\n"
+            "  SIGRTMIN (34)  increase file delay by 100ms\n"
+            "  SIGRTMIN+1(35) decrease file delay by 100ms"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("dirs", help="Directories to scan", nargs="+")
     parser.add_argument(
@@ -876,6 +890,13 @@ def main():
         type=positive_int,
         default=None,
         help="Stop after submitting this many files for transcoding",
+    )
+    parser.add_argument(
+        "--file-delay",
+        type=int,
+        default=0,
+        metavar="MS",
+        help="Delay in milliseconds before statting each new file (adjustable at runtime via SIGRTMIN/SIGRTMIN+1)",
     )
 
     args = parser.parse_args()
@@ -974,32 +995,78 @@ def main():
         sys.exit(1)
 
     def signal_handler(sig, frame):
-        logging.error("SIGINT received, exiting cleanly...")
+        name = signal.Signals(sig).name
+        logging.error(f"{name} received, exiting cleanly...")
         do_exit.set()
+
+    def sigtstp_handler(sig, frame):
+        old = thread_count.limit
+        if old != 1:
+            thread_count.set_limit(1)
+            logging.info(f"SIGTSTP received, thread limit: {old} -> 1")
+        else:
+            logging.info(f"SIGTSTP received, already at 1")
 
     def sigusr1_handler(sig, frame):
         old = thread_count.limit
         new = min(old + 1, _EXECUTOR_MAX_WORKERS)
         if new != old:
             thread_count.set_limit(new)
-            logging.info(f"SIGUSR1 received, thread limit: {old} -> {new}")
+            if old == 0:
+                logging.info(f"SIGUSR1 received, processing resumed (thread limit: 0 -> {new})")
+            else:
+                logging.info(f"SIGUSR1 received, thread limit: {old} -> {new}")
         else:
             logging.warning(f"SIGUSR1 received, already at maximum ({_EXECUTOR_MAX_WORKERS})")
 
     def sigusr2_handler(sig, frame):
         old = thread_count.limit
-        new = max(old - 1, 1)
+        new = max(old - 1, 0)
         if new != old:
             thread_count.set_limit(new)
-            logging.info(f"SIGUSR2 received, thread limit: {old} -> {new}")
+            if new == 0:
+                logging.info(
+                    f"SIGUSR2 received, thread limit: {old} -> 0 — "
+                    f"processing paused (in-flight copies will complete; send SIGUSR1 to resume)"
+                )
+            else:
+                logging.info(f"SIGUSR2 received, thread limit: {old} -> {new}")
         else:
-            logging.warning(f"SIGUSR2 received, already at minimum (1)")
+            logging.warning(f"SIGUSR2 received, already paused (thread limit 0; send SIGUSR1 to resume)")
+
+    global file_delay_ms
+    if args.file_delay < 0:
+        parser.error("--file-delay must be non-negative")
+    file_delay_ms = args.file_delay
+
+    def sigrtmin_handler(sig, frame):
+        global file_delay_ms
+        old = file_delay_ms
+        file_delay_ms = old + 100
+        logging.info(f"SIGRTMIN received, file delay: {old}ms -> {file_delay_ms}ms")
+
+    def sigrtmin1_handler(sig, frame):
+        global file_delay_ms
+        old = file_delay_ms
+        file_delay_ms = max(old - 100, 0)
+        logging.info(f"SIGRTMIN+1 received, file delay: {old}ms -> {file_delay_ms}ms")
 
     signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTSTP, sigtstp_handler)
     signal.signal(signal.SIGUSR1, sigusr1_handler)
     signal.signal(signal.SIGUSR2, sigusr2_handler)
+    signal.signal(signal.SIGRTMIN, sigrtmin_handler)
+    signal.signal(signal.SIGRTMIN + 1, sigrtmin1_handler)
 
-    logging.info(f"PID {os.getpid()}: send SIGUSR1 to increase threads, SIGUSR2 to decrease")
+    logging.info(
+        f"PID {os.getpid()}: "
+        f"SIGUSR1/{signal.SIGUSR1} +1 thread, "
+        f"SIGUSR2/{signal.SIGUSR2} -1 thread (0 = pause), "
+        f"SIGTSTP (Ctrl+Z) throttle to 1, "
+        f"SIGRTMIN/{signal.SIGRTMIN} / SIGRTMIN+1/{signal.SIGRTMIN + 1} adjust file delay ±100ms"
+    )
+    if file_delay_ms > 0:
+        logging.info(f"File delay: {file_delay_ms}ms")
 
     process_files(args)
 
