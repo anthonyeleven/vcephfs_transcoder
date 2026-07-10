@@ -88,9 +88,9 @@ Options:
 
 
 ```
-usage: vcephfs_transcoder.py [-h] [--tmpdir TMPDIR] [--process-hardlinks] [--debug] [--min-age MIN_AGE] [--min-size SIZE] [--max-size SIZE] [--threads THREADS] [--dry-run] [--log-file LOG_FILE] [--log-rotate-lines LOG_ROTATE_LINES]
-                             [--log-rotate-time LOG_ROTATE_TIME] [--log-rotate-size GIB] [--no-copy-file-range] [--max-files MAX_FILES]
-                             dirs [dirs ...]
+usage: vcephfs_transcoder.py    [-h] [--tmpdir TMPDIR] [--process-hardlinks] [--debug] [--min-age MIN_AGE] [--min-size SIZE] [--max-size SIZE] [--threads THREADS] [--dry-run] [--log-file LOG_FILE] [--log-rotate-lines LOG_ROTATE_LINES]
+                                [--log-rotate-time LOG_ROTATE_TIME] [--log-rotate-size GIB] [--no-copy-file-range] [--max-files MAX_FILES] [--file-delay MS]
+                                dirs [dirs ...]
 
 Transcode cephfs files to their directory layout
 
@@ -119,6 +119,14 @@ optional arguments:
   --no-copy-file-range  Disable use of copy_file_range and always use userspace copy
   --max-files MAX_FILES
                         Stop after submitting this many files for transcoding
+  --file-delay MS       Delay in milliseconds before statting each new file (adjustable at runtime via SIGRTMIN/SIGRTMIN+1)
+
+runtime signals:
+  SIGUSR1  (10)  increase thread count by 1 (resumes from pause)
+  SIGUSR2  (12)  decrease thread count by 1 (0 = pause)
+  SIGTSTP  (20)  throttle to 1 thread (Ctrl+Z)
+  SIGRTMIN (34)  increase file delay by 100ms
+  SIGRTMIN+1(35) decrease file delay by 100ms
 ```
 
 
