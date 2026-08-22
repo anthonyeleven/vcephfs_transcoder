@@ -88,8 +88,9 @@ Options:
 
 
 ```
-usage: vcephfs_transcoder.py [-h] [--tmpdir TMPDIR] [--process-hardlinks]
-                             [--debug] [--min-age MIN_AGE] [--min-size SIZE]
+usage: vcephfs_transcoder.py [-h] [--version] [--tmpdir TMPDIR]
+                             [--process-hardlinks] [--debug]
+                             [--min-age MIN_AGE] [--min-size SIZE]
                              [--max-size SIZE] [--threads THREADS] [--dry-run]
                              [--log-file LOG_FILE]
                              [--log-rotate-lines LOG_ROTATE_LINES]
@@ -106,6 +107,7 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
+  --version             show program's version number and exit
   --tmpdir TMPDIR       Temporary directory to which to copy files. Important:
                         This directory should have its layout set to the
                         *default* data pool for the FS, to avoid excess

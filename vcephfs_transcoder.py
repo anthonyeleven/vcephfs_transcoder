@@ -12,14 +12,13 @@ import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
 import threading, uuid, argparse
 
+_VERSION = "1701"
+
 replace_lock = threading.Lock()
 do_exit = threading.Event()
 thread_count = None
 file_delay_ms = 0
 min_age_days = 1
-
-# Captured once at startup so signal handlers can report the launch command.
-_initial_cmdline = shlex.join(sys.argv)
 
 # setproctitle is optional: when present, the command line shown by `ps` is
 # rewritten live as tunables change. Without it, that refresh is a no-op.
@@ -891,10 +890,9 @@ def process_files(args):
                 logging.warning(f"    - {path}")
 
 
-def _update_proctitle():
-    """Reflect the current live tunables in the command line shown by `ps`."""
-    if _setproctitle is None:
-        return
+def _amended_cmdline():
+    """sys.argv with the live tunables (threads / min-age / file-delay)
+    substituted in — i.e. the current effective command line."""
     argv = list(sys.argv)
 
     def _set(names, val):
@@ -917,15 +915,22 @@ def _update_proctitle():
         _set(["--threads"], thread_count.limit)
     _set(["--min-age"], min_age_days)
     _set(["--file-delay"], file_delay_ms)
-    _setproctitle.setproctitle(shlex.join(argv))
+    return shlex.join(argv)
+
+
+def _update_proctitle():
+    """Reflect the current live tunables in the command line shown by `ps`."""
+    if _setproctitle is not None:
+        _setproctitle.setproctitle(_amended_cmdline())
 
 
 def _report_state(prefix="State"):
-    """Log the full current state/tunables and refresh the `ps` command line."""
+    """Log the current state/tunables (with the amended command line) and
+    refresh the `ps` command line."""
     tc = thread_count.limit if thread_count is not None else "?"
     logging.info(
         f"{prefix}: threads(limit)={tc}, file_delay={file_delay_ms}ms, "
-        f"min_age={min_age_days}d | initial cmdline: {_initial_cmdline}"
+        f"min_age={min_age_days}d | cmdline: {_amended_cmdline()}"
     )
     _update_proctitle()
 
@@ -946,6 +951,9 @@ def main():
             "  SIGRTMIN+4(38) dump current state/tunables to the log"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {_VERSION}"
     )
     parser.add_argument("dirs", help="Directories to scan", nargs="+")
     parser.add_argument(
