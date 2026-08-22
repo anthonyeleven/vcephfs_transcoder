@@ -46,7 +46,10 @@ class DynamicSemaphore:
     """
 
     def __init__(self, value=1):
-        self._cond = threading.Condition(threading.Lock())
+        # RLock (not the default-overriding plain Lock) so a signal handler may
+        # re-enter .limit / .set_limit while the main thread already holds it
+        # (same thread) without deadlocking.
+        self._cond = threading.Condition(threading.RLock())
         self._limit = value
         self._value = value  # available permits
 
@@ -285,7 +288,10 @@ class RotatingLogHandler(logging.Handler):
         self._file_index = 0
         self._line_count = 0
         self._byte_count = 0
-        self._rotate_lock = threading.Lock()
+        # RLock so a signal handler that logs while the main thread is inside
+        # emit() holding this lock re-enters on the same thread instead of
+        # deadlocking (reachable with --log-file + --log-rotate-*).
+        self._rotate_lock = threading.RLock()
         self._stream = None
         self._open_time = None
         self._open_file(base_path)
@@ -893,11 +899,18 @@ def _update_proctitle():
 
     def _set(names, val):
         for nm in names:
+            # separate form: --flag value
             if nm in argv:
                 i = argv.index(nm)
                 if i + 1 < len(argv):
                     argv[i + 1] = str(val)
                 return
+            # joined form: --flag=value
+            pref = nm + "="
+            for i, tok in enumerate(argv):
+                if tok.startswith(pref):
+                    argv[i] = f"{nm}={val}"
+                    return
         argv.extend([names[0], str(val)])
 
     if thread_count is not None:
@@ -1210,12 +1223,13 @@ def main():
         # On-demand full dump of current runtime state / tunables to the log.
         _report_state("State dump (SIGRTMIN+4)")
 
-    # Signal-handler safety: the handlers below log and (when setproctitle is
-    # present) rewrite the ps title. This is safe because Python delivers signals
-    # to the main thread at bytecode boundaries — not truly asynchronously — and
-    # the logging locks are reentrant (RLock), so re-entering logging from a
-    # handler that interrupted a logging call does not deadlock; setproctitle is
-    # a bounded argv write. (Every handler already logged before this change.)
+    # Signal-handler safety: the handlers below log and adjust tunables, and
+    # Python delivers signals on the main thread — the same thread that, on its
+    # hot path, holds DynamicSemaphore._cond (in acquire/set_limit) and the log
+    # handler's _rotate_lock (in emit()). Both are RLocks (see each class's
+    # __init__), so a handler that interrupts such a critical section re-enters
+    # the lock on the same thread instead of deadlocking; setproctitle is a
+    # bounded argv write.
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTSTP, sigtstp_handler)
     signal.signal(signal.SIGUSR1, sigusr1_handler)
