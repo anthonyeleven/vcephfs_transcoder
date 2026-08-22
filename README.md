@@ -88,38 +88,61 @@ Options:
 
 
 ```
-usage: vcephfs_transcoder.py    [-h] [--tmpdir TMPDIR] [--process-hardlinks] [--debug] [--min-age MIN_AGE] [--min-size SIZE] [--max-size SIZE] [--threads THREADS] [--dry-run] [--log-file LOG_FILE] [--log-rotate-lines LOG_ROTATE_LINES]
-                                [--log-rotate-time LOG_ROTATE_TIME] [--log-rotate-size GIB] [--no-copy-file-range] [--max-files MAX_FILES] [--file-delay MS]
-                                dirs [dirs ...]
+usage: vcephfs_transcoder.py [-h] [--tmpdir TMPDIR] [--process-hardlinks]
+                             [--debug] [--min-age MIN_AGE] [--min-size SIZE]
+                             [--max-size SIZE] [--threads THREADS] [--dry-run]
+                             [--log-file LOG_FILE]
+                             [--log-rotate-lines LOG_ROTATE_LINES]
+                             [--log-rotate-time LOG_ROTATE_TIME]
+                             [--log-rotate-size GIB] [--no-copy-file-range]
+                             [--max-files MAX_FILES] [--file-delay MS]
+                             [--prune-dir-regex REGEX]
+                             dirs [dirs ...]
 
 Transcode cephfs files to their directory layout
 
 positional arguments:
   dirs                  Directories to scan
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
-  --tmpdir TMPDIR       Temporary directory to which to copy files. Important: This directory should have its layout set to the *default* data pool for the FS, to avoid excess backtrace objects.
-  --process-hardlinks   Process files with nlink > 1, which is potentially dangerous
+  --tmpdir TMPDIR       Temporary directory to which to copy files. Important:
+                        This directory should have its layout set to the
+                        *default* data pool for the FS, to avoid excess
+                        backtrace objects.
+  --process-hardlinks   Process files with nlink > 1, which is potentially
+                        dangerous
   --debug, -d
-  --min-age MIN_AGE, -m MIN_AGE
-                        Minimum age of file before transcoding, in days
-  --min-size SIZE       Skip files smaller than this size. Suffix B/K/M/G (binary); plain number means bytes. 0 disables.
-  --max-size SIZE       Skip files larger than this size (same format as --min-size). Omit for no upper limit.
-  --threads THREADS, -t THREADS
-                        Number of threads for data copying
+  --min-age MIN_AGE     Minimum age of file before transcoding, in days
+                        (adjustable at runtime via SIGRTMIN+2/SIGRTMIN+3)
+  --min-size SIZE       Skip files smaller than this size. Suffix B/K/M/G
+                        (binary); plain number means bytes. 0 disables.
+  --max-size SIZE       Skip files larger than this size (same format as
+                        --min-size). Omit for no upper limit.
+  --threads THREADS     Number of threads for data copying
   --dry-run, -n         Perform transcode but do not replace files
   --log-file LOG_FILE   Also log to this file
   --log-rotate-lines LOG_ROTATE_LINES
-                        Rotate the log file after this many lines (requires --log-file)
+                        Rotate the log file after this many lines (requires
+                        --log-file)
   --log-rotate-time LOG_ROTATE_TIME
-                        Rotate the log file after this duration, e.g. 30m, 2h, 1d (requires --log-file)
+                        Rotate the log file after this duration, e.g. 30m, 2h,
+                        1d (requires --log-file)
   --log-rotate-size GIB
-                        Rotate the log file when it reaches this size in GiB (requires --log-file)
-  --no-copy-file-range  Disable use of copy_file_range and always use userspace copy
+                        Rotate the log file when it reaches this size in GiB
+                        (requires --log-file)
+  --no-copy-file-range  Disable use of copy_file_range and always use
+                        userspace copy
   --max-files MAX_FILES
                         Stop after submitting this many files for transcoding
-  --file-delay MS       Delay in milliseconds before statting each new file (adjustable at runtime via SIGRTMIN/SIGRTMIN+1)
+  --file-delay MS       Delay in milliseconds before statting each new file
+                        (adjustable at runtime via SIGRTMIN/SIGRTMIN+1)
+  --prune-dir-regex REGEX
+                        Regular expression (unanchored, via re.search) matched
+                        against directory NAMES; any name containing a match
+                        is pruned from the walk entirely (not descended into
+                        or statted). Anchor with ^ / $ for exact names, e.g.
+                        '\.runfiles$' to skip Bazel runfiles symlink farms.
 
 runtime signals:
   SIGUSR1  (10)  increase thread count by 1 (resumes from pause)
@@ -127,6 +150,9 @@ runtime signals:
   SIGTSTP  (20)  throttle to 1 thread (Ctrl+Z)
   SIGRTMIN (34)  increase file delay by 100ms
   SIGRTMIN+1(35) decrease file delay by 100ms
+  SIGRTMIN+2(36) increase min-age by 3 days
+  SIGRTMIN+3(37) decrease min-age by 3 days (min 1)
+  SIGRTMIN+4(38) dump current state/tunables to the log
 ```
 
 
