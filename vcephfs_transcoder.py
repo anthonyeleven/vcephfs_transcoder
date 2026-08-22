@@ -16,6 +16,17 @@ replace_lock = threading.Lock()
 do_exit = threading.Event()
 thread_count = None
 file_delay_ms = 0
+min_age_days = 1
+
+# Captured once at startup so signal handlers can report the launch command.
+_initial_cmdline = shlex.join(sys.argv)
+
+# setproctitle is optional: when present, the command line shown by `ps` is
+# rewritten live as tunables change. Without it, that refresh is a no-op.
+try:
+    import setproctitle as _setproctitle
+except ImportError:
+    _setproctitle = None
 
 # Upper bound for ThreadPoolExecutor max_workers.  The DynamicSemaphore is the
 # real concurrency gate; this just ensures the executor has enough worker
@@ -337,10 +348,14 @@ class Stats:
     files_skipped_hardlink: int = 0
     files_skipped_open: int = 0
     files_skipped_small: int = 0
+    files_skipped_symlink: int = 0
     files_skipped_large: int = 0
+    dirs_pruned: int = 0
     files_failed: int = 0
     bytes_copied: int = 0
     copy_seconds: float = 0.0
+    _symlink_batch: int = 0
+    _dirs_pruned_batch: int = 0
     _lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
     def log_progress(self):
@@ -358,6 +373,50 @@ class Stats:
             mbps = (self.bytes_copied / (1024**2)) / self.copy_seconds
             return f", avg {mbps:.1f} MiB/s"
         return ""
+
+    def note_skipped_symlink(self, batch_size=1000):
+        """Count a skipped non-regular (symlink/etc.) file. Return a log
+        message once a full batch of *batch_size* has accumulated (else None),
+        so these are logged in batches instead of one line per file."""
+        with self._lock:
+            self.files_skipped_symlink += 1
+            self._symlink_batch += 1
+            if self._symlink_batch >= batch_size:
+                n = self._symlink_batch
+                self._symlink_batch = 0
+                return f"Skipped {n} symlinks/non-regular files (total {self.files_skipped_symlink})"
+        return None
+
+    def flush_skipped_symlinks(self):
+        """Return a log message for any partial (<batch_size) symlink batch."""
+        with self._lock:
+            if self._symlink_batch > 0:
+                n = self._symlink_batch
+                self._symlink_batch = 0
+                return f"Skipped {n} symlinks/non-regular files (total {self.files_skipped_symlink})"
+        return None
+
+    def note_pruned_dir(self, batch_size=100):
+        """Count a directory pruned via --prune-dir-regex. Return a log message
+        once a full batch of *batch_size* has accumulated (else None), so the
+        pruning is observable at INFO level like the symlink-skip batches."""
+        with self._lock:
+            self.dirs_pruned += 1
+            self._dirs_pruned_batch += 1
+            if self._dirs_pruned_batch >= batch_size:
+                n = self._dirs_pruned_batch
+                self._dirs_pruned_batch = 0
+                return f"Pruned {n} directories via --prune-dir-regex (total {self.dirs_pruned})"
+        return None
+
+    def flush_pruned_dirs(self):
+        """Return a log message for any partial (<batch_size) prune batch."""
+        with self._lock:
+            if self._dirs_pruned_batch > 0:
+                n = self._dirs_pruned_batch
+                self._dirs_pruned_batch = 0
+                return f"Pruned {n} directories via --prune-dir-regex (total {self.dirs_pruned})"
+        return None
 
 
 stats = Stats()
@@ -612,6 +671,19 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
 
         dirnames.sort()
         filenames.sort()
+        # Prune (do not descend into or stat) directories whose name matches
+        # --prune-dir-regex.  Mutating dirnames in place controls os.walk.
+        if getattr(args, "prune_re", None) is not None and dirnames:
+            keep = []
+            for d in dirnames:
+                if args.prune_re.search(d):
+                    logging.debug(f"Pruning {os.path.join(dirpath, d)}/ (--prune-dir-regex)")
+                    msg = stats.note_pruned_dir()
+                    if msg:
+                        logging.info(msg)
+                else:
+                    keep.append(d)
+            dirnames[:] = keep
         logging.debug(
             f"Scanning {dirpath} ({layout}): {len(dirnames)} dirs and {len(filenames)} files"
         )
@@ -648,7 +720,9 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             filepath = os.path.join(dirpath, filename)
             st = os.stat(filepath, follow_symlinks=False)
             if not stat.S_ISREG(st.st_mode):
-                logging.debug(f"Skipping {filepath}: not a regular file")
+                msg = stats.note_skipped_symlink()
+                if msg:
+                    logging.info(msg)
                 continue
             if st.st_nlink == 1 and st.st_size < args.min_size:
                 logging.info(
@@ -668,7 +742,7 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
                 with stats._lock:
                     stats.files_skipped_large += 1
                 continue
-            if st.st_mtime > (time.time() - 86400 * args.min_age):
+            if st.st_mtime > (time.time() - 86400 * min_age_days):
                 logging.info(f"Skipping {filepath}: modified too recently")
                 with stats._lock:
                     stats.files_skipped_recent += 1
@@ -811,6 +885,38 @@ def process_files(args):
                 logging.warning(f"    - {path}")
 
 
+def _update_proctitle():
+    """Reflect the current live tunables in the command line shown by `ps`."""
+    if _setproctitle is None:
+        return
+    argv = list(sys.argv)
+
+    def _set(names, val):
+        for nm in names:
+            if nm in argv:
+                i = argv.index(nm)
+                if i + 1 < len(argv):
+                    argv[i + 1] = str(val)
+                return
+        argv.extend([names[0], str(val)])
+
+    if thread_count is not None:
+        _set(["--threads"], thread_count.limit)
+    _set(["--min-age"], min_age_days)
+    _set(["--file-delay"], file_delay_ms)
+    _setproctitle.setproctitle(shlex.join(argv))
+
+
+def _report_state(prefix="State"):
+    """Log the full current state/tunables and refresh the `ps` command line."""
+    tc = thread_count.limit if thread_count is not None else "?"
+    logging.info(
+        f"{prefix}: threads(limit)={tc}, file_delay={file_delay_ms}ms, "
+        f"min_age={min_age_days}d | initial cmdline: {_initial_cmdline}"
+    )
+    _update_proctitle()
+
+
 def main():
     global thread_count
     parser = argparse.ArgumentParser(
@@ -821,7 +927,10 @@ def main():
             "  SIGUSR2  (12)  decrease thread count by 1 (0 = pause)\n"
             "  SIGTSTP  (20)  throttle to 1 thread (Ctrl+Z)\n"
             "  SIGRTMIN (34)  increase file delay by 100ms\n"
-            "  SIGRTMIN+1(35) decrease file delay by 100ms"
+            "  SIGRTMIN+1(35) decrease file delay by 100ms\n"
+            "  SIGRTMIN+2(36) increase min-age by 3 days\n"
+            "  SIGRTMIN+3(37) decrease min-age by 3 days (min 1)\n"
+            "  SIGRTMIN+4(38) dump current state/tunables to the log"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -840,10 +949,9 @@ def main():
     parser.add_argument("--debug", "-d", action="store_true")
     parser.add_argument(
         "--min-age",
-        "-m",
         default=1,
         type=int,
-        help="Minimum age of file before transcoding, in days",
+        help="Minimum age of file before transcoding, in days (adjustable at runtime via SIGRTMIN+2/SIGRTMIN+3)",
     )
     parser.add_argument(
         "--min-size",
@@ -861,7 +969,6 @@ def main():
     )
     parser.add_argument(
         "--threads",
-        "-t",
         default=4,
         type=int,
         help="Number of threads for data copying",
@@ -910,6 +1017,15 @@ def main():
         metavar="MS",
         help="Delay in milliseconds before statting each new file (adjustable at runtime via SIGRTMIN/SIGRTMIN+1)",
     )
+    parser.add_argument(
+        "--prune-dir-regex",
+        default=None,
+        metavar="REGEX",
+        help="Regular expression (unanchored, via re.search) matched against "
+        "directory NAMES; any name containing a match is pruned from the walk "
+        "entirely (not descended into or statted). Anchor with ^ / $ for exact "
+        "names, e.g. '\\.runfiles$' to skip Bazel runfiles symlink farms.",
+    )
 
     args = parser.parse_args()
     try:
@@ -923,6 +1039,13 @@ def main():
         parser.error(str(e))
 
     thread_count = DynamicSemaphore(args.threads)
+
+    args.prune_re = None
+    if args.prune_dir_regex:
+        try:
+            args.prune_re = re.compile(args.prune_dir_regex)
+        except re.error as e:
+            parser.error(f"--prune-dir-regex invalid regex: {e}")
 
     has_rotation = (
         args.log_rotate_lines is not None
@@ -1018,6 +1141,7 @@ def main():
             logging.info(f"SIGTSTP received, thread limit: {old} -> 1")
         else:
             logging.info(f"SIGTSTP received, already at 1")
+        _report_state()
 
     def sigusr1_handler(sig, frame):
         old = thread_count.limit
@@ -1030,6 +1154,7 @@ def main():
                 logging.info(f"SIGUSR1 received, thread limit: {old} -> {new}")
         else:
             logging.warning(f"SIGUSR1 received, already at maximum ({_EXECUTOR_MAX_WORKERS})")
+        _report_state()
 
     def sigusr2_handler(sig, frame):
         old = thread_count.limit
@@ -1045,45 +1170,94 @@ def main():
                 logging.info(f"SIGUSR2 received, thread limit: {old} -> {new}")
         else:
             logging.warning(f"SIGUSR2 received, already paused (thread limit 0; send SIGUSR1 to resume)")
+        _report_state()
 
-    global file_delay_ms
+    global file_delay_ms, min_age_days
     if args.file_delay < 0:
         parser.error("--file-delay must be non-negative")
     file_delay_ms = args.file_delay
+    min_age_days = args.min_age
 
     def sigrtmin_handler(sig, frame):
         global file_delay_ms
         old = file_delay_ms
         file_delay_ms = old + 100
         logging.info(f"SIGRTMIN received, file delay: {old}ms -> {file_delay_ms}ms")
+        _report_state()
 
     def sigrtmin1_handler(sig, frame):
         global file_delay_ms
         old = file_delay_ms
         file_delay_ms = max(old - 100, 0)
         logging.info(f"SIGRTMIN+1 received, file delay: {old}ms -> {file_delay_ms}ms")
+        _report_state()
 
+    def sigrtmin2_handler(sig, frame):
+        global min_age_days
+        old = min_age_days
+        min_age_days = old + 3
+        logging.info(f"SIGRTMIN+2 received, min-age: {old}d -> {min_age_days}d")
+        _report_state()
+
+    def sigrtmin3_handler(sig, frame):
+        global min_age_days
+        old = min_age_days
+        min_age_days = max(old - 3, 1)
+        logging.info(f"SIGRTMIN+3 received, min-age: {old}d -> {min_age_days}d")
+        _report_state()
+
+    def sigrtmin4_handler(sig, frame):
+        # On-demand full dump of current runtime state / tunables to the log.
+        _report_state("State dump (SIGRTMIN+4)")
+
+    # Signal-handler safety: the handlers below log and (when setproctitle is
+    # present) rewrite the ps title. This is safe because Python delivers signals
+    # to the main thread at bytecode boundaries — not truly asynchronously — and
+    # the logging locks are reentrant (RLock), so re-entering logging from a
+    # handler that interrupted a logging call does not deadlock; setproctitle is
+    # a bounded argv write. (Every handler already logged before this change.)
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTSTP, sigtstp_handler)
     signal.signal(signal.SIGUSR1, sigusr1_handler)
     signal.signal(signal.SIGUSR2, sigusr2_handler)
     signal.signal(signal.SIGRTMIN, sigrtmin_handler)
     signal.signal(signal.SIGRTMIN + 1, sigrtmin1_handler)
+    signal.signal(signal.SIGRTMIN + 2, sigrtmin2_handler)
+    signal.signal(signal.SIGRTMIN + 3, sigrtmin3_handler)
+    signal.signal(signal.SIGRTMIN + 4, sigrtmin4_handler)
 
     logging.info(
         f"PID {os.getpid()}: "
         f"SIGUSR1/{signal.SIGUSR1} +1 thread, "
         f"SIGUSR2/{signal.SIGUSR2} -1 thread (0 = pause), "
         f"SIGTSTP (Ctrl+Z) throttle to 1, "
-        f"SIGRTMIN/{signal.SIGRTMIN} / SIGRTMIN+1/{signal.SIGRTMIN + 1} adjust file delay ±100ms"
+        f"SIGRTMIN/{signal.SIGRTMIN} / SIGRTMIN+1/{signal.SIGRTMIN + 1} adjust file delay ±100ms, "
+        f"SIGRTMIN+2/{signal.SIGRTMIN + 2} / SIGRTMIN+3/{signal.SIGRTMIN + 3} adjust min-age ±3d (min 1), "
+        f"SIGRTMIN+4/{signal.SIGRTMIN + 4} dump state to log"
     )
     if file_delay_ms > 0:
         logging.info(f"File delay: {file_delay_ms}ms")
+
+    # Make the degraded (no-op) mode observable rather than a silent surprise.
+    logging.info(
+        "ps command-line live-update: "
+        + ("enabled" if _setproctitle is not None
+           else "disabled (install python3-setproctitle to enable)")
+    )
+    # Prime the ps command line with the launch-time tunables.
+    _update_proctitle()
 
     process_files(args)
 
     if args.max_files is not None and stats.files_submitted >= args.max_files:
         logging.info(f"Stopped early: --max-files limit of {args.max_files} reached")
+
+    msg = stats.flush_skipped_symlinks()
+    if msg:
+        logging.info(msg)
+    msg = stats.flush_pruned_dirs()
+    if msg:
+        logging.info(msg)
 
     logging.info(
         f"Complete: {stats.files_transcoded} transcoded, "
@@ -1094,7 +1268,9 @@ def main():
         f"{stats.files_skipped_hardlink} hardlinks skipped, "
         f"{stats.files_skipped_open} open/locked, "
         f"{stats.files_skipped_small} below min-size, "
+        f"{stats.files_skipped_symlink} symlinks/non-regular, "
         f"{stats.files_skipped_large} above max-size, "
+        f"{stats.dirs_pruned} dirs pruned, "
         f"{stats.bytes_copied / (1024**3):.1f} GiB copied"
         f"{stats._avg_throughput_str()}"
     )
