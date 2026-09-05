@@ -2,8 +2,9 @@
 #
 # vcephfs-transcode-setup.sh
 #
-# Automates the 2026Q2 CephFS transcoding plan from:
-# [internal planning document]
+# Automates a CephFS replication-to-erasure-coding transcoding plan:
+# create the EC pool, set directory layouts, then transcode existing files
+# into the new layout.
 #
 # This script performs the pool-creation and layout-setting steps on a mon,
 # then invokes the transcoder on a client.  It is idempotent where Ceph

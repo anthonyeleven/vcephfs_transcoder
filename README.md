@@ -92,20 +92,26 @@ usage: vcephfs_transcoder.py [-h] [--version] [--tmpdir TMPDIR]
                              [--process-hardlinks] [--debug]
                              [--min-age MIN_AGE] [--min-size SIZE]
                              [--max-size SIZE] [--threads THREADS] [--dry-run]
+                             [--config PATH] [--print-config-example [VOLUME]]
+                             [--config-poll-seconds SEC] [--force-tmpdir-pool]
                              [--log-file LOG_FILE]
                              [--log-rotate-lines LOG_ROTATE_LINES]
                              [--log-rotate-time LOG_ROTATE_TIME]
                              [--log-rotate-size GIB] [--no-copy-file-range]
+                             [--copy-file-range] [--source-pool POOL]
+                             [--prune-small-subtrees]
+                             [--prune-subtree-max-bytes BYTES]
+                             [--prune-budget-bytes BYTES]
                              [--max-files MAX_FILES] [--file-delay MS]
                              [--prune-dir-regex REGEX]
-                             dirs [dirs ...]
+                             [dirs ...]
 
 Transcode cephfs files to their directory layout
 
 positional arguments:
   dirs                  Directories to scan
 
-options:
+optional arguments:
   -h, --help            show this help message and exit
   --version             show program's version number and exit
   --tmpdir TMPDIR       Temporary directory to which to copy files. Important:
@@ -123,6 +129,19 @@ options:
                         --min-size). Omit for no upper limit.
   --threads THREADS     Number of threads for data copying
   --dry-run, -n         Perform transcode but do not replace files
+  --config PATH         key=value file of live tunables (file_delay_ms,
+                        threads, min_age_days, min_size, prune_dir_regex), re-
+                        read when its mtime changes. Keep it on local disk,
+                        NOT in the CephFS volume: a stat there is an MDS round
+                        trip.
+  --print-config-example [VOLUME]
+                        print a fully-populated --config file for VOLUME and
+                        exit
+  --config-poll-seconds SEC
+                        how often to stat --config for changes (default: 10)
+  --force-tmpdir-pool   proceed even if the tmpdir is in a target pool.
+                        Disables the only check that makes a failed layout
+                        application visible; do not use routinely.
   --log-file LOG_FILE   Also log to this file
   --log-rotate-lines LOG_ROTATE_LINES
                         Rotate the log file after this many lines (requires
@@ -134,7 +153,39 @@ options:
                         Rotate the log file when it reaches this size in GiB
                         (requires --log-file)
   --no-copy-file-range  Disable use of copy_file_range and always use
-                        userspace copy
+                        userspace copy. DEFAULT since 2026-09-05: a 15-thread
+                        A/B on a production volume measured copy_file_range no
+                        faster overall (154.0 vs 170.1 MiB/s) and 1.3-2.1x
+                        SLOWER for files under 1 MiB, which is the size range
+                        these jobs now work in.
+  --copy-file-range     Opt back in to copy_file_range (server-side copy when
+                        CephFS supports it). Off by default; see --no-copy-
+                        file-range.
+  --source-pool POOL    Only transcode files whose CURRENT data pool is POOL.
+                        Without it, every file not already on the target pool
+                        is eligible. Use this to drain one pool into another
+                        without also sweeping the default pool.
+  --prune-small-subtrees
+                        Skip whole subtrees whose recursive size makes them
+                        not worth walking, using the MDS's own
+                        ceph.dir.rbytes/rfiles (one getfattr per directory, no
+                        walk). OFF by default: it changes what the pass
+                        covers, which should always be deliberate. INERT
+                        without --min-size, since the mean-size test compares
+                        against min-size/8; a warning is logged at startup if
+                        you pass this with --min-size 0.
+  --prune-subtree-max-bytes BYTES
+                        With --prune-small-subtrees, only prune a subtree
+                        whose TOTAL recursive bytes are below this (default 1
+                        GiB). This is a bound on what pruning can cost you:
+                        whatever the size distribution inside, skipping the
+                        subtree forgoes at most this many bytes.
+  --prune-budget-bytes BYTES
+                        With --prune-small-subtrees, stop pruning once this
+                        many bytes have been skipped in total (default 100
+                        GiB). Deliberately finite: the per-subtree bound above
+                        says nothing about the aggregate, so without this a
+                        pass could skip unbounded data a gigabyte at a time.
   --max-files MAX_FILES
                         Stop after submitting this many files for transcoding
   --file-delay MS       Delay in milliseconds before statting each new file
@@ -145,16 +196,73 @@ options:
                         is pruned from the walk entirely (not descended into
                         or statted). Anchor with ^ / $ for exact names, e.g.
                         '\.runfiles$' to skip Bazel runfiles symlink farms.
+                        Overrides the built-in default set (see
+                        DEFAULT_PRUNE_DIRS); pass an empty string to disable
+                        pruning entirely.
 
 runtime signals:
   SIGUSR1  (10)  increase thread count by 1 (resumes from pause)
   SIGUSR2  (12)  decrease thread count by 1 (0 = pause)
   SIGTSTP  (20)  throttle to 1 thread (Ctrl+Z)
-  SIGRTMIN (34)  increase file delay by 100ms
-  SIGRTMIN+1(35) decrease file delay by 100ms
+  SIGRTMIN (34)  increase file delay x1.25 (min +1ms, cap 600000ms)
+  SIGRTMIN+1(35) decrease file delay /1.25 (min -1ms, floor 0ms)
   SIGRTMIN+2(36) increase min-age by 3 days
   SIGRTMIN+3(37) decrease min-age by 3 days (min 1)
   SIGRTMIN+4(38) dump current state/tunables to the log
+
+example --config file (every key at its default):
+
+    # vcephfs_transcoder runtime config -- VOLUME
+    # Conventional path: /home/USER/tc_VOLUME.conf
+    #
+    # Re-read when this file's mtime changes (--config-poll-seconds,
+    # default 10s). Only keys whose value CHANGED in the file are applied,
+    # so editing one line never re-asserts the others -- a delay set by
+    # signal survives an unrelated edit here.
+    #
+    # Keep this on LOCAL disk, never inside the CephFS volume: a stat there
+    # is an MDS round trip, which is the load being bounded.
+    #
+    # Every key is optional. Commenting one out means this file does not
+    # assert it at all, leaving it to the command line or to signals.
+    
+    # --- pace -------------------------------------------------------------
+    # Sleep per file ENCOUNTERED in the walk, before the stat. Scan rate is
+    # 1000/file_delay_ms files/s REGARDLESS of threads -- the walker is
+    # single-threaded and is what gates a pass. 0 = unthrottled.
+    file_delay_ms   = 0
+    
+    # Concurrent copies. Bounds the copier, not the walker. 0 pauses the job
+    # (in-flight copies finish); set > 0 to resume.
+    threads         = 1
+    
+    # --- how the delay signals move ---------------------------------------
+    # SIGRTMIN multiplies the delay, SIGRTMIN+1 divides it. Separate rates
+    # let backing off be coarser than recovering: 2.0 up with 1.1 down
+    # retreats in doublings and probes back in 10% increments.
+    delay_step_up   = 1.25
+    delay_step_down = 1.25
+    
+    # Floor for the down direction. 0 permits a step to fully unthrottled;
+    # raise it to guarantee the signal path can never do that on a live
+    # filesystem.
+    delay_min_ms    = 0
+    
+    # --- what counts as eligible ------------------------------------------
+    # Skip files modified within this many days.
+    min_age_days    = 1
+    
+    # Skip files smaller than this many bytes. Pre-Tentacle, EC pads small
+    # objects to a whole stripe, which is why this is not lower.
+    min_size        = 512000
+    
+    # --- what to skip entirely --------------------------------------------
+    # Matched against directory NAMES during the walk; matches are never
+    # descended into or statted. Cost is one regex match per directory, not
+    # per file. Set empty to disable pruning entirely.
+    prune_dir_regex = ^(\.runfiles|site\-packages|node_modules|__pycache__|\.venv|venv|penv|renv|packrat|\.git|\.tox|\.mypy_cache|\.pytest_cache|\.cargo|\.gradle)$
+
+    redirect it to disk with:  vcephfs_transcoder.py --print-config-example > /home/USER/tc_VOLUME.conf
 ```
 
 
