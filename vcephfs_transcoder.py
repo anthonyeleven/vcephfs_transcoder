@@ -7,7 +7,7 @@
 #
 # MIT license (https://opensource.org/license/mit)
 
-import errno, shlex
+import errno, json, shlex
 import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
 import threading, uuid, argparse
@@ -833,6 +833,108 @@ def get_layout_walking_up(path):
         parent = os.path.split(parent)[0]
         layout = CephLayout.from_dir(parent)
     return layout
+
+
+def alloc_bytes(size, scheme, min_alloc):
+    """Allocated bytes for one file under a redundancy scheme on given media.
+
+    scheme is ("rep", n) or ("ec", k, m, stripe_unit). Two roundings apply and
+    both matter for small files: EC pads to whole stripe rows, and every shard
+    (or replica) then rounds up to min_alloc. The effective granularity is
+    therefore max(stripe_unit, min_alloc), not either one alone.
+    """
+    if scheme[0] == "rep":
+        return scheme[1] * (-(-size // min_alloc)) * min_alloc
+    _, k, m, su = scheme
+    rows = -(-size // (k * su))
+    per_shard = rows * su
+    return (k + m) * (-(-per_shard // min_alloc)) * min_alloc
+
+
+def size_crossover(src_scheme, dst_scheme, min_alloc, step=4096, limit=64 << 20):
+    """Smallest file size at which dst allocates strictly less than src.
+
+    Returns None if dst never wins below `limit`. Deliberately general in the
+    SOURCE scheme: comparing against 3x replication only is wrong whenever the
+    source is R2 or another EC profile, and the answer moves a long way. With
+    4k min_alloc, R3 -> EC6+3 crosses at 16 KiB but R2 -> EC6+3 at 20 KiB, and
+    at 16-32 KiB EC6+3 beats R3 while losing to R2.
+    """
+    for size in range(step, limit + 1, step):
+        if alloc_bytes(size, dst_scheme, min_alloc) < alloc_bytes(size, src_scheme, min_alloc):
+            return size
+    return None
+
+
+def _pool_scheme(pool):
+    """Best-effort ("rep", n) / ("ec", k, m, su) for a pool name, else None.
+
+    Needs the ceph CLI and a usable keyring. The transcoder runs on clients that
+    often have neither, so every failure path returns None and the caller simply
+    skips the advisory. This must never be load-bearing.
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["ceph", "osd", "pool", "ls", "detail", "-f", "json"],
+            capture_output=True, text=True, timeout=15)
+        if out.returncode != 0:
+            return None
+        for pd in json.loads(out.stdout):
+            if pd.get("pool_name") != pool:
+                continue
+            if pd.get("type") == 1 or pd.get("erasure_code_profile") in (None, "", "replicated_rule"):
+                return ("rep", int(pd.get("size", 3)))
+            sw = int(pd.get("stripe_width", 0))
+            prof = subprocess.run(
+                ["ceph", "osd", "erasure-code-profile", "get",
+                 pd["erasure_code_profile"], "-f", "json"],
+                capture_output=True, text=True, timeout=15)
+            if prof.returncode != 0:
+                return None
+            pj = json.loads(prof.stdout)
+            k, m = int(pj["k"]), int(pj["m"])
+            su = (sw // k) if (sw and k) else 4096
+            return ("ec", k, m, su)
+    except Exception:
+        return None
+    return None
+
+
+def _min_alloc_hint():
+    """Cluster-configured bluestore_min_alloc_size_ssd, or None."""
+    try:
+        import subprocess
+        out = subprocess.run(["ceph", "config", "get", "osd",
+                              "bluestore_min_alloc_size_ssd"],
+                             capture_output=True, text=True, timeout=15)
+        return int(out.stdout.strip()) if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def crossover_warning(src_pool, dst_pool, min_size):
+    """Advisory if min_size sits below the size where the move starts paying.
+
+    Returns a message or None. Advisory only: below the crossover a transcode
+    consumes MORE raw space than it frees, which no other check would catch.
+    """
+    src = _pool_scheme(src_pool)
+    dst = _pool_scheme(dst_pool)
+    if not src or not dst:
+        return None
+    ma = _min_alloc_hint() or 4096
+    x = size_crossover(src, dst, ma)
+    if x is None:
+        return ("%s -> %s never saves space at min_alloc %d: every size costs at "
+                "least as much on the target. Check the target profile."
+                % (src_pool, dst_pool, ma))
+    if min_size and min_size >= x:
+        return None
+    return ("--min-size %d is below the %d-byte crossover for %s -> %s at "
+            "min_alloc %d. Files under %d bytes cost MORE raw space after "
+            "transcoding than before."
+            % (min_size, x, src_pool, dst_pool, ma, x))
 
 
 def _prune_inert_warning(args):
@@ -1723,6 +1825,19 @@ def main():
             "--force-tmpdir-pool given; continuing despite the pool conflict. "
             "Layout-application failures will NOT be detectable in this run."
         )
+
+    # Advisory: below the crossover a transcode consumes MORE raw space than it
+    # frees, and nothing else here would notice. Source defaults to the tmpdir's
+    # pool (the FS default pool, where most untranscoded data lives); --source-pool
+    # overrides it so a pool-to-pool drain is judged against the right baseline.
+    # Best-effort -- needs the ceph CLI, and stays silent without it.
+    for _d in args.dirs:
+        _t = get_layout_walking_up(_d)
+        if _t is None:
+            continue
+        _msg = crossover_warning(args.source_pool or layout.pool, _t.pool, args.min_size)
+        if _msg:
+            logging.warning(_msg)
 
     def signal_handler(sig, frame):
         name = signal.Signals(sig).name

@@ -44,6 +44,9 @@
 #     rule:     ec<k>.<m>-rule-<class> e.g. ec8.2-rule-hdd
 #     pool:     cephfs.<vol>.ec<k>.<m>.<class>.data
 #   --pg-num INT           PG count for new pool (default: 128)
+#   --pg-autoscale-mode MODE
+#                          PG autoscale mode for new pool (default: off)
+#                          (e.g. "off", "on", "warn")
 #   --tmpdir PATH          Temp dir for transcoder (default: mount/tmp)
 #   --fastec               Enable allow_ec_optimizations (FastEC)
 #   --compression MODE     Compression mode for new pool (default: aggressive)
@@ -85,6 +88,7 @@ EC_M=""
 CRUSH_DEVICE_CLASS=""
 REPLICATED=false
 PG_NUM=128
+PG_AUTOSCALE_MODE="off"
 
 # --- Helpers ----------------------------------------------------------------
 usage() {
@@ -124,6 +128,93 @@ crush_rule_exists() {
     ceph osd crush rule ls 2>/dev/null | grep -qx "$1"
 }
 
+# Survey bluestore_min_alloc_size across the OSDs that will back a pool.
+#
+# Why this matters at pool-creation time: min_alloc sets the per-shard rounding,
+# so it decides the size below which erasure coding costs MORE raw space than
+# the replication it replaces. Getting it wrong is not a performance problem you
+# can tune away later -- stripe_unit and min_alloc are fixed for the life of the
+# pool, and the only remedy is creating a new pool and moving the data again.
+#
+# A MIXED population is not simply "use the largest". Shards land on whichever
+# OSDs CRUSH picks, so the expected allocation is the weighted mean across the
+# population; the largest value is the worst case, not the expectation. Both are
+# reported.
+#
+# Best-effort throughout: this needs `ceph` and a working keyring. It runs on a
+# mon in our deployment, but that is a local convention, not a property of the
+# tool -- anywhere it cannot query, it warns once and returns without blocking.
+survey_min_alloc() {
+    local rule="$1"
+    local -a osds=()
+    local out
+
+    if ! command -v ceph >/dev/null 2>&1; then
+        log_warn "ceph CLI not found; skipping min_alloc_size survey."
+        log_warn "Run this on a host with cluster admin access to check it."
+        return 0
+    fi
+
+    out=$(ceph osd crush rule dump "$rule" -f json 2>/dev/null) || {
+        log_warn "Could not read CRUSH rule '$rule'; skipping min_alloc_size survey."
+        return 0
+    }
+
+    # Device class the rule targets, e.g. "default~ssd" -> ssd
+    local cls
+    cls=$(printf '%s' "$out" | tr ',' '\n' | grep -o '"item_name"[^,]*' | head -1 |
+          sed -E 's/.*"default~?([a-z0-9-]*)".*/\1/')
+
+    if [ -n "$cls" ]; then
+        mapfile -t osds < <(ceph osd crush class ls-osd "$cls" 2>/dev/null)
+    fi
+    if [ "${#osds[@]}" -eq 0 ]; then
+        mapfile -t osds < <(ceph osd ls 2>/dev/null)
+    fi
+    if [ "${#osds[@]}" -eq 0 ]; then
+        log_warn "Could not enumerate OSDs; skipping min_alloc_size survey."
+        return 0
+    fi
+
+    # Sample rather than query every OSD: metadata is one round trip each and a
+    # fleet can be thousands. A mixed population shows up in a sample of 40.
+    local sample=40 n=0 val
+    local -A counts=()
+    local i
+    for i in "${osds[@]}"; do
+        [ "$n" -ge "$sample" ] && break
+        val=$(ceph osd metadata "$i" -f json 2>/dev/null |
+              grep -o '"bluestore_min_alloc_size"[^,]*' |
+              sed -E 's/.*: *"?([0-9]+)"?.*/\1/')
+        [ -n "$val" ] || continue
+        counts["$val"]=$(( ${counts[$val]:-0} + 1 ))
+        n=$(( n + 1 ))
+    done
+
+    if [ "$n" -eq 0 ]; then
+        log_warn "No OSD metadata readable; skipping min_alloc_size survey."
+        return 0
+    fi
+
+    if [ "${#counts[@]}" -eq 1 ]; then
+        local only
+        for only in "${!counts[@]}"; do :; done
+        log_info "min_alloc_size uniform across $n sampled OSDs (class ${cls:-any}): $only bytes"
+        return 0
+    fi
+
+    log_warn "MIXED bluestore_min_alloc_size across $n sampled OSDs (class ${cls:-any}):"
+    local k maxv=0
+    for k in "${!counts[@]}"; do
+        log_warn "    $k bytes on ${counts[$k]}/$n sampled ($(( 100 * counts[$k] / n ))%)"
+        [ "$k" -gt "$maxv" ] && maxv="$k"
+    done
+    log_warn "  Space amplification will be a weighted MEAN across this population,"
+    log_warn "  not a single figure. Worst case per shard is $maxv bytes, which is"
+    log_warn "  what the EC-vs-replication crossover should be computed against."
+    log_warn "  Consider confining the pool to one class so the math is predictable."
+}
+
 require_arg() {
     local varname="$1"
     local val="${!varname:-}"
@@ -147,6 +238,7 @@ while [ $# -gt 0 ]; do
         --crush-device-class) CRUSH_DEVICE_CLASS="$2"; shift 2 ;;
         --replicated)        REPLICATED=true;          shift   ;;
         --pg-num)            PG_NUM="$2";              shift 2 ;;
+        --pg-autoscale-mode) PG_AUTOSCALE_MODE="$2";  shift 2 ;;
         --tmpdir)            TRANSCODE_TMPDIR_OVERRIDE="$2";     shift 2 ;;
         --fastec)          FASTEC=true;            shift   ;;
         --compression)       COMPRESSION="$2";         shift 2 ;;
@@ -169,6 +261,7 @@ require_arg MOUNT
 [[ "$MIN_AGE" =~ ^[1-9][0-9]*$ ]] || { log_err "--min-age must be a positive integer"; exit 1; }
 [[ "$PG_NUM" =~ ^[1-9][0-9]*$ ]] || { log_err "--pg-num must be a positive integer"; exit 1; }
 (( (PG_NUM & (PG_NUM - 1)) == 0 )) || { log_err "--pg-num must be a power of 2 (got ${PG_NUM})"; exit 1; }
+[[ "$PG_AUTOSCALE_MODE" =~ ^(on|off|warn)$ ]] || { log_err "--pg-autoscale-mode must be 'on', 'off', or 'warn'"; exit 1; }
 
 # Derive volume name from the last component of the mount path
 # e.g. /shared/cephlab/howie -> howie
@@ -272,6 +365,7 @@ echo "  CRUSH rule:       ${CRUSH_RULE}"
 fi
 echo "  Pool name:        ${POOL_NAME}"
 echo "  PG num:           ${PG_NUM}"
+echo "  PG autoscale:     ${PG_AUTOSCALE_MODE}"
 echo "  Compression:      ${COMPRESSION} (${COMPRESSION_ALG})"
 echo "  Temp dir:         ${TRANSCODE_TMPDIR}"
 if [ "$REPLICATED" = false ]; then
@@ -312,6 +406,7 @@ if [ "$SKIP_POOL_SETUP" = false ]; then
         else
             log_info "Pool 1: Create replicated data pool '${POOL_NAME}' (pg_num=${PG_NUM})"
             run ceph osd pool create "${POOL_NAME}" "${PG_NUM}" "${PG_NUM}" replicated
+            run ceph osd pool set "${POOL_NAME}" pg_autoscale_mode "${PG_AUTOSCALE_MODE}"
         fi
 
         log_info "Pool 2: Add data pool to filesystem '${VOLUME}'"
@@ -336,6 +431,11 @@ if [ "$SKIP_POOL_SETUP" = false ]; then
         else
             log_info "Pool 2: Create CRUSH rule '${CRUSH_RULE}'"
             run ceph osd crush rule create-erasure "${CRUSH_RULE}" "${EC_PROFILE}"
+
+        # Check the media before committing: stripe_unit and min_alloc are fixed
+        # for the life of the pool, and they set the size below which EC costs
+        # more raw space than the replication it replaces.
+        survey_min_alloc "${CRUSH_RULE}" || true
         fi
 
         if pool_exists "${POOL_NAME}"; then
@@ -343,6 +443,7 @@ if [ "$SKIP_POOL_SETUP" = false ]; then
         else
             log_info "Pool 3: Create EC data pool '${POOL_NAME}' (pg_num=${PG_NUM})"
             run ceph osd pool create "${POOL_NAME}" "${PG_NUM}" "${PG_NUM}" erasure "${EC_PROFILE}"
+            run ceph osd pool set "${POOL_NAME}" pg_autoscale_mode "${PG_AUTOSCALE_MODE}"
 
             log_info "Pool 4: Set pool CRUSH rule to '${CRUSH_RULE}' and remove auto-created rule"
             run ceph osd pool set "${POOL_NAME}" crush_rule "${CRUSH_RULE}"
