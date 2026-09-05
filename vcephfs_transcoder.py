@@ -31,6 +31,64 @@ thread_count = None
 file_delay_ms = 0
 min_age_days = 1
 
+# --- what transcoding costs in objects, and where it lands -------------------
+#
+# Measured on a 980-OSD production cluster, 2026-09-05. All figures from live
+# probes rather than from the documentation, because several of them are not
+# what the documentation implies.
+#
+# FIRST vs DEFAULT. These are different things and conflating them is the easy
+# mistake here:
+#   - The filesystem's FIRST data pool is data_pools[0], fixed when the fs is
+#     created. It cannot be changed and it cannot be removed.
+#   - A directory's DEFAULT pool is whatever ceph.dir.layout.pool says for that
+#     directory. It is freely settable, including on the volume root, which is
+#     how a transcode target is chosen.
+# Pointing the root layout at an EC pool changes where NEW files land. It does
+# NOT change the first data pool.
+#
+# BACKTRACES. Every inode carries a backtrace -- the path from the inode to the
+# root, used for hard-link resolution, for path lookup when the inode is not in
+# the MDS cache, and by cephfs-data-scan to rebuild a lost metadata pool from
+# the data pools alone. Verified placement:
+#   - always in the FIRST data pool, whatever the file's layout;
+#   - also in the file's CURRENT pool, when that differs from the first;
+#   - also in every pool in the inode's old_pools, i.e. any pool its layout has
+#     ever pointed at. Switching a file's layout after creation therefore leaves
+#     a permanent backtrace behind in the old pool.
+#
+# So a file whose data lives outside the first pool costs TWO objects, not one:
+# its data object, plus a zero-byte object in the first pool holding only the
+# backtrace. Measured on real transcoded files: size 0, a 305-355 byte `parent`
+# xattr, and zero omap entries. It is an xattr on a RADOS object, not omap --
+# the data pools report 0 B of omap; all omap lives in the metadata pool.
+#
+# This is the price of using a non-first pool, NOT a price of transcoding. A
+# file created directly on the EC pool carries exactly the same two objects.
+# Transcoding only moves files into that state sooner. Once the volume root
+# points at an EC pool, every new file pays it too.
+#
+# The old inode is genuinely gone. A transcode does not move a file: it creates
+# a new inode, copies into it, and renames over the original, which unlinks the
+# old inode completely -- verified absent from all pools after a journal flush.
+# So a non-first source pool really can be emptied and deleted. The FIRST pool
+# never can be: it keeps a backtrace for every inode in the filesystem.
+#
+# WHAT IT COSTS. Not capacity. Across 980 OSDs holding 17.4 PiB, BlueStore
+# metadata (RocksDB/BlueFS) totalled 63.4 TiB, or 0.36% of used space, with the
+# DB colocated on the block device on every OSD. The cost is OBJECT COUNT, which
+# drives scrub duration, recovery granularity, peering cost and onode cache
+# pressure. Per-GB is the wrong denominator; per-OSD and per-PG are the right
+# ones. This is the mechanism behind "bytes leave, objects stay": a fully
+# transcoded volume keeps one zero-byte object per file in its first pool
+# forever, so the pool's object count does not fall even as its stored bytes
+# approach zero.
+#
+# Corollary for widening an EC profile, e.g. 4+2 -> 8+2: shard count per object
+# rises from 6 to 10, so object count rises with it. On a cluster where the DB
+# is on a separate device rather than colocated, that is the case to size for
+# before starting.
+
 # --- multiplicative delay stepping -------------------------------------------
 # The delay knob is hyperbolic: +100ms at 2000ms is a 5% rate change, at 100ms
 # it is a 100x change. A fixed additive step therefore cannot serve both ends of

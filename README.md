@@ -280,3 +280,77 @@ Example invocations:
 This was presented at Ceph Day Seattle 2026, and based on a script posted
 to Reddit by `marcan42`.
 
+
+## Why a file-level transcoder, and not RADOS-layer pool migration
+
+Ceph has an in-flight alternative: transparent pool migration at the RADOS layer,
+below the filesystem — see ceph/ceph
+[#65746 "Pool Migration"](https://github.com/ceph/ceph/pull/65746) and
+[#69112 "Pool Migration 2"](https://github.com/ceph/ceph/pull/69112) by `jamiepryde`.
+It uses the redirect/manifest shape: the source pool keeps a small redirect object per
+migrated object and clients are forwarded transparently.
+
+The two approaches trade off in opposite directions, and which one you want depends
+almost entirely on whether you need the source pool to go away.
+
+| | This transcoder | RADOS-layer redirect |
+|---|---|---|
+| Layer | File, MDS-mediated | Object, below the filesystem |
+| Residue in the source pool | A zero-byte backtrace object, and only in the filesystem's **first** data pool | A redirect object per migrated object, in **every** source pool |
+| Can the source pool be deleted afterwards? | **Yes**, for any pool that is not the filesystem's first data pool | **No** — the redirects are load-bearing |
+| Client transparency | Each replacement is an atomic rename, but it is per-file work | Fully transparent; no walk at all |
+| Cost model | One full tree walk plus per-file MDS operations | No walk, but a permanent indirection on every read |
+| Reversible mid-flight? | Yes — stop the job; whatever moved has moved | Bounded by the redirect layer's own lifecycle |
+
+The short version: this tool pays an enormous one-time walk and in exchange leaves a
+source pool that is genuinely empty and can be dropped. The redirect model skips the
+walk entirely, and in exchange you carry the source pool and an extra hop forever.
+
+### What "empty" actually means
+
+Verified on a production cluster rather than inferred:
+
+- A transcode does not move a file. It creates a **new inode**, copies into it, then
+  renames over the original — which unlinks the old inode completely. After a journal
+  flush the old inode's objects are absent from every pool, so a non-first source pool
+  really does reach zero and can be deleted.
+- Every inode keeps a backtrace in the filesystem's **first** data pool
+  (`data_pools[0]`), regardless of where its data lives. That pool can never be
+  emptied, and it is not the same thing as a directory's *default* pool
+  (`ceph.dir.layout.pool`), which is freely settable and is how a transcode target is
+  chosen. Pointing the volume root at an EC pool changes where new files land; it does
+  not change the first data pool.
+- A file whose data is outside the first pool therefore costs **two** objects: its data
+  object, plus a zero-byte object in the first pool holding only the backtrace —
+  measured at size 0, a 305-355 byte `parent` xattr, zero omap entries.
+
+That last point is the price of using a non-first pool, **not** a price of transcoding:
+a file created directly on the EC pool carries exactly the same two objects.
+
+### The cost is object count, not capacity
+
+Across 980 OSDs holding 17.4 PiB, with the BlueStore DB colocated on the block device
+on every OSD:
+
+```
+    raw size         23512.7 TiB
+    used total       17403.0 TiB
+      of which data  17332.3 TiB
+      of which META     63.4 TiB   <- RocksDB/BlueFS
+      of which omap      7.4 TiB
+    META as % of used: 0.36%
+```
+
+Metadata is 0.36% of used space, so capacity is not the concern. Object count is: it
+drives scrub duration, recovery granularity, peering cost and onode cache pressure.
+Per-GB is the wrong denominator; per-OSD and per-PG are the right ones.
+
+This is the mechanism behind "bytes leave, objects stay" — a fully transcoded volume
+keeps one zero-byte object per file in its first pool forever, so its object count does
+not fall even as its stored bytes approach zero. Size pools for the object count they
+will retain, not the bytes they will shed.
+
+A corollary if you are widening an EC profile rather than migrating from replication:
+4+2 to 8+2 raises shards per object from 6 to 10, so object count rises with it. On a
+cluster whose DB lives on a separate device rather than colocated, that is the case to
+size for before starting.
