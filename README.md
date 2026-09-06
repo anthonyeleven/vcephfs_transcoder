@@ -281,6 +281,64 @@ This was presented at Ceph Day Seattle 2026, and based on a script posted
 to Reddit by `marcan42`.
 
 
+## Runtime configuration
+
+Long passes need retuning while they run. A pass over a large volume takes weeks,
+the filesystem underneath it does not hold still for that long, and restarting to
+change a setting throws away the walk position — there is no checkpoint, so a
+restart re-walks from the top.
+
+So the tunables live in a `key = value` file, re-read whenever its mtime changes:
+
+```
+vcephfs_transcoder.py --print-config-example > ~/tc_myvolume.conf
+vcephfs_transcoder.py --config ~/tc_myvolume.conf /mnt/cephfs/myvolume ...
+```
+
+Edit the file and the running job picks it up within `--config-poll-seconds`
+(default 10). No restart, no signals, no lost position. `--print-config-example`
+emits every key at its default with the reasoning for each inline, so the file is
+its own documentation; the same example is reproduced in `--help`.
+
+Currently settable at runtime: `file_delay_ms`, `threads`, `min_age_days`,
+`min_size`, `prune_dir_regex`, `prune_subtree_max_bytes`, `prune_budget_bytes`,
+and the delay-stepping controls `delay_step_up` / `delay_step_down` /
+`delay_min_ms`.
+
+### The trap: every edit re-applies every key
+
+An edit to the file re-applies **all** the keys it contains, not just the one you
+changed. So any key left present in the file is silently reasserted whenever you
+touch anything else.
+
+This is not hypothetical. Lowering `min_size` on a running job reset its thread
+count from 15 back to 1, because `threads` was still set in the file from an
+earlier session, and the job crawled until somebody noticed.
+
+If an external controller owns a tunable, **comment that key out**:
+
+```
+# threads and file_delay_ms are owned by the controller. Leaving them set here
+# means any unrelated edit to this file resets them.
+# threads         = 1
+# file_delay_ms   = 100
+min_age_days    = 33
+min_size        = 131072
+```
+
+A key that is absent is not applied. A key that is present is applied on every
+reload, whether or not you meant to change it.
+
+### Notes
+
+- One file per volume. The jobs are independent and their sensible settings
+  differ by orders of magnitude — a volume of 4 MiB files and a volume of 30 KiB
+  files want nothing in common.
+- Comments are stripped at `#`, and keys split on the first `=`, so values may
+  contain `=` but not `#`.
+- Unknown keys are rejected with an error naming the line, rather than ignored —
+  a typo in a tuning edit should not read as success.
+
 ## Why a file-level transcoder, and not RADOS-layer pool migration
 
 Ceph has an in-flight alternative: transparent pool migration at the RADOS layer,
