@@ -7,7 +7,7 @@
 #
 # MIT license (https://opensource.org/license/mit)
 
-import errno, json, shlex
+import errno, json, shlex, urllib.parse, urllib.request
 import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
 import threading, uuid, argparse
@@ -310,7 +310,9 @@ class RuntimeConfig:
     #     delay_min_ms    -> module global   (read by _delay_up/_delay_down)
     KEYS = ('file_delay_ms', 'threads', 'min_age_days', 'min_size',
             'prune_dir_regex', 'delay_step_up', 'delay_step_down',
-            'delay_min_ms', 'prune_subtree_max_bytes', 'prune_budget_bytes')
+            'delay_min_ms', 'prune_subtree_max_bytes', 'prune_budget_bytes',
+            'regulate_prometheus_url', 'regulate_query', 'regulate_pause_ms',
+            'regulate_slo_ms', 'regulate_period_s', 'regulate_quiet_ticks')
 
     def __init__(self, path, poll_seconds=10.0):
         self.path = path
@@ -422,6 +424,18 @@ class RuntimeConfig:
                     iv = int(v)
                     if not 0 <= iv <= DELAY_MAX_MS:
                         raise ValueError("out of range 0..%d" % DELAY_MAX_MS)
+                    out[k] = iv
+                elif k in ('regulate_prometheus_url', 'regulate_query'):
+                    out[k] = v or None
+                elif k in ('regulate_pause_ms', 'regulate_slo_ms'):
+                    fv = float(v)
+                    if fv <= 0:
+                        raise ValueError("must be > 0")
+                    out[k] = fv
+                elif k in ('regulate_period_s', 'regulate_quiet_ticks'):
+                    iv = int(v)
+                    if iv < 1:
+                        raise ValueError("must be >= 1")
                     out[k] = iv
                 elif k in ('prune_subtree_max_bytes', 'prune_budget_bytes'):
                     iv = int(v)
@@ -1053,6 +1067,253 @@ def _prune_inert_warning(args):
     return None
 
 
+
+# --- self-regulation ---------------------------------------------------------
+# Throttle this job against a latency signal the job itself cannot see. Its own
+# stat latency is the wrong measure: it reports what the transcoder experiences,
+# while the thing worth protecting is what the filesystem's real clients
+# experience. That lives in monitoring, so we ask monitoring.
+#
+# This was a separate process (tc_governor.py) driving the job over SIGUSR1/
+# SIGUSR2/SIGRTMIN and then grepping this log to discover whether each signal had
+# landed. Roughly 150 lines of that existed only because it was a second process:
+# PID discovery, signal-coalescing workarounds, a static per-host table of which
+# volume lives where, and re-reading the job's own hit rate back out of its log.
+# In-process those are an attribute read and an assignment. The separate process
+# also died twice without anyone noticing, once leaving a job paused for four
+# days; a thread that raises logs into this file, where it is visible.
+#
+# Everything is optional. With no regulate_prometheus_url the thread never starts
+# and the job runs at whatever file_delay_ms and threads say -- the tool has to be
+# fully usable by anyone who does not have these metrics, or indeed any Prometheus.
+REG_DEFAULTS = {
+    'regulate_prometheus_url': None,
+    'regulate_query': None,
+    'regulate_pause_ms': 150.0,
+    'regulate_slo_ms': 75.0,
+    'regulate_period_s': 30,
+    'regulate_floor_ms': 0,
+    'regulate_quiet_ticks': 10,
+}
+# Raise the delay floor after repeated pauses: pausing repeatedly means the delay
+# is set lower than this filesystem will sustain, and recovering within a tick is
+# not good enough if external alerting has already fired.
+REG_PAUSE_WINDOW_S = 6 * 3600
+REG_PAUSE_MAX = 3
+REG_FLOOR_BACKOFF = 1.5
+REG_FLOOR_CAP_MS = 2000
+# ... and release it again after sustained quiet. A ratchet with no release is a
+# trap: one bad night walks the floor up step by step and it never comes back, so
+# the job stays throttled long after the cause has gone.
+REG_FLOOR_DECAY_S = 1800
+REG_ERR_QUIET_S = 600          # rate-limit repeated query failures to one line
+
+
+def _mds_namespace_for(path):
+    """CephFS filesystem name for the mount containing `path`, or None.
+
+    Read from mds_namespace in /proc/mounts rather than guessed from the path.
+    The path is not a safe substitute. A directory's last path component often
+    differs from the filesystem it lives on -- observed in production, where two
+    similarly named directories resolved to entirely different filesystems -- and
+    querying the wrong one would regulate against a volume this job is not
+    touching, with nothing to indicate it.
+    """
+    try:
+        path = os.path.abspath(path)
+        best, best_ns = "", None
+        with open("/proc/self/mounts") as fh:
+            for line in fh:
+                f = line.split()
+                if len(f) < 4 or f[2] != "ceph":
+                    continue
+                mp = f[1]
+                if (path == mp or path.startswith(mp.rstrip("/") + "/")) and len(mp) > len(best):
+                    for opt in f[3].split(","):
+                        if opt.startswith("mds_namespace="):
+                            best, best_ns = mp, opt.split("=", 1)[1]
+        return best_ns
+    except OSError:
+        return None
+
+
+def _resolve_query(args):
+    """(query, why_disabled). Substitutes {volume} if the query asks for it."""
+    q = getattr(args, "regulate_query", None)
+    if not q:
+        return None, "no regulate_query configured"
+    if "{volume}" not in q:
+        return q, None
+    names = {_mds_namespace_for(d) for d in args.dirs}
+    names.discard(None)
+    if len(names) != 1:
+        return None, (
+            "regulate_query uses {volume} but the filesystem name could not be "
+            "resolved to exactly one value (found %s). Either run one volume per "
+            "job, or write regulate_query without {volume}." % (sorted(names) or "none"))
+    return q.replace("{volume}", re.escape(names.pop())), None
+
+
+class Regulator(threading.Thread):
+    """Poll a latency query and throttle this job to keep it under a threshold."""
+
+    daemon = True
+
+    def __init__(self, args, query):
+        super().__init__(name="regulator")
+        self.args = args
+        self.query = query
+        self.floor_ms = int(args.regulate_floor_ms)
+        self._floor_base = self.floor_ms
+        self._pauses = []
+        self._last_decay = 0.0
+        self._quiet = 0
+        self._last_err = 0.0
+        self._paused_threads = None
+
+    # -- data -----------------------------------------------------------------
+    def sample(self):
+        """Latency in ms, or None when there is no usable answer."""
+        url = self.args.regulate_prometheus_url + "?" + urllib.parse.urlencode(
+            {"query": self.query})
+        with urllib.request.urlopen(url, timeout=45) as r:
+            d = json.load(r)
+        if d.get("status") != "success":
+            raise ValueError("query status %r" % d.get("status"))
+        res = d.get("data", {}).get("result", [])
+        if len(res) != 1:
+            raise ValueError("query returned %d series, need exactly 1" % len(res))
+        v = float(res[0]["value"][1])
+        if v != v or v in (float("inf"), float("-inf")) or v < 0:
+            raise ValueError("query returned %r" % v)
+        return v
+
+    # -- actions --------------------------------------------------------------
+    def _pause(self, lat):
+        global file_delay_ms
+        extra = self._note_pause()
+        if thread_count.limit > 0:
+            self._paused_threads = thread_count.limit
+            thread_count.set_limit(0)
+            logging.warning(
+                "Regulator: PAUSE at %.1f ms (%.0f%% of the %.0f ms target) -- "
+                "threads %d -> 0, in-flight copies will finish%s",
+                lat, 100.0 * lat / self.args.regulate_slo_ms,
+                self.args.regulate_slo_ms, self._paused_threads, extra)
+
+    def _resume(self):
+        if thread_count.limit == 0 and self._paused_threads:
+            thread_count.set_limit(self._paused_threads)
+            logging.info("Regulator: resumed, threads 0 -> %d", self._paused_threads)
+            self._paused_threads = None
+
+    def _ease(self):
+        global file_delay_ms
+        if thread_count.limit == 0 or file_delay_ms <= self.floor_ms:
+            return
+        old = file_delay_ms
+        new = max(_delay_down(old), self.floor_ms)
+        if new != old:
+            file_delay_ms = new
+            _update_proctitle()
+            logging.info("Regulator: quiet, file delay %dms -> %dms (floor %dms)",
+                         old, new, self.floor_ms)
+
+    def _note_pause(self):
+        now = time.time()
+        self._pauses = [t for t in self._pauses if now - t < REG_PAUSE_WINDOW_S] + [now]
+        if len(self._pauses) <= REG_PAUSE_MAX:
+            return " [%d pause(s) in %dh]" % (len(self._pauses), REG_PAUSE_WINDOW_S // 3600)
+        old = self.floor_ms
+        new = min(int(old * REG_FLOOR_BACKOFF) + 1, REG_FLOOR_CAP_MS)
+        if new <= old:
+            return " [floor already at cap %dms]" % REG_FLOOR_CAP_MS
+        self.floor_ms = new
+        self._pauses = []
+        return " [floor raised %dms -> %dms after repeated pauses]" % (old, new)
+
+    def _maybe_decay_floor(self):
+        if self.floor_ms <= self._floor_base:
+            return
+        now = time.time()
+        last = max([self._last_decay] + self._pauses) if self._pauses else self._last_decay
+        if now - last < REG_FLOOR_DECAY_S:
+            return
+        old = self.floor_ms
+        self.floor_ms = max(self._floor_base, int(old / REG_FLOOR_BACKOFF))
+        self._last_decay = now
+        self._pauses = []
+        logging.info("Regulator: quiet %dmin, floor %dms -> %dms (baseline %dms)",
+                     REG_FLOOR_DECAY_S // 60, old, self.floor_ms, self._floor_base)
+
+    # -- loop -----------------------------------------------------------------
+    def run(self):
+        period = max(5, int(self.args.regulate_period_s))
+        while not do_exit.is_set():
+            try:
+                lat = self.sample()
+            except Exception as e:
+                # Hold. A monitoring outage is not evidence about the filesystem,
+                # and acting on absent data is worse than not acting.
+                now = time.time()
+                if now - self._last_err > REG_ERR_QUIET_S:
+                    logging.warning(
+                        "Regulator: no usable sample (%s) -- holding current "
+                        "settings, not adjusting", e)
+                    self._last_err = now
+                do_exit.wait(period)
+                continue
+            if lat >= self.args.regulate_pause_ms:
+                self._quiet = 0
+                self._pause(lat)
+            else:
+                self._resume()
+                self._maybe_decay_floor()
+                self._quiet += 1
+                if self._quiet >= int(self.args.regulate_quiet_ticks):
+                    self._quiet = 0
+                    self._ease()
+            do_exit.wait(period)
+
+
+def start_regulator(args):
+    """Start the regulator, or explain once why it is not running."""
+    if not getattr(args, "regulate_prometheus_url", None):
+        logging.info("Self-regulation disabled (no regulate_prometheus_url); "
+                     "running at file_delay=%dms threads=%d",
+                     file_delay_ms, thread_count.limit)
+        return None
+    query, why = _resolve_query(args)
+    if not query:
+        logging.warning("Self-regulation disabled: %s", why)
+        return None
+    reg = Regulator(args, query)
+    try:
+        lat = reg.sample()
+    except Exception as e:
+        logging.warning("Self-regulation disabled: the query did not return a "
+                        "usable value (%s). Query: %s", e, query)
+        return None
+    # Units are the likeliest misconfiguration and the failure is silent in both
+    # directions: seconds means it never triggers, microseconds means it never
+    # stops. Say what came back so a factor of 1000 is obvious immediately.
+    if lat < 0.01:
+        logging.warning("Regulator: query returned %.6f -- is this SECONDS? "
+                        "regulate_query must return MILLISECONDS. Enabled, but "
+                        "it will likely never trigger.", lat)
+    elif lat > 60000:
+        logging.warning("Regulator: query returned %.0f -- is this MICROSECONDS? "
+                        "regulate_query must return MILLISECONDS. Enabled, but "
+                        "it will pause almost immediately.", lat)
+    logging.info("Regulator: enabled. Sample %.2f ms; pause at %.0f ms, target "
+                 "%.0f ms, poll %ds, delay floor %dms.",
+                 lat, args.regulate_pause_ms, args.regulate_slo_ms,
+                 args.regulate_period_s, reg.floor_ms)
+    logging.info("Regulator: query = %s", query)
+    reg.start()
+    return reg
+
+
 def _recursive_stats(path):
     """(rbytes, rfiles) for a directory from CephFS recursive stats, or (None, None).
 
@@ -1463,6 +1724,8 @@ def process_files(args):
         for line in f:
             mountpoints.add(line.split()[1])
 
+    start_regulator(args)
+
     with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
         tmpdir_dev = os.stat(args.tmpdir).st_dev
         for start_dir in args.dirs:
@@ -1694,6 +1957,46 @@ def main():
         action="store_false",
         help="Opt back in to copy_file_range (server-side copy when CephFS "
              "supports it). Off by default; see --no-copy-file-range.",
+    )
+    parser.add_argument(
+        "--regulate-prometheus-url",
+        default=None,
+        metavar="URL",
+        help="Prometheus /api/v1/query endpoint for self-regulation. Unset "
+             "(the default) disables regulation entirely and the job simply "
+             "runs at --file-delay and --threads.",
+    )
+    parser.add_argument(
+        "--regulate-query",
+        default=None,
+        metavar="PROMQL",
+        help="A complete PromQL expression returning ONE value in MILLISECONDS "
+             "for the latency to protect. {volume} is substituted with the "
+             "CephFS name from the mount, regex-escaped; write the query without "
+             "it if that cannot be derived. Single line, no '#'.",
+    )
+    parser.add_argument(
+        "--regulate-pause-ms", type=float, default=150.0, metavar="MS",
+        help="Pause the job while the query exceeds this (default 150).",
+    )
+    parser.add_argument(
+        "--regulate-slo-ms", type=float, default=75.0, metavar="MS",
+        help="Soft target, used only to express readings as a percentage in log "
+             "messages (default 75). --regulate-pause-ms is what actually gates.",
+    )
+    parser.add_argument(
+        "--regulate-period-s", type=int, default=30, metavar="SEC",
+        help="Seconds between samples (default 30).",
+    )
+    parser.add_argument(
+        "--regulate-floor-ms", type=int, default=0, metavar="MS",
+        help="Lower bound on --file-delay that regulation may ease down to. "
+             "Repeated pauses raise it; sustained quiet releases it back to this "
+             "baseline (default 0).",
+    )
+    parser.add_argument(
+        "--regulate-quiet-ticks", type=int, default=10, metavar="N",
+        help="Consecutive clean samples before easing the delay (default 10).",
     )
     parser.add_argument(
         "--source-pool",
@@ -2091,6 +2394,14 @@ def main():
                         args.min_size // 8,
                         args.prune_budget_bytes,
                     )
+        for _k, _label in (('regulate_pause_ms', 'regulate pause threshold'),
+                           ('regulate_slo_ms', 'regulate soft target'),
+                           ('regulate_period_s', 'regulate poll period'),
+                           ('regulate_quiet_ticks', 'regulate quiet ticks')):
+            if _k in cfg and cfg[_k] != getattr(args, _k, None):
+                _old = getattr(args, _k, None)
+                setattr(args, _k, cfg[_k])
+                logging.info("Config: %s %s -> %s", _label, _old, cfg[_k])
         for _k, _label in (('prune_subtree_max_bytes', 'prune subtree ceiling'),
                            ('prune_budget_bytes', 'prune budget')):
             if _k in cfg and cfg[_k] != getattr(args, _k):

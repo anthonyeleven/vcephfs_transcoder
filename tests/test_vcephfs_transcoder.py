@@ -30,6 +30,14 @@ class Args:
         self.min_size = 0
         self.prune_subtree_max_bytes = 1 << 30
         self.prune_budget_bytes = 100 << 30
+        self.dirs = []
+        self.regulate_prometheus_url = None
+        self.regulate_query = None
+        self.regulate_pause_ms = 150.0
+        self.regulate_slo_ms = 75.0
+        self.regulate_period_s = 30
+        self.regulate_floor_ms = 0
+        self.regulate_quiet_ticks = 10
         self.__dict__.update(kw)
 
 
@@ -225,6 +233,146 @@ class HelpRenders(unittest.TestCase):
                      "--prune-small-subtrees", "--prune-subtree-max-bytes",
                      "--prune-budget-bytes"):
             self.assertIn(flag, r.stdout, f"{flag} missing from --help")
+
+
+class RegulatorConfig(unittest.TestCase):
+    """The disabled paths matter most: anyone without Prometheus must be fine."""
+
+    def test_keys_registered(self):
+        for k in ("regulate_prometheus_url", "regulate_query", "regulate_pause_ms",
+                  "regulate_slo_ms", "regulate_period_s", "regulate_quiet_ticks"):
+            self.assertIn(k, vct.RuntimeConfig.KEYS)
+
+    def test_query_with_equals_and_braces_parses(self):
+        """A PromQL expression is full of '=' and '{'; the parser splits on the
+        FIRST '=' only, so this must survive intact."""
+        q = ('1e3 * sum(increase(m_sum{a="b",c=~"d\\.e\\..*"}[1m]))'
+             ' / sum(increase(m_count{a="b"}[1m]))')
+        out, errs = vct.RuntimeConfig._parse("regulate_query = " + q + "\n")
+        self.assertEqual(errs, [])
+        self.assertEqual(out["regulate_query"], q)
+
+    def test_bad_thresholds_rejected(self):
+        for line in ("regulate_pause_ms = 0\n", "regulate_pause_ms = -5\n",
+                     "regulate_period_s = 0\n"):
+            _, errs = vct.RuntimeConfig._parse(line)
+            self.assertTrue(errs, f"accepted {line!r}")
+
+    def test_empty_url_means_none(self):
+        out, errs = vct.RuntimeConfig._parse("regulate_prometheus_url =\n")
+        self.assertEqual(errs, [])
+        self.assertIsNone(out["regulate_prometheus_url"])
+
+
+class RegulatorVolume(unittest.TestCase):
+    def test_query_without_placeholder_passes_through(self):
+        a = Args(regulate_query="up", dirs=["/nowhere"])
+        q, why = vct._resolve_query(a)
+        self.assertEqual(q, "up")
+        self.assertIsNone(why)
+
+    def test_no_query_is_disabled_not_crash(self):
+        a = Args(regulate_query=None, dirs=["/nowhere"])
+        q, why = vct._resolve_query(a)
+        self.assertIsNone(q)
+        self.assertIn("no regulate_query", why)
+
+    def test_placeholder_without_resolvable_volume_disables(self):
+        """Must refuse rather than guess -- querying the wrong filesystem would
+        regulate against a volume this job is not touching, silently."""
+        a = Args(regulate_query="x{volume}y", dirs=["/definitely/not/a/ceph/mount"])
+        q, why = vct._resolve_query(a)
+        self.assertIsNone(q)
+        self.assertIn("{volume}", why)
+
+    def test_volume_is_regex_escaped(self):
+        """A name containing a dot must not widen the match."""
+        real = vct._mds_namespace_for
+        vct._mds_namespace_for = lambda d: "a.b"
+        try:
+            a = Args(regulate_query='m{d=~"mds\\.{volume}\\..*"}', dirs=["/x"])
+            q, why = vct._resolve_query(a)
+        finally:
+            vct._mds_namespace_for = real
+        self.assertIsNone(why)
+        self.assertIn("a\\.b", q)
+
+    def test_dirs_on_different_volumes_disables(self):
+        real = vct._mds_namespace_for
+        seq = iter(["one", "two"])
+        vct._mds_namespace_for = lambda d: next(seq)
+        try:
+            a = Args(regulate_query="{volume}", dirs=["/a", "/b"])
+            q, why = vct._resolve_query(a)
+        finally:
+            vct._mds_namespace_for = real
+        self.assertIsNone(q)
+        self.assertIn("exactly one", why)
+
+
+class RegulatorBehavior(unittest.TestCase):
+    """Drive the decision logic with a stubbed sample()."""
+
+    def _reg(self, floor=20):
+        a = Args(regulate_prometheus_url="http://x", regulate_query="q",
+                 regulate_pause_ms=150.0, regulate_slo_ms=75.0,
+                 regulate_period_s=30, regulate_floor_ms=floor,
+                 regulate_quiet_ticks=3, dirs=["/x"])
+        return vct.Regulator(a, "q")
+
+    def test_floor_ratchets_then_releases(self):
+        r = self._reg(floor=20)
+        for _ in range(12):
+            r._note_pause()
+        ratcheted = r.floor_ms
+        self.assertGreater(ratcheted, 20, "ratchet did not fire")
+        r._pauses = []
+        for _ in range(8):
+            r._last_decay = time.time() - vct.REG_FLOOR_DECAY_S - 1
+            r._maybe_decay_floor()
+        self.assertEqual(r.floor_ms, 20, "floor never returned to baseline")
+
+    def test_floor_never_below_baseline(self):
+        r = self._reg(floor=20)
+        for _ in range(12):
+            r._note_pause()
+        for _ in range(20):
+            r._pauses = []
+            r._last_decay = time.time() - 99999
+            r._maybe_decay_floor()
+        self.assertEqual(r.floor_ms, 20)
+
+    def test_control_ratchet_alone_does_not_return(self):
+        """Without the decay the floor stays up -- proves the release does work."""
+        r = self._reg(floor=20)
+        for _ in range(12):
+            r._note_pause()
+        self.assertGreater(r.floor_ms, 20)
+
+    def test_bad_samples_raise_rather_than_mislead(self):
+        r = self._reg()
+        for payload in ('{"status":"error"}',
+                        '{"status":"success","data":{"result":[]}}',
+                        '{"status":"success","data":{"result":[{"value":[0,"1"]},'
+                        '{"value":[0,"2"]}]}}',
+                        '{"status":"success","data":{"result":[{"value":[0,"-1"]}]}}',
+                        '{"status":"success","data":{"result":[{"value":[0,"NaN"]}]}}'):
+            with self.subTest(payload=payload[:40]):
+                r_ = self._reg()
+                r_._payload = payload
+                import io, json as _j
+                class _R:
+                    def __init__(self, t): self.t = t
+                    def read(self): return self.t.encode()
+                    def __enter__(self): return self
+                    def __exit__(self, *a): return False
+                real = vct.urllib.request.urlopen
+                vct.urllib.request.urlopen = lambda *a, **k: _R(payload)
+                try:
+                    with self.assertRaises(Exception):
+                        r_.sample()
+                finally:
+                    vct.urllib.request.urlopen = real
 
 
 class Crossover(unittest.TestCase):
