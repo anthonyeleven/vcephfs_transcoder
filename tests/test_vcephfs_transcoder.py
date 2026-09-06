@@ -285,8 +285,14 @@ class RegulatorVolume(unittest.TestCase):
         self.assertIsNone(q)
         self.assertIn("{volume}", why)
 
-    def test_volume_is_regex_escaped(self):
-        """A name containing a dot must not widen the match."""
+    def test_volume_is_escaped_for_regex_and_for_promql(self):
+        """A dot in the name must not widen the match, and the backslash that
+        stops it has to survive PromQL's string layer as well.
+
+        re.escape() alone gives a\\.b, and inside a PromQL double-quoted string
+        that is "unknown escape sequence U+002E" -- an HTTP 400 at every poll,
+        so the regulator silently never comes up.
+        """
         real = vct._mds_namespace_for
         vct._mds_namespace_for = lambda d: "a.b"
         try:
@@ -295,7 +301,19 @@ class RegulatorVolume(unittest.TestCase):
         finally:
             vct._mds_namespace_for = real
         self.assertIsNone(why)
-        self.assertIn("a\\.b", q)
+        self.assertIn(r"a\\.b", q)
+        # and not the single-backslash form, which is the one that 400s
+        self.assertNotIn(r"a\.b", q.replace(r"a\\.b", "<v>"))
+
+    def test_plain_volume_name_is_untouched(self):
+        real = vct._mds_namespace_for
+        vct._mds_namespace_for = lambda d: "myvol"
+        try:
+            a = Args(regulate_query="x{volume}y", dirs=["/x"])
+            q, why = vct._resolve_query(a)
+        finally:
+            vct._mds_namespace_for = real
+        self.assertEqual(q, "xmyvoly")
 
     def test_dirs_on_different_volumes_disables(self):
         real = vct._mds_namespace_for
