@@ -7,18 +7,449 @@
 #
 # MIT license (https://opensource.org/license/mit)
 
-import errno, shlex
+import errno, json, shlex, urllib.parse, urllib.request
 import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
 import threading, uuid, argparse
 
-_VERSION = "1701"
+_VERSION = "2001"
 
-replace_lock = threading.Lock()
+# Replacing a file must be serialized against another worker replacing the
+# SAME file -- that is the only invariant here. A single global lock also
+# serialized every *unrelated* file, which capped effective concurrency at one
+# regardless of --threads (measured 0.96 on a 15-thread job). Stripe by a hash
+# of the path: equal paths always map to the same stripe, so the per-path
+# guarantee holds, while unrelated paths proceed in parallel.
+_REPLACE_LOCK_STRIPES = 64
+_replace_locks = [threading.Lock() for _ in range(_REPLACE_LOCK_STRIPES)]
+
+
+def _replace_lock_for(path):
+    return _replace_locks[hash(path) % _REPLACE_LOCK_STRIPES]
 do_exit = threading.Event()
 thread_count = None
 file_delay_ms = 0
 min_age_days = 1
+
+# --- the tmpdir is the throughput bottleneck, and why it has not moved yet ---
+#
+# Measured 2026-09-05. Renaming the finished temp file out of --tmpdir and into
+# its target directory is where nearly all per-file wall time goes. Controlled
+# A/B/C on one client, same file size, 12 trials each:
+#
+#     A. same directory (deep in the tree)     mean    0.3 ms  p50 0.3  max     0.4
+#     B. tmpdir -> deep dir (what we do)       mean 1266.7 ms  p50 8.2  max 14914.7
+#     C. sibling dir -> deep dir               mean  387.9 ms  p50 0.3  max  4637.0
+#
+# It is bimodal. B's median is a healthy 8.2 ms; the mean is set by a tail that
+# reaches fifteen seconds. Since a stalled worker blocks everything queued
+# behind it, the tail is what determines throughput, not the median. Only case A
+# had no outliers at all.
+#
+# For scale: on the same client, into the same pools, a 256 KiB write plus fsync
+# takes ~5 ms and a cold read ~3 ms. So the storage is roughly 100x faster than
+# what the transcoder extracts from it, and this rename is the reason.
+#
+# THE FIX would be to create the temp file beside its target instead of in a
+# shared tmpdir, making every rename intra-directory. Two documented objections
+# stood in the way; both have now been checked.
+#
+#   1. Detectability. --tmpdir must be on the default data pool so that a failed
+#      layout.apply_file() leaves the file somewhere visibly wrong. A sibling
+#      temp file inherits the target directory's layout, which would mask that.
+#      Answerable: apply the layout and then READ IT BACK before copying. That
+#      is a stronger check than inferring correctness from the tmpdir's pool.
+#
+#   2. "Excess backtrace objects", per the --tmpdir help text. Measured, and it
+#      does not block the change. Backtrace placement depends on the file's
+#      FINAL layout, not on where the temp file was staged: a file outside the
+#      first data pool costs two objects either way. The only case that adds a
+#      third is switching a file's layout after creation, which puts an entry in
+#      old_pools -- and a sibling temp file created directly in a target-pool
+#      directory performs no switch at all. Neutral, not worse.
+#
+# So the change is unblocked but deliberately NOT made here: it touches every
+# file of a petabyte-scale migration and wants its own review, its own PR, and
+# the A/B/C above as its regression test. Do not "simplify" the tmpdir away
+# without reading objection 1.
+
+# --- what transcoding costs in objects, and where it lands -------------------
+#
+# Measured on a 980-OSD production cluster, 2026-09-05. All figures from live
+# probes rather than from the documentation, because several of them are not
+# what the documentation implies.
+#
+# FIRST vs DEFAULT. These are different things and conflating them is the easy
+# mistake here:
+#   - The filesystem's FIRST data pool is data_pools[0], fixed when the fs is
+#     created. It cannot be changed and it cannot be removed.
+#   - A directory's DEFAULT pool is whatever ceph.dir.layout.pool says for that
+#     directory. It is freely settable, including on the volume root, which is
+#     how a transcode target is chosen.
+# Pointing the root layout at an EC pool changes where NEW files land. It does
+# NOT change the first data pool.
+#
+# BACKTRACES. Every inode carries a backtrace -- the path from the inode to the
+# root, used for hard-link resolution, for path lookup when the inode is not in
+# the MDS cache, and by cephfs-data-scan to rebuild a lost metadata pool from
+# the data pools alone. Verified placement:
+#   - always in the FIRST data pool, whatever the file's layout;
+#   - also in the file's CURRENT pool, when that differs from the first;
+#   - also in every pool in the inode's old_pools, i.e. any pool its layout has
+#     ever pointed at. Switching a file's layout after creation therefore leaves
+#     a permanent backtrace behind in the old pool.
+#
+# So a file whose data lives outside the first pool costs TWO objects, not one:
+# its data object, plus a zero-byte object in the first pool holding only the
+# backtrace. Measured on real transcoded files: size 0, a 305-355 byte `parent`
+# xattr, and zero omap entries. It is an xattr on a RADOS object, not omap --
+# the data pools report 0 B of omap; all omap lives in the metadata pool.
+#
+# This is the price of using a non-first pool, NOT a price of transcoding. A
+# file created directly on the EC pool carries exactly the same two objects.
+# Transcoding only moves files into that state sooner. Once the volume root
+# points at an EC pool, every new file pays it too.
+#
+# The old inode is genuinely gone. A transcode does not move a file: it creates
+# a new inode, copies into it, and renames over the original, which unlinks the
+# old inode completely -- verified absent from all pools after a journal flush.
+# So a non-first source pool really can be emptied and deleted. The FIRST pool
+# never can be: it keeps a backtrace for every inode in the filesystem.
+#
+# WHAT IT COSTS. Not capacity. Across 980 OSDs holding 17.4 PiB, BlueStore
+# metadata (RocksDB/BlueFS) totalled 63.4 TiB, or 0.36% of used space, with the
+# DB colocated on the block device on every OSD. The cost is OBJECT COUNT, which
+# drives scrub duration, recovery granularity, peering cost and onode cache
+# pressure. Per-GB is the wrong denominator; per-OSD and per-PG are the right
+# ones. This is the mechanism behind "bytes leave, objects stay": a fully
+# transcoded volume keeps one zero-byte object per file in its first pool
+# forever, so the pool's object count does not fall even as its stored bytes
+# approach zero.
+#
+# Corollary for widening an EC profile, e.g. 4+2 -> 8+2: shard count per object
+# rises from 6 to 10, so object count rises with it. On a cluster where the DB
+# is on a separate device rather than colocated, that is the case to size for
+# before starting.
+
+# --- multiplicative delay stepping -------------------------------------------
+# The delay knob is hyperbolic: +100ms at 2000ms is a 5% rate change, at 100ms
+# it is a 100x change. A fixed additive step therefore cannot serve both ends of
+# the range. A constant ratio gives even ~25% granularity everywhere, so
+# 2100ms -> 0 is 30 steps instead of being unreachable below 100ms.
+# Stays INTEGER milliseconds: 1ms is already ~1000 files/s, at or above what the
+# walker can stat at, so sub-ms would control nothing -- and keeping it integral
+# leaves the log line format unchanged for anything already parsing it.
+# Multiplicative step for the delay signals, separately settable per direction
+# so backing off can be coarser than recovering. "Back off fast, speed up
+# slowly" then lives in the step size as well as in whatever cadence an external
+# controller uses. Both default to 1.25 (a ~25%/20% rate change per step);
+# raise delay_step_up alone to make SIGRTMIN retreat harder.
+DELAY_STEP_UP = 1.25
+DELAY_STEP_DOWN = 1.25
+DELAY_MAX_MS = 600000
+# Floor for the DOWN direction. 0 keeps the historical behavior of allowing a
+# step to unthrottled; set it in the config to guarantee the signal path can
+# never produce an unbounded stat rate on a live filesystem.
+DELAY_MIN_MS = 0
+
+# Where per-volume config files conventionally live: local disk, never in the
+# CephFS volume being walked.
+CONFIG_DIR = os.path.expanduser("~")
+
+# Directory names pruned from the walk unless --prune-dir-regex says otherwise.
+#
+# Every entry is machine-generated, reproducible from a manifest, and composed
+# almost entirely of files below any plausible --min-size, so walking one costs
+# MDS stats and returns nothing. This is a DEFAULT, not a policy: pass
+# --prune-dir-regex to replace the set, or --prune-dir-regex '' to disable
+# pruning entirely. The effective pattern is logged at startup either way.
+#
+# Measured on one production volume: 86.5% of files sat inside virtualenvs, and
+# the largest of 585,309 of them is 503,423 bytes -- below the 512,000 byte
+# threshold, so nothing eligible is lost. Another volume spent 22 days at 1.17%
+# of its files grinding a Bazel .runfiles tree carrying a pip site-packages copy
+# of the awscli examples directory. A third's zero-yield stretch was inside
+# renv/packrat R package libraries.
+#
+# Anchored to whole names: 'venv' prunes a directory called venv, not one
+# called conventions.
+DEFAULT_PRUNE_DIRS = (
+    ".runfiles",        # Bazel symlink farms
+    "site-packages",    # pip
+    "node_modules",     # npm
+    "__pycache__",      # cpython bytecode
+    ".venv", "venv", "penv",
+    "renv", "packrat",  # R package libraries
+    ".git",
+    ".tox", ".mypy_cache", ".pytest_cache",
+    ".cargo", ".gradle",
+)
+DEFAULT_PRUNE_REGEX = "^(%s)$" % "|".join(re.escape(d) for d in DEFAULT_PRUNE_DIRS)
+
+# Set in main() when --config is given; polled from the walker loop.
+runtime_config = None
+apply_config = None
+
+
+def config_example(volume="VOLUME"):
+    """A complete, fully-populated --config file with every key at its default.
+
+    Printed by --help so the set of live tunables is discoverable without
+    reading the source, and so an operator can redirect it straight to a file.
+    Values shown ARE the running defaults, interpolated from the constants
+    above rather than retyped, so this cannot drift.
+    """
+    return "\n".join((
+        "# vcephfs_transcoder runtime config -- %s" % volume,
+        "# Conventional path: %s" % config_path_for(volume),
+        "#",
+        "# Re-read when this file's mtime changes (--config-poll-seconds,",
+        "# default 10s). Only keys whose value CHANGED in the file are applied,",
+        "# so editing one line never re-asserts the others -- a delay set by",
+        "# signal survives an unrelated edit here.",
+        "#",
+        "# Keep this on LOCAL disk, never inside the CephFS volume: a stat there",
+        "# is an MDS round trip, which is the load being bounded.",
+        "#",
+        "# Every key is optional. Commenting one out means this file does not",
+        "# assert it at all, leaving it to the command line or to signals.",
+        "",
+        "# --- pace -------------------------------------------------------------",
+        "# Sleep per file ENCOUNTERED in the walk, before the stat. Scan rate is",
+        "# 1000/file_delay_ms files/s REGARDLESS of threads -- the walker is",
+        "# single-threaded and is what gates a pass. 0 = unthrottled.",
+        "file_delay_ms   = 0",
+        "",
+        "# Concurrent copies. Bounds the copier, not the walker. 0 pauses the job",
+        "# (in-flight copies finish); set > 0 to resume.",
+        "threads         = 1",
+        "",
+        "# --- how the delay signals move ---------------------------------------",
+        "# SIGRTMIN multiplies the delay, SIGRTMIN+1 divides it. Separate rates",
+        "# let backing off be coarser than recovering: 2.0 up with 1.1 down",
+        "# retreats in doublings and probes back in 10% increments.",
+        "delay_step_up   = %s" % DELAY_STEP_UP,
+        "delay_step_down = %s" % DELAY_STEP_DOWN,
+        "",
+        "# Floor for the down direction. 0 permits a step to fully unthrottled;",
+        "# raise it to guarantee the signal path can never do that on a live",
+        "# filesystem.",
+        "delay_min_ms    = %d" % DELAY_MIN_MS,
+        "",
+        "# --- what counts as eligible ------------------------------------------",
+        "# Skip files modified within this many days.",
+        "min_age_days    = 1",
+        "",
+        "# Skip files smaller than this many bytes. Pre-Tentacle, EC pads small",
+        "# objects to a whole stripe, which is why this is not lower.",
+        "min_size        = 512000",
+        "",
+        "# --- what to skip entirely --------------------------------------------",
+        "# Matched against directory NAMES during the walk; matches are never",
+        "# descended into or statted. Cost is one regex match per directory, not",
+        "# per file. Set empty to disable pruning entirely.",
+        "prune_dir_regex = %s" % DEFAULT_PRUNE_REGEX,
+        "",
+    ))
+
+
+def config_path_for(volume):
+    """Conventional config path for a volume.
+
+    One file per volume rather than sections in one file: jobs run on different
+    hosts, so a shared file would need syncing and would invite cross-host
+    read-modify-write races.
+    """
+    return "%s/tc_%s.conf" % (CONFIG_DIR, volume)
+
+
+def _delay_up(old):
+    """One step slower. Always moves by >=1ms; a multiplicative step at small
+    values would otherwise round back to where it started and stick."""
+    if old <= 0:
+        return max(1, DELAY_MIN_MS)
+    return min(max(int(round(old * DELAY_STEP_UP)), old + 1), DELAY_MAX_MS)
+
+
+def _delay_down(old):
+    """One step faster. Stops at DELAY_MIN_MS, which is 0 (unthrottled) unless
+    the config raises it. Same minimum-movement guard."""
+    if old <= DELAY_MIN_MS:
+        return DELAY_MIN_MS
+    if old <= max(1, DELAY_MIN_MS):
+        return DELAY_MIN_MS
+    return max(min(int(old / DELAY_STEP_DOWN), old - 1), DELAY_MIN_MS)
+
+
+class RuntimeConfig:
+    """Live tunables from a key=value file, re-read when its mtime changes.
+
+    Applied on mtime change only, so a signal-driven adjustment persists until
+    the file is next edited -- otherwise the two interfaces fight every poll.
+
+    A bad value is rejected and the previous one kept, loudly: a typo must never
+    stop a running job or silently set the delay to zero.
+
+    Keep the file on LOCAL disk, not in the CephFS volume. A stat there is an
+    MDS round trip, which is exactly the load this whole mechanism exists to
+    bound.
+    """
+
+    # Live tunables are read from two different places at runtime, so a new key
+    # must be applied to whichever one its reader uses or it is silently
+    # ignored. Current split, as applied by _apply_config():
+    #     file_delay_ms   -> module global   (read by the walker loop)
+    #     min_age_days    -> module global   (read by the per-file age test)
+    #     threads         -> thread_count.set_limit()
+    #     min_size        -> args.min_size
+    #     prune_dir_regex -> args.prune_re   (compiled, not the raw string)
+    #     prune_subtree_max_bytes -> args.prune_subtree_max_bytes
+    #     prune_budget_bytes      -> args.prune_budget_bytes
+    #     delay_step_up   -> module global   (read by _delay_up)
+    #     delay_step_down -> module global   (read by _delay_down)
+    #     delay_min_ms    -> module global   (read by _delay_up/_delay_down)
+    KEYS = ('file_delay_ms', 'threads', 'min_age_days', 'min_size',
+            'prune_dir_regex', 'delay_step_up', 'delay_step_down',
+            'delay_min_ms', 'prune_subtree_max_bytes', 'prune_budget_bytes',
+            'regulate_prometheus_url', 'regulate_query', 'regulate_pause_ms',
+            'regulate_slo_ms', 'regulate_period_s', 'regulate_quiet_ticks')
+
+    def __init__(self, path, poll_seconds=10.0):
+        self.path = path
+        self.poll_seconds = poll_seconds
+        self._next = 0.0
+        self._mtime = None
+        # Last values seen IN THE FILE, so an edit only re-applies the keys it
+        # actually changed. Without this, editing any one key re-asserts every
+        # other key in the file and silently reverts whatever a signal had set
+        # in the meantime. Observed 2026-08-30: adding prune_dir_regex to a
+        # running job reset file_delay_ms from 20ms back to the 100ms still
+        # written in the file, discarding four hours of adaptive easing.
+        self._seen = {}
+
+    @staticmethod
+    def _comparable(v):
+        """Regex objects compare by identity, so compare the pattern instead."""
+        return v.pattern if hasattr(v, 'pattern') else v
+
+    def poll(self, apply_cb):
+        now = time.monotonic()
+        if now < self._next:
+            return
+        self._next = now + self.poll_seconds
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            if self._mtime is not None:
+                logging.warning("Config %s disappeared; keeping current tunables",
+                                self.path)
+                self._mtime = None
+            return
+        except OSError as e:
+            logging.warning("Config %s unreadable (%s); keeping current tunables",
+                            self.path, e)
+            return
+        if st.st_mtime == self._mtime:
+            return
+        self._mtime = st.st_mtime
+        try:
+            with open(self.path) as f:
+                raw = f.read()
+        except OSError as e:
+            logging.warning("Config %s read failed (%s)", self.path, e)
+            return
+        parsed, errs = self._parse(raw)
+        for e in errs:
+            logging.error("Config %s: %s (ignored, previous value kept)",
+                          self.path, e)
+
+        # Apply only what changed in the file since the last read. On the very
+        # first read everything is new, which is what we want at startup.
+        if self._seen:
+            changed = {k: v for k, v in parsed.items()
+                       if self._comparable(v) != self._comparable(self._seen.get(k))}
+        else:
+            changed = dict(parsed)
+        self._seen = dict(parsed)
+
+        if changed:
+            apply_cb(changed)
+        elif parsed:
+            logging.info("Config %s changed on disk but no tunable differs; "
+                         "nothing re-applied", self.path)
+
+    @staticmethod
+    def _parse(raw):
+        # Forward reference: _EXECUTOR_MAX_WORKERS is defined below this class.
+        # Safe because _parse only runs at call time, well after import.
+        out, errs = {}, []
+        for n, line in enumerate(raw.splitlines(), 1):
+            line = line.split('#', 1)[0].strip()
+            if not line:
+                continue
+            if '=' not in line:
+                errs.append("line %d: no '='" % n)
+                continue
+            k, v = (x.strip() for x in line.split('=', 1))
+            try:
+                if k == 'file_delay_ms':
+                    iv = int(v)
+                    if not 0 <= iv <= DELAY_MAX_MS:
+                        raise ValueError("out of range 0..%d" % DELAY_MAX_MS)
+                    out[k] = iv
+                elif k == 'threads':
+                    iv = int(v)
+                    if not 0 <= iv <= _EXECUTOR_MAX_WORKERS:
+                        raise ValueError("out of range 0..%d" % _EXECUTOR_MAX_WORKERS)
+                    out[k] = iv
+                elif k == 'min_age_days':
+                    iv = int(v)
+                    if iv < 1:
+                        raise ValueError("must be >= 1")
+                    out[k] = iv
+                elif k == 'min_size':
+                    iv = int(v)
+                    if iv < 0:
+                        raise ValueError("must be >= 0")
+                    out[k] = iv
+                elif k in ('delay_step_up', 'delay_step_down'):
+                    fv = float(v)
+                    # A step of exactly 1.0 would never move; below 1.0 it moves
+                    # the wrong way. Cap well below the point where one step
+                    # spans the whole useful range.
+                    if not 1.01 <= fv <= 10.0:
+                        raise ValueError("must be between 1.01 and 10.0")
+                    out[k] = fv
+                elif k == 'delay_min_ms':
+                    iv = int(v)
+                    if not 0 <= iv <= DELAY_MAX_MS:
+                        raise ValueError("out of range 0..%d" % DELAY_MAX_MS)
+                    out[k] = iv
+                elif k in ('regulate_prometheus_url', 'regulate_query'):
+                    out[k] = v or None
+                elif k in ('regulate_pause_ms', 'regulate_slo_ms'):
+                    fv = float(v)
+                    if fv <= 0:
+                        raise ValueError("must be > 0")
+                    out[k] = fv
+                elif k in ('regulate_period_s', 'regulate_quiet_ticks'):
+                    iv = int(v)
+                    if iv < 1:
+                        raise ValueError("must be >= 1")
+                    out[k] = iv
+                elif k in ('prune_subtree_max_bytes', 'prune_budget_bytes'):
+                    iv = int(v)
+                    if iv < 0:
+                        raise ValueError("must be >= 0")
+                    out[k] = iv
+                elif k == 'prune_dir_regex':
+                    out[k] = re.compile(v) if v else None
+                else:
+                    errs.append("line %d: unknown key %r" % (n, k))
+            except (ValueError, re.error) as e:
+                errs.append("line %d: %s=%r: %s" % (n, k, v, e))
+        return out, errs
+
 
 # setproctitle is optional: when present, the command line shown by `ps` is
 # rewritten live as tunables change. Without it, that refresh is a no-op.
@@ -355,13 +786,26 @@ class Stats:
     files_skipped_small: int = 0
     files_skipped_symlink: int = 0
     files_skipped_large: int = 0
+    files_skipped_source_pool: int = 0
     dirs_pruned: int = 0
+    subtrees_pruned: int = 0
+    bytes_pruned: int = 0
     files_failed: int = 0
     bytes_copied: int = 0
     copy_seconds: float = 0.0
     _symlink_batch: int = 0
     _dirs_pruned_batch: int = 0
     _lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+    def prune_budget_left(self, budget):
+        with self._lock:
+            return budget - self.bytes_pruned
+
+    def note_pruned_subtree(self, nbytes):
+        with self._lock:
+            self.subtrees_pruned += 1
+            self.bytes_pruned += nbytes
+            return ""
 
     def log_progress(self):
         avg = self._avg_throughput_str()
@@ -505,6 +949,398 @@ def get_layout_walking_up(path):
     return layout
 
 
+def alloc_bytes(size, scheme, min_alloc):
+    """Allocated bytes for one file under a redundancy scheme on given media.
+
+    scheme is ("rep", n) or ("ec", k, m, stripe_unit). Two roundings apply and
+    both matter for small files: EC pads to whole stripe rows, and every shard
+    (or replica) then rounds up to min_alloc. The effective granularity is
+    therefore max(stripe_unit, min_alloc), not either one alone.
+    """
+    if scheme[0] == "rep":
+        return scheme[1] * (-(-size // min_alloc)) * min_alloc
+    _, k, m, su = scheme
+    rows = -(-size // (k * su))
+    per_shard = rows * su
+    return (k + m) * (-(-per_shard // min_alloc)) * min_alloc
+
+
+def size_crossover(src_scheme, dst_scheme, min_alloc, step=4096, limit=64 << 20):
+    """Smallest file size at which dst allocates strictly less than src.
+
+    Returns None if dst never wins below `limit`. Deliberately general in the
+    SOURCE scheme: comparing against 3x replication only is wrong whenever the
+    source is R2 or another EC profile, and the answer moves a long way. With
+    4k min_alloc, R3 -> EC6+3 crosses at 16 KiB but R2 -> EC6+3 at 20 KiB, and
+    at 16-32 KiB EC6+3 beats R3 while losing to R2.
+    """
+    for size in range(step, limit + 1, step):
+        if alloc_bytes(size, dst_scheme, min_alloc) < alloc_bytes(size, src_scheme, min_alloc):
+            return size
+    return None
+
+
+def _pool_scheme(pool):
+    """Best-effort ("rep", n) / ("ec", k, m, su) for a pool name, else None.
+
+    Needs the ceph CLI and a usable keyring. The transcoder runs on clients that
+    often have neither, so every failure path returns None and the caller simply
+    skips the advisory. This must never be load-bearing.
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["ceph", "osd", "pool", "ls", "detail", "-f", "json"],
+            capture_output=True, text=True, timeout=15)
+        if out.returncode != 0:
+            return None
+        for pd in json.loads(out.stdout):
+            if pd.get("pool_name") != pool:
+                continue
+            if pd.get("type") == 1 or pd.get("erasure_code_profile") in (None, "", "replicated_rule"):
+                return ("rep", int(pd.get("size", 3)))
+            sw = int(pd.get("stripe_width", 0))
+            prof = subprocess.run(
+                ["ceph", "osd", "erasure-code-profile", "get",
+                 pd["erasure_code_profile"], "-f", "json"],
+                capture_output=True, text=True, timeout=15)
+            if prof.returncode != 0:
+                return None
+            pj = json.loads(prof.stdout)
+            k, m = int(pj["k"]), int(pj["m"])
+            su = (sw // k) if (sw and k) else 4096
+            return ("ec", k, m, su)
+    except Exception:
+        return None
+    return None
+
+
+def _min_alloc_hint():
+    """Cluster-configured bluestore_min_alloc_size_ssd, or None."""
+    try:
+        import subprocess
+        out = subprocess.run(["ceph", "config", "get", "osd",
+                              "bluestore_min_alloc_size_ssd"],
+                             capture_output=True, text=True, timeout=15)
+        return int(out.stdout.strip()) if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def crossover_warning(src_pool, dst_pool, min_size):
+    """Advisory if min_size sits below the size where the move starts paying.
+
+    Returns a message or None. Advisory only: below the crossover a transcode
+    consumes MORE raw space than it frees, which no other check would catch.
+    """
+    src = _pool_scheme(src_pool)
+    dst = _pool_scheme(dst_pool)
+    if not src or not dst:
+        return None
+    ma = _min_alloc_hint() or 4096
+    x = size_crossover(src, dst, ma)
+    if x is None:
+        return ("%s -> %s never saves space at min_alloc %d: every size costs at "
+                "least as much on the target. Check the target profile."
+                % (src_pool, dst_pool, ma))
+    if min_size and min_size >= x:
+        return None
+    return ("--min-size %d is below the %d-byte crossover for %s -> %s at "
+            "min_alloc %d. Files under %d bytes cost MORE raw space after "
+            "transcoding than before."
+            % (min_size, x, src_pool, dst_pool, ma, x))
+
+
+def _prune_inert_warning(args):
+    """Message if subtree pruning is configured but cannot fire, else None.
+
+    The mean-size gate compares against min_size/8, so at min_size 0 it can
+    never be satisfied. min_size is runtime-mutable via --config, so this is
+    re-checked whenever it changes rather than only at startup.
+    """
+    if getattr(args, "prune_small_subtrees", False) and args.min_size <= 0:
+        return (
+            "--prune-small-subtrees is set with min-size 0, so the mean-size "
+            "test (mean < min-size/8) can never be satisfied and NOTHING will "
+            "be pruned. Set min-size to make pruning effective."
+        )
+    return None
+
+
+
+# --- self-regulation ---------------------------------------------------------
+# Throttle this job against a latency signal the job itself cannot see. Its own
+# stat latency is the wrong measure: it reports what the transcoder experiences,
+# while the thing worth protecting is what the filesystem's real clients
+# experience. That lives in monitoring, so we ask monitoring.
+#
+# This was a separate process (tc_governor.py) driving the job over SIGUSR1/
+# SIGUSR2/SIGRTMIN and then grepping this log to discover whether each signal had
+# landed. Roughly 150 lines of that existed only because it was a second process:
+# PID discovery, signal-coalescing workarounds, a static per-host table of which
+# volume lives where, and re-reading the job's own hit rate back out of its log.
+# In-process those are an attribute read and an assignment. The separate process
+# also died twice without anyone noticing, once leaving a job paused for four
+# days; a thread that raises logs into this file, where it is visible.
+#
+# Everything is optional. With no regulate_prometheus_url the thread never starts
+# and the job runs at whatever file_delay_ms and threads say -- the tool has to be
+# fully usable by anyone who does not have these metrics, or indeed any Prometheus.
+REG_DEFAULTS = {
+    'regulate_prometheus_url': None,
+    'regulate_query': None,
+    'regulate_pause_ms': 150.0,
+    'regulate_slo_ms': 75.0,
+    'regulate_period_s': 30,
+    'regulate_floor_ms': 0,
+    'regulate_quiet_ticks': 10,
+}
+# Raise the delay floor after repeated pauses: pausing repeatedly means the delay
+# is set lower than this filesystem will sustain, and recovering within a tick is
+# not good enough if external alerting has already fired.
+REG_PAUSE_WINDOW_S = 6 * 3600
+REG_PAUSE_MAX = 3
+REG_FLOOR_BACKOFF = 1.5
+REG_FLOOR_CAP_MS = 2000
+# ... and release it again after sustained quiet. A ratchet with no release is a
+# trap: one bad night walks the floor up step by step and it never comes back, so
+# the job stays throttled long after the cause has gone.
+REG_FLOOR_DECAY_S = 1800
+REG_ERR_QUIET_S = 600          # rate-limit repeated query failures to one line
+
+
+def _mds_namespace_for(path):
+    """CephFS filesystem name for the mount containing `path`, or None.
+
+    Read from mds_namespace in /proc/mounts rather than guessed from the path.
+    The path is not a safe substitute. A directory's last path component often
+    differs from the filesystem it lives on -- observed in production, where two
+    similarly named directories resolved to entirely different filesystems -- and
+    querying the wrong one would regulate against a volume this job is not
+    touching, with nothing to indicate it.
+    """
+    try:
+        path = os.path.abspath(path)
+        # Touch the path first. These trees are commonly autofs, and an autofs
+        # mount point has no ceph entry in /proc/self/mounts until something
+        # triggers it -- so reading the table cold reports "not a ceph mount" for
+        # a path that is one. The mounts also carry a timeout and unmount when
+        # idle, so this is not only a first-run concern.
+        try:
+            # os.stat is NOT enough: autofs answers a stat of the mount point
+            # itself without mounting anything. Opening the directory is what
+            # triggers it. Read at most one entry -- these are volume roots and
+            # we only need the mount, not a listing.
+            with os.scandir(path) as _it:
+                next(_it, None)
+        except OSError:
+            pass
+        best, best_ns = "", None
+        with open("/proc/self/mounts") as fh:
+            for line in fh:
+                f = line.split()
+                if len(f) < 4 or f[2] != "ceph":
+                    continue
+                mp = f[1]
+                if (path == mp or path.startswith(mp.rstrip("/") + "/")) and len(mp) > len(best):
+                    for opt in f[3].split(","):
+                        if opt.startswith("mds_namespace="):
+                            best, best_ns = mp, opt.split("=", 1)[1]
+        return best_ns
+    except OSError:
+        return None
+
+
+def _resolve_query(args):
+    """(query, why_disabled). Substitutes {volume} if the query asks for it."""
+    q = getattr(args, "regulate_query", None)
+    if not q:
+        return None, "no regulate_query configured"
+    if "{volume}" not in q:
+        return q, None
+    names = {_mds_namespace_for(d) for d in args.dirs}
+    names.discard(None)
+    if len(names) != 1:
+        return None, (
+            "regulate_query uses {volume} but the filesystem name could not be "
+            "resolved to exactly one value (found %s). Either run one volume per "
+            "job, or write regulate_query without {volume}." % (sorted(names) or "none"))
+    return q.replace("{volume}", re.escape(names.pop())), None
+
+
+class Regulator(threading.Thread):
+    """Poll a latency query and throttle this job to keep it under a threshold."""
+
+    daemon = True
+
+    def __init__(self, args, query):
+        super().__init__(name="regulator")
+        self.args = args
+        self.query = query
+        self.floor_ms = int(args.regulate_floor_ms)
+        self._floor_base = self.floor_ms
+        self._pauses = []
+        self._last_decay = 0.0
+        self._quiet = 0
+        self._last_err = 0.0
+        self._paused_threads = None
+
+    # -- data -----------------------------------------------------------------
+    def sample(self):
+        """Latency in ms, or None when there is no usable answer."""
+        url = self.args.regulate_prometheus_url + "?" + urllib.parse.urlencode(
+            {"query": self.query})
+        with urllib.request.urlopen(url, timeout=45) as r:
+            d = json.load(r)
+        if d.get("status") != "success":
+            raise ValueError("query status %r" % d.get("status"))
+        res = d.get("data", {}).get("result", [])
+        if len(res) != 1:
+            raise ValueError("query returned %d series, need exactly 1" % len(res))
+        v = float(res[0]["value"][1])
+        if v != v or v in (float("inf"), float("-inf")) or v < 0:
+            raise ValueError("query returned %r" % v)
+        return v
+
+    # -- actions --------------------------------------------------------------
+    def _pause(self, lat):
+        global file_delay_ms
+        extra = self._note_pause()
+        if thread_count.limit > 0:
+            self._paused_threads = thread_count.limit
+            thread_count.set_limit(0)
+            logging.warning(
+                "Regulator: PAUSE at %.1f ms (%.0f%% of the %.0f ms target) -- "
+                "threads %d -> 0, in-flight copies will finish%s",
+                lat, 100.0 * lat / self.args.regulate_slo_ms,
+                self.args.regulate_slo_ms, self._paused_threads, extra)
+
+    def _resume(self):
+        if thread_count.limit == 0 and self._paused_threads:
+            thread_count.set_limit(self._paused_threads)
+            logging.info("Regulator: resumed, threads 0 -> %d", self._paused_threads)
+            self._paused_threads = None
+
+    def _ease(self):
+        global file_delay_ms
+        if thread_count.limit == 0 or file_delay_ms <= self.floor_ms:
+            return
+        old = file_delay_ms
+        new = max(_delay_down(old), self.floor_ms)
+        if new != old:
+            file_delay_ms = new
+            _update_proctitle()
+            logging.info("Regulator: quiet, file delay %dms -> %dms (floor %dms)",
+                         old, new, self.floor_ms)
+
+    def _note_pause(self):
+        now = time.time()
+        self._pauses = [t for t in self._pauses if now - t < REG_PAUSE_WINDOW_S] + [now]
+        if len(self._pauses) <= REG_PAUSE_MAX:
+            return " [%d pause(s) in %dh]" % (len(self._pauses), REG_PAUSE_WINDOW_S // 3600)
+        old = self.floor_ms
+        new = min(int(old * REG_FLOOR_BACKOFF) + 1, REG_FLOOR_CAP_MS)
+        if new <= old:
+            return " [floor already at cap %dms]" % REG_FLOOR_CAP_MS
+        self.floor_ms = new
+        self._pauses = []
+        return " [floor raised %dms -> %dms after repeated pauses]" % (old, new)
+
+    def _maybe_decay_floor(self):
+        if self.floor_ms <= self._floor_base:
+            return
+        now = time.time()
+        last = max([self._last_decay] + self._pauses) if self._pauses else self._last_decay
+        if now - last < REG_FLOOR_DECAY_S:
+            return
+        old = self.floor_ms
+        self.floor_ms = max(self._floor_base, int(old / REG_FLOOR_BACKOFF))
+        self._last_decay = now
+        self._pauses = []
+        logging.info("Regulator: quiet %dmin, floor %dms -> %dms (baseline %dms)",
+                     REG_FLOOR_DECAY_S // 60, old, self.floor_ms, self._floor_base)
+
+    # -- loop -----------------------------------------------------------------
+    def run(self):
+        period = max(5, int(self.args.regulate_period_s))
+        while not do_exit.is_set():
+            try:
+                lat = self.sample()
+            except Exception as e:
+                # Hold. A monitoring outage is not evidence about the filesystem,
+                # and acting on absent data is worse than not acting.
+                now = time.time()
+                if now - self._last_err > REG_ERR_QUIET_S:
+                    logging.warning(
+                        "Regulator: no usable sample (%s) -- holding current "
+                        "settings, not adjusting", e)
+                    self._last_err = now
+                do_exit.wait(period)
+                continue
+            if lat >= self.args.regulate_pause_ms:
+                self._quiet = 0
+                self._pause(lat)
+            else:
+                self._resume()
+                self._maybe_decay_floor()
+                self._quiet += 1
+                if self._quiet >= int(self.args.regulate_quiet_ticks):
+                    self._quiet = 0
+                    self._ease()
+            do_exit.wait(period)
+
+
+def start_regulator(args):
+    """Start the regulator, or explain once why it is not running."""
+    if not getattr(args, "regulate_prometheus_url", None):
+        logging.info("Self-regulation disabled (no regulate_prometheus_url); "
+                     "running at file_delay=%dms threads=%d",
+                     file_delay_ms, thread_count.limit)
+        return None
+    query, why = _resolve_query(args)
+    if not query:
+        logging.warning("Self-regulation disabled: %s", why)
+        return None
+    reg = Regulator(args, query)
+    try:
+        lat = reg.sample()
+    except Exception as e:
+        logging.warning("Self-regulation disabled: the query did not return a "
+                        "usable value (%s). Query: %s", e, query)
+        return None
+    # Units are the likeliest misconfiguration and the failure is silent in both
+    # directions: seconds means it never triggers, microseconds means it never
+    # stops. Say what came back so a factor of 1000 is obvious immediately.
+    if lat < 0.01:
+        logging.warning("Regulator: query returned %.6f -- is this SECONDS? "
+                        "regulate_query must return MILLISECONDS. Enabled, but "
+                        "it will likely never trigger.", lat)
+    elif lat > 60000:
+        logging.warning("Regulator: query returned %.0f -- is this MICROSECONDS? "
+                        "regulate_query must return MILLISECONDS. Enabled, but "
+                        "it will pause almost immediately.", lat)
+    logging.info("Regulator: enabled. Sample %.2f ms; pause at %.0f ms, target "
+                 "%.0f ms, poll %ds, delay floor %dms.",
+                 lat, args.regulate_pause_ms, args.regulate_slo_ms,
+                 args.regulate_period_s, reg.floor_ms)
+    logging.info("Regulator: query = %s", query)
+    reg.start()
+    return reg
+
+
+def _recursive_stats(path):
+    """(rbytes, rfiles) for a directory from CephFS recursive stats, or (None, None).
+
+    These are maintained by the MDS, so this is one getfattr rather than a walk.
+    """
+    try:
+        rb = int(os.getxattr(path, b"ceph.dir.rbytes"))
+        rf = int(os.getxattr(path, b"ceph.dir.rfiles"))
+        return rb, rf
+    except (OSError, ValueError):
+        return None, None
+
+
 def process_file(args, filepaths, st, layout, file_layout):
     if do_exit.is_set():
         return
@@ -550,15 +1386,23 @@ def process_file(args, filepaths, st, layout, file_layout):
         shutil.copystat(filepaths[0], tmp_file, follow_symlinks=False)
         os.chown(tmp_file, st.st_uid, st.st_gid)
 
+        # The per-copy rate and copy method were here to show whether
+        # copy_file_range (server-side copy) was actually faster in practice.
+        # It is not measurably so, and the numbers swing 30x on identically
+        # sized files because they track OSD and MDS contention rather than
+        # the copy path. Dropped as noise.
+        #
+        # The "[N bytes] in Xs" shape is deliberately unchanged: log mining
+        # keys on it, and the archives span years of prior runs. Only the
+        # "(Y MiB/s) via <method>" suffix is gone, so old and new logs parse
+        # identically.
         if copy_elapsed > 0:
-            mbps = (st.st_size / (1024**2)) / copy_elapsed
             logging.info(
-                f"Copied {filepaths[0]} [{st.st_size} bytes] in {copy_elapsed:.2f}s "
-                f"({mbps:.1f} MiB/s) via {copy_method}"
+                f"Copied {filepaths[0]} [{st.st_size} bytes] in {copy_elapsed:.2f}s"
             )
         else:
             logging.info(
-                f"Copied {filepaths[0]} [{st.st_size} bytes] in <1ms via {copy_method}"
+                f"Copied {filepaths[0]} [{st.st_size} bytes] in <1ms"
             )
 
     except Exception:
@@ -573,7 +1417,7 @@ def process_file(args, filepaths, st, layout, file_layout):
         os.unlink(tmp_file)
         return
 
-    with replace_lock:
+    with _replace_lock_for(filepaths[0]):
         try:
             # Block SIGINT in this thread to reduce the chance of EINTR during
             # the rename sequence.  Note: Python's signal handler runs on the
@@ -651,6 +1495,15 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
     for dirpath, dirnames, filenames in os.walk(start_dir, topdown=True):
         if do_exit.is_set() or _limit_reached():
             return
+
+        # Also poll here, not only in the per-file loop below. A subtree of
+        # pure directories -- or one where every file is pruned -- never
+        # reaches the per-file poll, so a config edit would go unobserved
+        # while the walker descends it. Still mtime-gated, so this is a
+        # clock check per directory, not a stat.
+        if runtime_config is not None:
+            runtime_config.poll(apply_config)
+
         if dirpath in mountpoints:
             logging.warning(f"Skipping {dirpath}: path is a mountpoint")
             del dirnames[:]
@@ -676,6 +1529,31 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
 
         dirnames.sort()
         filenames.sort()
+        # Prune subtrees that are not worth walking, using the recursive stats
+        # the MDS already maintains. One getfattr answers what would otherwise
+        # be a full walk. The rbytes test is the safety property -- it bounds
+        # the loss regardless of how the bytes are distributed inside -- and the
+        # mean-size test is only an efficiency signal on top of it.
+        if getattr(args, "prune_small_subtrees", False) and dirnames:
+            keep = []
+            for d in dirnames:
+                full = os.path.join(dirpath, d)
+                rb, rf = _recursive_stats(full)
+                if (
+                    rb is not None
+                    and rf
+                    and rb < args.prune_subtree_max_bytes
+                    and rb / rf < args.min_size / 8
+                    and stats.prune_budget_left(args.prune_budget_bytes) > rb
+                ):
+                    msg = stats.note_pruned_subtree(rb)
+                    logging.info(
+                        f"Pruning {full}/: {rf} files / {rb} bytes recursive "
+                        f"(mean {rb // rf} B < min-size/8){msg}"
+                    )
+                else:
+                    keep.append(d)
+            dirnames[:] = keep
         # Prune (do not descend into or stat) directories whose name matches
         # --prune-dir-regex.  Mutating dirnames in place controls os.walk.
         if getattr(args, "prune_re", None) is not None and dirnames:
@@ -713,6 +1591,11 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
         for filename in filenames:
             if do_exit.is_set() or _limit_reached():
                 return
+
+            # Time-gated mtime check (default 10s). Must not stat per iteration:
+            # at full speed the walker runs thousands of iterations a second.
+            if runtime_config is not None:
+                runtime_config.poll(apply_config)
 
             delay = file_delay_ms
             if delay > 0:
@@ -762,6 +1645,13 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             if file_layout == layout:
                 with stats._lock:
                     stats.files_skipped_layout_match += 1
+                continue
+            # --source-pool restricts the run to files currently in one pool,
+            # so a drain (e.g. ec6.3 -> ec4.2) does not also sweep up every
+            # file still sitting on the default replicated pool.
+            if args.source_pool is not None and file_layout.pool != args.source_pool:
+                with stats._lock:
+                    stats.files_skipped_source_pool += 1
                 continue
             if st.st_nlink == 1:
                 submit([filepath], st, file_layout)
@@ -847,6 +1737,8 @@ def process_files(args):
     with open("/proc/self/mounts", "r") as f:
         for line in f:
             mountpoints.add(line.split()[1])
+
+    start_regulator(args)
 
     with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
         tmpdir_dev = os.stat(args.tmpdir).st_dev
@@ -944,18 +1836,30 @@ def main():
             "  SIGUSR1  (10)  increase thread count by 1 (resumes from pause)\n"
             "  SIGUSR2  (12)  decrease thread count by 1 (0 = pause)\n"
             "  SIGTSTP  (20)  throttle to 1 thread (Ctrl+Z)\n"
-            "  SIGRTMIN (34)  increase file delay by 100ms\n"
-            "  SIGRTMIN+1(35) decrease file delay by 100ms\n"
+            f"  SIGRTMIN (34)  increase file delay x{DELAY_STEP_UP}"
+            f" (min +1ms, cap {DELAY_MAX_MS}ms)\n"
+            f"  SIGRTMIN+1(35) decrease file delay /{DELAY_STEP_DOWN}"
+            f" (min -1ms, floor {DELAY_MIN_MS}ms)\n"
             "  SIGRTMIN+2(36) increase min-age by 3 days\n"
             "  SIGRTMIN+3(37) decrease min-age by 3 days (min 1)\n"
             "  SIGRTMIN+4(38) dump current state/tunables to the log"
+            "\n\n"
+            "example --config file (every key at its default):\n\n"
+            # argparse runs the epilog through `text % dict(prog=...)`, so any
+            # literal % arriving from config_example() is read as a format spec
+            # and raises. Double them here rather than banning % from the
+            # config comments; our own %(prog)s below is added after this and
+            # is meant to be substituted.
+            + "\n".join("    " + l for l in config_example().splitlines()).replace("%", "%%")
+            + "\n\n    redirect it to disk with:  %(prog)s --print-config-example > "
+            + config_path_for("VOLUME")
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {_VERSION}"
     )
-    parser.add_argument("dirs", help="Directories to scan", nargs="+")
+    parser.add_argument("dirs", help="Directories to scan", nargs="*")
     parser.add_argument(
         "--tmpdir",
         default="/data/tmp",
@@ -1000,6 +1904,35 @@ def main():
         action="store_true",
         help="Perform transcode but do not replace files",
     )
+    parser.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help="key=value file of live tunables (file_delay_ms, threads, min_age_days, "
+             "min_size, prune_dir_regex), re-read when its mtime changes. Keep it on "
+             "local disk, NOT in the CephFS volume: a stat there is an MDS round trip.",
+    )
+    parser.add_argument(
+        "--print-config-example",
+        metavar="VOLUME",
+        nargs="?",
+        const="VOLUME",
+        help="print a fully-populated --config file for VOLUME and exit",
+    )
+    parser.add_argument(
+        "--config-poll-seconds",
+        type=float,
+        default=10.0,
+        metavar="SEC",
+        help="how often to stat --config for changes (default: 10)",
+    )
+    parser.add_argument(
+        "--force-tmpdir-pool",
+        action="store_true",
+        help="proceed even if the tmpdir is in a target pool. Disables the only "
+             "check that makes a failed layout application visible; do not use "
+             "routinely.",
+    )
     parser.add_argument("--log-file", help="Also log to this file")
     parser.add_argument(
         "--log-rotate-lines",
@@ -1022,8 +1955,101 @@ def main():
     )
     parser.add_argument(
         "--no-copy-file-range",
+        dest="no_copy_file_range",
         action="store_true",
-        help="Disable use of copy_file_range and always use userspace copy",
+        default=True,
+        help="Disable use of copy_file_range and always use userspace copy. "
+             "DEFAULT since 2026-09-05: a 15-thread A/B on a production "
+             "volume measured "
+             "copy_file_range no faster overall (154.0 vs 170.1 MiB/s) and "
+             "1.3-2.1x SLOWER for files under 1 MiB, which is the size range "
+             "these jobs now work in.",
+    )
+    parser.add_argument(
+        "--copy-file-range",
+        dest="no_copy_file_range",
+        action="store_false",
+        help="Opt back in to copy_file_range (server-side copy when CephFS "
+             "supports it). Off by default; see --no-copy-file-range.",
+    )
+    parser.add_argument(
+        "--regulate-prometheus-url",
+        default=None,
+        metavar="URL",
+        help="Prometheus /api/v1/query endpoint for self-regulation. Unset "
+             "(the default) disables regulation entirely and the job simply "
+             "runs at --file-delay and --threads.",
+    )
+    parser.add_argument(
+        "--regulate-query",
+        default=None,
+        metavar="PROMQL",
+        help="A complete PromQL expression returning ONE value in MILLISECONDS "
+             "for the latency to protect. {volume} is substituted with the "
+             "CephFS name from the mount, regex-escaped; write the query without "
+             "it if that cannot be derived. Single line, no '#'.",
+    )
+    parser.add_argument(
+        "--regulate-pause-ms", type=float, default=150.0, metavar="MS",
+        help="Pause the job while the query exceeds this (default 150).",
+    )
+    parser.add_argument(
+        "--regulate-slo-ms", type=float, default=75.0, metavar="MS",
+        help="Soft target, used only to express readings as a percentage in log "
+             "messages (default 75). --regulate-pause-ms is what actually gates.",
+    )
+    parser.add_argument(
+        "--regulate-period-s", type=int, default=30, metavar="SEC",
+        help="Seconds between samples (default 30).",
+    )
+    parser.add_argument(
+        "--regulate-floor-ms", type=int, default=0, metavar="MS",
+        help="Lower bound on --file-delay that regulation may ease down to. "
+             "Repeated pauses raise it; sustained quiet releases it back to this "
+             "baseline (default 0).",
+    )
+    parser.add_argument(
+        "--regulate-quiet-ticks", type=int, default=10, metavar="N",
+        help="Consecutive clean samples before easing the delay (default 10).",
+    )
+    parser.add_argument(
+        "--source-pool",
+        default=None,
+        metavar="POOL",
+        help="Only transcode files whose CURRENT data pool is POOL. Without it, "
+             "every file not already on the target pool is eligible. Use this to "
+             "drain one pool into another without also sweeping the default pool.",
+    )
+    parser.add_argument(
+        "--prune-small-subtrees",
+        action="store_true",
+        default=False,
+        help="Skip whole subtrees whose recursive size makes them not worth "
+             "walking, using the MDS's own ceph.dir.rbytes/rfiles (one getfattr "
+             "per directory, no walk). OFF by default: it changes what the pass "
+             "covers, which should always be deliberate. INERT without --min-size, "
+             "since the mean-size test compares against min-size/8; a warning is "
+             "logged at startup if you pass this with --min-size 0.",
+    )
+    parser.add_argument(
+        "--prune-subtree-max-bytes",
+        type=int,
+        default=1 << 30,
+        metavar="BYTES",
+        help="With --prune-small-subtrees, only prune a subtree whose TOTAL "
+             "recursive bytes are below this (default 1 GiB). This is a bound on "
+             "what pruning can cost you: whatever the size distribution inside, "
+             "skipping the subtree forgoes at most this many bytes.",
+    )
+    parser.add_argument(
+        "--prune-budget-bytes",
+        type=int,
+        default=100 << 30,
+        metavar="BYTES",
+        help="With --prune-small-subtrees, stop pruning once this many bytes have "
+             "been skipped in total (default 100 GiB). Deliberately finite: the "
+             "per-subtree bound above says nothing about the aggregate, so without "
+             "this a pass could skip unbounded data a gigabyte at a time.",
     )
     parser.add_argument(
         "--max-files",
@@ -1045,10 +2071,22 @@ def main():
         help="Regular expression (unanchored, via re.search) matched against "
         "directory NAMES; any name containing a match is pruned from the walk "
         "entirely (not descended into or statted). Anchor with ^ / $ for exact "
-        "names, e.g. '\\.runfiles$' to skip Bazel runfiles symlink farms.",
+        "names, e.g. '\\.runfiles$' to skip Bazel runfiles symlink farms. "
+        "Overrides the built-in default set (see DEFAULT_PRUNE_DIRS); pass an "
+        "empty string to disable pruning entirely.",
     )
 
     args = parser.parse_args()
+
+    # Emit an example config and exit, before any argument that only matters to
+    # a real run is validated -- this is a documentation command, not a run.
+    if args.print_config_example:
+        print(config_example(args.print_config_example))
+        return 0
+
+    if not args.dirs:
+        parser.error("the following arguments are required: dirs")
+
     try:
         validate_size_bounds(args.min_size, args.max_size)
     except ValueError as e:
@@ -1061,6 +2099,11 @@ def main():
 
     thread_count = DynamicSemaphore(args.threads)
 
+    # None means "not given" -> apply the default set. An explicitly empty
+    # string means "no pruning", and must stay distinguishable from not-given.
+    _prune_defaulted = args.prune_dir_regex is None
+    if _prune_defaulted:
+        args.prune_dir_regex = DEFAULT_PRUNE_REGEX
     args.prune_re = None
     if args.prune_dir_regex:
         try:
@@ -1119,10 +2162,17 @@ def main():
     if args.no_copy_file_range:
         _cfr_func, _cfr_label = None, None
 
+    _inert = _prune_inert_warning(args)
+    if _inert:
+        logging.warning(_inert)
+
     if _cfr_label:
         logging.info(f"Using copy_file_range via {_cfr_label} (server-side copy when supported by CephFS)")
     elif args.no_copy_file_range:
-        logging.info("copy_file_range disabled via --no-copy-file-range, using userspace copy")
+        logging.info(
+            "copy_file_range disabled (default; pass --copy-file-range to enable), "
+            "using userspace copy"
+        )
     else:
         logging.info("copy_file_range not available, using userspace copy")
 
@@ -1137,18 +2187,74 @@ def main():
         )
         sys.exit(1)
 
-    logging.warning(
-        f"Temporary directory is {args.tmpdir} with pool {layout.pool}. "
-        f"This should be the *default* data pool for the FS (NOT the target pool for your files). "
-        f"If it is not, configure it with `setfattr -n ceph.dir.layout.pool -v default_data_pool_name {args.tmpdir}` then try again."
-    )
-    try:
-        answer = input("Proceed? [y/N] ").strip().lower()
-    except EOFError:
-        answer = ""
-    if answer != "y":
-        logging.error("Aborted.")
-        sys.exit(1)
+    logging.info(f"Temporary directory is {args.tmpdir} with pool {layout.pool}")
+
+    # State the effective prune set before any walking happens. When it is the
+    # built-in default the operator has not chosen it, so name every directory
+    # rather than printing an opaque regex -- this silently skips whole
+    # subtrees, and "why did it not transcode X" is otherwise hard to answer
+    # from the log.
+    if args.prune_re is None:
+        logging.warning("Directory pruning DISABLED; every directory will be walked")
+    elif _prune_defaulted:
+        logging.warning(
+            "Pruning these directory names by default (override with "
+            "--prune-dir-regex, disable with --prune-dir-regex ''): %s",
+            " ".join(DEFAULT_PRUNE_DIRS))
+    else:
+        logging.warning("Pruning directory names matching: %s", args.prune_dir_regex)
+
+    # The tmpdir must not sit in a pool we are transcoding *into*.
+    #
+    # Two distinct failures if it does. First, every file whose target is that
+    # pool becomes a no-op that still pays a full data rewrite -- the exact
+    # churn that burned 41 TiB of already-EC data in one incident. Second, and
+    # worse, a silently failed apply_file() stops being detectable: the temp file
+    # inherits the target pool from the tmpdir, so a broken layout call still
+    # produces a correct-looking result and the bug ships.
+    #
+    # This was previously an interactive "Proceed? [y/N]" prompt. A prompt
+    # cannot be answered by a detached or scripted start -- input() raises
+    # EOFError and the job aborts -- so the check is done programmatically
+    # instead. That works headless AND is stronger, because it cannot be
+    # waved through by a human who is not reading carefully.
+    conflicts = []
+    for d in args.dirs:
+        target = get_layout_walking_up(d)
+        if target is not None and target.pool == layout.pool:
+            conflicts.append((d, target.pool))
+
+    if conflicts:
+        for d, pool in conflicts:
+            logging.error(
+                f"tmpdir {args.tmpdir} is in pool {pool}, which is also the "
+                f"target pool for {d}."
+            )
+        logging.error(
+            "The tmpdir must be the filesystem's DEFAULT data pool, never a "
+            "target pool. Fix with: setfattr -n ceph.dir.layout.pool "
+            f"-v <default_data_pool> {args.tmpdir}"
+        )
+        if not args.force_tmpdir_pool:
+            logging.error("Aborting. Pass --force-tmpdir-pool if this is deliberate.")
+            sys.exit(1)
+        logging.warning(
+            "--force-tmpdir-pool given; continuing despite the pool conflict. "
+            "Layout-application failures will NOT be detectable in this run."
+        )
+
+    # Advisory: below the crossover a transcode consumes MORE raw space than it
+    # frees, and nothing else here would notice. Source defaults to the tmpdir's
+    # pool (the FS default pool, where most untranscoded data lives); --source-pool
+    # overrides it so a pool-to-pool drain is judged against the right baseline.
+    # Best-effort -- needs the ceph CLI, and stays silent without it.
+    for _d in args.dirs:
+        _t = get_layout_walking_up(_d)
+        if _t is None:
+            continue
+        _msg = crossover_warning(args.source_pool or layout.pool, _t.pool, args.min_size)
+        if _msg:
+            logging.warning(_msg)
 
     def signal_handler(sig, frame):
         name = signal.Signals(sig).name
@@ -1202,14 +2308,14 @@ def main():
     def sigrtmin_handler(sig, frame):
         global file_delay_ms
         old = file_delay_ms
-        file_delay_ms = old + 100
+        file_delay_ms = _delay_up(old)
         logging.info(f"SIGRTMIN received, file delay: {old}ms -> {file_delay_ms}ms")
         _report_state()
 
     def sigrtmin1_handler(sig, frame):
         global file_delay_ms
         old = file_delay_ms
-        file_delay_ms = max(old - 100, 0)
+        file_delay_ms = _delay_down(old)
         logging.info(f"SIGRTMIN+1 received, file delay: {old}ms -> {file_delay_ms}ms")
         _report_state()
 
@@ -1238,6 +2344,102 @@ def main():
     # __init__), so a handler that interrupts such a critical section re-enters
     # the lock on the same thread instead of deadlocking; setproctitle is a
     # bounded argv write.
+    def _apply_config(cfg):
+        """Apply a parsed config dict to live state, logging only what changes.
+
+        Every applied change is logged with old and new values so the question
+        "what was this job doing at 14:02?" is answerable from this log alone.
+        """
+        global file_delay_ms, min_age_days
+        if 'file_delay_ms' in cfg and cfg['file_delay_ms'] != file_delay_ms:
+            old_v = file_delay_ms
+            file_delay_ms = cfg['file_delay_ms']
+            logging.info("Config: file delay %dms -> %dms", old_v, file_delay_ms)
+        if 'threads' in cfg and cfg['threads'] != thread_count.limit:
+            old_v = thread_count.limit
+            thread_count.set_limit(cfg['threads'])
+            # Match the SIGUSR2/SIGUSR1 wording so a log scan finds a pause the
+            # same way regardless of which interface caused it.
+            if cfg['threads'] == 0:
+                logging.info(
+                    "Config: thread limit %d -> 0 — processing paused "
+                    "(in-flight copies will complete; set threads > 0 to resume)",
+                    old_v)
+            elif old_v == 0:
+                logging.info(
+                    "Config: processing resumed (thread limit: 0 -> %d)",
+                    cfg['threads'])
+            else:
+                logging.info("Config: thread limit %d -> %d", old_v, cfg['threads'])
+        global DELAY_STEP_UP, DELAY_STEP_DOWN, DELAY_MIN_MS
+        if 'delay_step_up' in cfg and cfg['delay_step_up'] != DELAY_STEP_UP:
+            old_v = DELAY_STEP_UP
+            DELAY_STEP_UP = cfg['delay_step_up']
+            logging.info("Config: delay step up x%.3f -> x%.3f", old_v, DELAY_STEP_UP)
+        if 'delay_step_down' in cfg and cfg['delay_step_down'] != DELAY_STEP_DOWN:
+            old_v = DELAY_STEP_DOWN
+            DELAY_STEP_DOWN = cfg['delay_step_down']
+            logging.info("Config: delay step down /%.3f -> /%.3f", old_v, DELAY_STEP_DOWN)
+        if 'delay_min_ms' in cfg and cfg['delay_min_ms'] != DELAY_MIN_MS:
+            old_v = DELAY_MIN_MS
+            DELAY_MIN_MS = cfg['delay_min_ms']
+            logging.info("Config: delay floor %dms -> %dms", old_v, DELAY_MIN_MS)
+        if 'min_age_days' in cfg and cfg['min_age_days'] != min_age_days:
+            old_v = min_age_days
+            min_age_days = cfg['min_age_days']
+            logging.info("Config: min-age %dd -> %dd", old_v, min_age_days)
+        if 'min_size' in cfg and cfg['min_size'] != args.min_size:
+            old_v = args.min_size
+            args.min_size = cfg['min_size']
+            logging.info("Config: min-size %d -> %d bytes", old_v, args.min_size)
+            # min_size feeds the subtree-prune gate, so a runtime change can
+            # switch pruning between inert and active. Say so, or the startup
+            # warning silently stops being true mid-run.
+            if getattr(args, "prune_small_subtrees", False):
+                msg = _prune_inert_warning(args)
+                if msg:
+                    logging.warning("Config: %s", msg)
+                elif old_v <= 0:
+                    logging.info(
+                        "Config: subtree pruning is now ACTIVE (min-size is no "
+                        "longer 0); subtrees under %d bytes averaging below %d "
+                        "bytes/file may be skipped, budget %d bytes",
+                        args.prune_subtree_max_bytes,
+                        args.min_size // 8,
+                        args.prune_budget_bytes,
+                    )
+        for _k, _label in (('regulate_pause_ms', 'regulate pause threshold'),
+                           ('regulate_slo_ms', 'regulate soft target'),
+                           ('regulate_period_s', 'regulate poll period'),
+                           ('regulate_quiet_ticks', 'regulate quiet ticks')):
+            if _k in cfg and cfg[_k] != getattr(args, _k, None):
+                _old = getattr(args, _k, None)
+                setattr(args, _k, cfg[_k])
+                logging.info("Config: %s %s -> %s", _label, _old, cfg[_k])
+        for _k, _label in (('prune_subtree_max_bytes', 'prune subtree ceiling'),
+                           ('prune_budget_bytes', 'prune budget')):
+            if _k in cfg and cfg[_k] != getattr(args, _k):
+                _old = getattr(args, _k)
+                setattr(args, _k, cfg[_k])
+                logging.info("Config: %s %d -> %d bytes", _label, _old, cfg[_k])
+        if 'prune_dir_regex' in cfg:
+            old_p = args.prune_re.pattern if args.prune_re else None
+            new_p = cfg['prune_dir_regex'].pattern if cfg['prune_dir_regex'] else None
+            if old_p != new_p:
+                # os.walk(topdown=True) lets dirnames be mutated, so a new
+                # pattern takes effect at the next directory descent.
+                args.prune_re = cfg['prune_dir_regex']
+                logging.info("Config: prune-dir-regex %r -> %r", old_p, new_p)
+        _report_state("Config reloaded")
+
+    global runtime_config, apply_config
+    if args.config:
+        apply_config = _apply_config
+        runtime_config = RuntimeConfig(args.config, args.config_poll_seconds)
+        logging.info("Runtime config: %s (polled every %.0fs)",
+                     args.config, args.config_poll_seconds)
+        runtime_config.poll(apply_config)     # apply once at startup
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTSTP, sigtstp_handler)
     signal.signal(signal.SIGUSR1, sigusr1_handler)
@@ -1253,7 +2455,7 @@ def main():
         f"SIGUSR1/{signal.SIGUSR1} +1 thread, "
         f"SIGUSR2/{signal.SIGUSR2} -1 thread (0 = pause), "
         f"SIGTSTP (Ctrl+Z) throttle to 1, "
-        f"SIGRTMIN/{signal.SIGRTMIN} / SIGRTMIN+1/{signal.SIGRTMIN + 1} adjust file delay ±100ms, "
+        f"SIGRTMIN/{signal.SIGRTMIN} / SIGRTMIN+1/{signal.SIGRTMIN + 1} adjust file delay x{DELAY_STEP_UP} up / /{DELAY_STEP_DOWN} down (floor {DELAY_MIN_MS}ms), "
         f"SIGRTMIN+2/{signal.SIGRTMIN + 2} / SIGRTMIN+3/{signal.SIGRTMIN + 3} adjust min-age ±3d (min 1), "
         f"SIGRTMIN+4/{signal.SIGRTMIN + 4} dump state to log"
     )
@@ -1285,6 +2487,8 @@ def main():
         f"Complete: {stats.files_transcoded} transcoded, "
         f"{stats.files_failed} failed, "
         f"{stats.files_skipped_layout_match} already matched, "
+        f"{stats.files_skipped_source_pool} wrong source pool, "
+        f"{stats.subtrees_pruned} subtrees pruned ({stats.bytes_pruned} bytes), "
         f"{stats.files_skipped_recent} too recent, "
         f"{stats.files_skipped_changed} changed during processing, "
         f"{stats.files_skipped_hardlink} hardlinks skipped, "
