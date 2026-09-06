@@ -350,6 +350,86 @@ moves markedly less data across the client link than a userspace copy does, the
 offload is working for you and `--copy-file-range` is likely worth enabling
 regardless of what the per-call overhead costs.
 
+## Second passes: `--paths-from`
+
+A second pass at a lower `--min-size` usually already knows its candidates. The
+previous run logged every file it skipped and why, so the list of files that were
+"below --min-size" *is* the candidate set for the next threshold.
+
+Rediscovering them by walking is the expensive part. `file_delay` sleeps once per
+file **encountered**, in the single-threaded producer loop, before the `stat` — so
+a pass costs roughly `rfiles × file_delay` no matter how few files qualify. On one
+production volume that meant visiting 195M paths to reach 8.7M candidates: about
+45 days of walking to do 2 days of work.
+
+```
+# extract the candidates from the previous run's log
+grep -a 'below --min-size' prev.log \
+  | sed -E 's/.*Skipping (.*): size [0-9]+ below --min-size [0-9]+$/\1/' \
+  > candidates.txt
+
+vcephfs_transcoder.py --min-size 131072 /vol/data \
+    --tmpdir /vol/data/tmp-transcode --paths-from candidates.txt
+```
+
+The directories still have to be given. They are not scanned; they bound what the
+list is allowed to touch, and a listed path outside them is refused and counted.
+A list is easy to generate against the wrong volume and the damage would be quiet
+and large.
+
+The file is NUL- or newline-delimited, detected from its content, so both
+`find -print0` and a line-oriented scrape work without a flag. It is read in
+chunks rather than slurped — these lists run to tens of millions of lines.
+
+### The list is a snapshot, and it decays
+
+Nothing here trusts the list. Every path is re-`stat`ed and its layout re-read,
+exactly as the walker would, so a stale list is safe rather than dangerous. What
+it costs you is coverage, and that can go fast. Measured on two volumes six days
+after the logs were written:
+
+| | still exists | of those, still needing the move |
+|---|---|---|
+| volume A | 36.7% | 60.6% |
+| volume B | 100.0% | 98.2% |
+
+On volume A only 22% of the list was still worth acting on. So regenerate the list
+close to when you use it, and read `vanished` in the completion line as the measure
+of how stale it was:
+
+```
+Complete: 0 transcoded, 0 failed, 20 already matched, 0 wrong source pool,
+          20 vanished, ...
+```
+
+A path that has disappeared is logged at INFO and counted. It is an expected
+outcome of a list that has aged, not an error, and it never aborts the run.
+
+### What this mode deliberately does not do
+
+- **It does not discover.** A list cannot contain files created after the log was
+  written, or files the earlier run never reached. Use it to re-process known
+  candidates cheaply; keep a full walk for finding new work.
+- **It declines multiply-linked files.** Every link has to be in hand before any
+  of them can be replaced, and a list cannot promise it holds them all.
+  Transcoding a partial set would break the link relationship, so this mode skips
+  them regardless of `--process-hardlinks`. Walk for those.
+- **`--prune-dir-regex` and `--prune-small-subtrees` have no effect,** and say so
+  at startup. They prune the walk; here the list has replaced the walk.
+
+### One deliberate difference from the walker
+
+This mode checks the file's **layout before its size**; the walker does the
+reverse. The walker is right for its case: most of what it encounters is tiny, a
+`stat` alone rejects it, and reading a layout for every file would add an MDS
+round trip to the common path.
+
+A list is already filtered to plausible candidates, and its stalest entries are
+exactly the ones an earlier pass has since moved. Testing size first would log
+those as "below --min-size" and hide the fact that they are already done — which
+is not hypothetical: it is how one analysis came to overstate its remaining work,
+by counting already-converted files as outstanding candidates.
+
 ## Runtime configuration
 
 Long passes need retuning while they run. A pass over a large volume takes weeks,
