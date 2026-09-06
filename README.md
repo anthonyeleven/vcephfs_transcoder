@@ -312,6 +312,44 @@ This was presented at Ceph Day Seattle 2026, and based on a script posted
 to Reddit by `marcan42`.
 
 
+### When `--copy-file-range` may still be the right choice
+
+The default here is off, on measurements taken with clients well connected to the
+cluster. That is not everyone's situation, and the reasoning behind the default does
+not transfer to all of them.
+
+`copy_file_range` on CephFS can become an OSD-to-OSD copy, in which case the data
+never traverses the client's link at all. Where a client reaches the cluster over a
+slower or higher-latency path than the cluster's own interconnect, that matters far
+more than any per-call overhead: a userspace copy moves the file across that link
+twice, once in and once out.
+
+**In this deployment that offload does not appear to happen.** Measured on a 1 GiB
+cross-pool copy, counting the client's own interfaces:
+
+```
+  method         secs     MiB/s    client rx    client tx   wire/filesize
+  cfr            1.13     905.9        1034Mi       1033Mi          2.02x
+  userspace      1.17     874.9        1034Mi       1033Mi          2.02x
+```
+
+Both methods put the whole file across the client link in each direction. Whatever
+`copy_file_range` is doing here, it is not keeping the data off the wire, which is
+why it shows up in our numbers as pure overhead.
+
+Two honest limits on that result. It is one configuration — the copies are
+**cross-pool** (replicated to erasure-coded), which is this tool's entire purpose and
+a plausible reason the fast path declines, but we did not isolate the cause. And
+counting bytes at the client says nothing about what the fabric beyond that hop
+carried, or what a differently-connected client would experience.
+
+So: if your clients are remote, or you have reason to believe the OSD-side copy
+engages in your setup, measure it before accepting the default. Compare the client's
+interface counters across an identical copy done each way — if `copy_file_range`
+moves markedly less data across the client link than a userspace copy does, the
+offload is working for you and `--copy-file-range` is likely worth enabling
+regardless of what the per-call overhead costs.
+
 ## Runtime configuration
 
 Long passes need retuning while they run. A pass over a large volume takes weeks,
