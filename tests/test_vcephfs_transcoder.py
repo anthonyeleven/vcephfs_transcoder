@@ -401,6 +401,90 @@ class RegulatorBehavior(unittest.TestCase):
                     vct.urllib.request.urlopen = real
 
 
+class RegulateConfigRouting(unittest.TestCase):
+    """A regulate_* key that parses but is never copied onto args is invisible.
+
+    This is the bug these tests exist for: regulate_prometheus_url and
+    regulate_query validated cleanly and were then discarded, so a fully
+    configured job still logged "Self-regulation disabled (no
+    regulate_prometheus_url)" and ran unthrottled. Nothing failed; the feature
+    simply was not there.
+    """
+
+    @staticmethod
+    def _routed():
+        return {k for k, _ in vct.REGULATE_APPLY}
+
+    @staticmethod
+    def _declared():
+        return {k for k in vct.RuntimeConfig.KEYS if k.startswith("regulate_")}
+
+    def test_every_declared_key_is_routed(self):
+        missing = self._declared() - self._routed()
+        self.assertEqual(missing, set(),
+                         "accepted from the config file but never applied: %s"
+                         % sorted(missing))
+
+    def test_every_routed_key_is_declared(self):
+        """The other direction: routing a key the parser rejects is dead code."""
+        extra = self._routed() - self._declared()
+        self.assertEqual(extra, set(),
+                         "applied but not accepted from the config file: %s"
+                         % sorted(extra))
+
+    def test_the_invariant_catches_a_dropped_key(self):
+        """Control. Remove a key from the routing table and the check must fail,
+        otherwise the two tests above would pass against any table at all."""
+        crippled = tuple(e for e in vct.REGULATE_APPLY
+                         if e[0] != "regulate_prometheus_url")
+        routed = {k for k, _ in crippled}
+        self.assertTrue(self._declared() - routed,
+                        "invariant did not notice a missing key")
+
+    def test_routing_lands_the_url_and_query_on_args(self):
+        """Walk the same table _apply_config walks, against a real parse."""
+        text = ("regulate_prometheus_url = http://prom.example/api/v1/query\n"
+                'regulate_query = 1e3 * avg(x{a="b"})\n'
+                "regulate_pause_ms = 200\n"
+                "regulate_floor_ms = 25\n")
+        cfg, errs = vct.RuntimeConfig._parse(text)
+        self.assertEqual(errs, [])
+        a = Args()
+        for k, _label in vct.REGULATE_APPLY:
+            if k in cfg:
+                setattr(a, k, cfg[k])
+        self.assertEqual(a.regulate_prometheus_url,
+                         "http://prom.example/api/v1/query")
+        self.assertEqual(a.regulate_query, '1e3 * avg(x{a="b"})')
+        self.assertEqual(a.regulate_pause_ms, 200.0)
+        self.assertEqual(a.regulate_floor_ms, 25)
+
+    def test_floor_ms_accepted_and_range_checked(self):
+        cfg, errs = vct.RuntimeConfig._parse("regulate_floor_ms = 20\n")
+        self.assertEqual(errs, [])
+        self.assertEqual(cfg["regulate_floor_ms"], 20)
+        for bad in ("regulate_floor_ms = -1\n",
+                    "regulate_floor_ms = %d\n" % (vct.DELAY_MAX_MS + 1)):
+            _, errs = vct.RuntimeConfig._parse(bad)
+            self.assertTrue(errs, "accepted %r" % bad)
+
+    def test_set_floor_base_moves_the_baseline(self):
+        a = Args(regulate_prometheus_url="http://x", regulate_query="q",
+                 regulate_floor_ms=20, dirs=["/x"])
+        r = vct.Regulator(a, "q")
+        self.assertEqual(r._floor_base, 20)
+        r.set_floor_base(50)
+        self.assertEqual(r._floor_base, 50)
+        self.assertGreaterEqual(r.floor_ms, 50,
+                                "floor left sitting below its own baseline")
+
+    def test_example_config_documents_every_key(self):
+        """--help prints this; a key absent from it is undiscoverable."""
+        ex = vct.config_example("vol")
+        for k in self._declared():
+            self.assertIn(k, ex, "%s missing from the example config" % k)
+
+
 class Crossover(unittest.TestCase):
     """Generalized source scheme: comparing against 3x replication only is wrong."""
 

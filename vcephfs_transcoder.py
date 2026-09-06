@@ -147,6 +147,14 @@ min_age_days = 1
 DELAY_STEP_UP = 1.25
 DELAY_STEP_DOWN = 1.25
 DELAY_MAX_MS = 600000
+
+# Regulator defaults. Defined here, above config_example(), so the example
+# file can interpolate them rather than retyping values that would drift.
+REG_PAUSE_MS_DEFAULT = 150.0
+REG_SLO_MS_DEFAULT = 75.0
+REG_PERIOD_S_DEFAULT = 30
+REG_FLOOR_MS_DEFAULT = 0
+REG_QUIET_TICKS_DEFAULT = 10
 # Floor for the DOWN direction. 0 keeps the historical behavior of allowing a
 # step to unthrottled; set it in the config to guarantee the signal path can
 # never produce an unbounded stat rate on a live filesystem.
@@ -189,6 +197,7 @@ DEFAULT_PRUNE_REGEX = "^(%s)$" % "|".join(re.escape(d) for d in DEFAULT_PRUNE_DI
 # Set in main() when --config is given; polled from the walker loop.
 runtime_config = None
 apply_config = None
+regulator = None
 
 
 def config_example(volume="VOLUME"):
@@ -249,6 +258,33 @@ def config_example(volume="VOLUME"):
         "# descended into or statted. Cost is one regex match per directory, not",
         "# per file. Set empty to disable pruning entirely.",
         "prune_dir_regex = %s" % DEFAULT_PRUNE_REGEX,
+        "",
+        "# --- self-regulation ----------------------------------------------------",
+        "# Throttle against what the filesystem's OTHER clients experience, which",
+        "# this job cannot observe from its own copy latency. Entirely optional:",
+        "# leave the URL empty and the regulator never starts.",
+        "#",
+        "# The query is a complete PromQL expression and must evaluate to exactly",
+        "# one series whose value is MILLISECONDS. Nothing here assumes Ceph, or",
+        "# any particular exporter. {volume} is substituted with this filesystem's",
+        "# name (regex-escaped); omit it and the query is used verbatim.",
+        "#",
+        "# Units are checked once at startup and called out, because seconds means",
+        "# it never triggers and microseconds means it never stops -- both silent.",
+        "regulate_prometheus_url =",
+        "regulate_query  =",
+        "",
+        "# Pause above this. The soft target is what it eases back toward; it does",
+        "# not gate the pause.",
+        "regulate_pause_ms   = %s" % REG_PAUSE_MS_DEFAULT,
+        "regulate_slo_ms     = %s" % REG_SLO_MS_DEFAULT,
+        "",
+        "# Poll period, and the delay floor the regulator decays back down to",
+        "# after a quiet spell. Repeated pauses ratchet the floor UP; quiet time",
+        "# releases it, but never below this baseline.",
+        "regulate_period_s   = %d" % REG_PERIOD_S_DEFAULT,
+        "regulate_floor_ms   = %d" % REG_FLOOR_MS_DEFAULT,
+        "regulate_quiet_ticks = %d" % REG_QUIET_TICKS_DEFAULT,
         "",
     ))
 
@@ -312,7 +348,8 @@ class RuntimeConfig:
             'prune_dir_regex', 'delay_step_up', 'delay_step_down',
             'delay_min_ms', 'prune_subtree_max_bytes', 'prune_budget_bytes',
             'regulate_prometheus_url', 'regulate_query', 'regulate_pause_ms',
-            'regulate_slo_ms', 'regulate_period_s', 'regulate_quiet_ticks')
+            'regulate_slo_ms', 'regulate_period_s', 'regulate_quiet_ticks',
+            'regulate_floor_ms')
 
     def __init__(self, path, poll_seconds=10.0):
         self.path = path
@@ -436,6 +473,11 @@ class RuntimeConfig:
                     iv = int(v)
                     if iv < 1:
                         raise ValueError("must be >= 1")
+                    out[k] = iv
+                elif k == 'regulate_floor_ms':
+                    iv = int(v)
+                    if not 0 <= iv <= DELAY_MAX_MS:
+                        raise ValueError("out of range 0..%d" % DELAY_MAX_MS)
                     out[k] = iv
                 elif k in ('prune_subtree_max_bytes', 'prune_budget_bytes'):
                     iv = int(v)
@@ -1086,14 +1128,30 @@ def _prune_inert_warning(args):
 # Everything is optional. With no regulate_prometheus_url the thread never starts
 # and the job runs at whatever file_delay_ms and threads say -- the tool has to be
 # fully usable by anyone who does not have these metrics, or indeed any Prometheus.
+# Every regulate_* key in RuntimeConfig.KEYS must appear here, or it parses,
+# validates, and is then discarded. That is exactly what happened to
+# regulate_prometheus_url and regulate_query: a fully configured file still
+# started with "Self-regulation disabled (no regulate_prometheus_url)", because
+# only the four tuning keys below were ever copied onto args. Tested as an
+# invariant rather than trusted to review.
+REGULATE_APPLY = (
+    ('regulate_prometheus_url', 'regulate Prometheus URL'),
+    ('regulate_query', 'regulate query'),
+    ('regulate_pause_ms', 'regulate pause threshold'),
+    ('regulate_slo_ms', 'regulate soft target'),
+    ('regulate_period_s', 'regulate poll period'),
+    ('regulate_quiet_ticks', 'regulate quiet ticks'),
+    ('regulate_floor_ms', 'regulate delay floor'),
+)
+
 REG_DEFAULTS = {
     'regulate_prometheus_url': None,
     'regulate_query': None,
-    'regulate_pause_ms': 150.0,
-    'regulate_slo_ms': 75.0,
-    'regulate_period_s': 30,
-    'regulate_floor_ms': 0,
-    'regulate_quiet_ticks': 10,
+    'regulate_pause_ms': REG_PAUSE_MS_DEFAULT,
+    'regulate_slo_ms': REG_SLO_MS_DEFAULT,
+    'regulate_period_s': REG_PERIOD_S_DEFAULT,
+    'regulate_floor_ms': REG_FLOOR_MS_DEFAULT,
+    'regulate_quiet_ticks': REG_QUIET_TICKS_DEFAULT,
 }
 # Raise the delay floor after repeated pauses: pausing repeatedly means the delay
 # is set lower than this filesystem will sustain, and recovering within a tick is
@@ -1184,6 +1242,16 @@ class Regulator(threading.Thread):
         self._quiet = 0
         self._last_err = 0.0
         self._paused_threads = None
+
+    def set_floor_base(self, ms):
+        """Move the baseline the floor decays back to.
+
+        The baseline is captured at construction, so without this a config
+        change to regulate_floor_ms would be accepted and have no effect.
+        """
+        self._floor_base = int(ms)
+        if self.floor_ms < self._floor_base:
+            self.floor_ms = self._floor_base
 
     # -- data -----------------------------------------------------------------
     def sample(self):
@@ -1738,7 +1806,8 @@ def process_files(args):
         for line in f:
             mountpoints.add(line.split()[1])
 
-    start_regulator(args)
+    global regulator
+    regulator = start_regulator(args)
 
     with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
         tmpdir_dev = os.stat(args.tmpdir).st_dev
@@ -1990,26 +2059,26 @@ def main():
              "it if that cannot be derived. Single line, no '#'.",
     )
     parser.add_argument(
-        "--regulate-pause-ms", type=float, default=150.0, metavar="MS",
+        "--regulate-pause-ms", type=float, default=REG_PAUSE_MS_DEFAULT, metavar="MS",
         help="Pause the job while the query exceeds this (default 150).",
     )
     parser.add_argument(
-        "--regulate-slo-ms", type=float, default=75.0, metavar="MS",
+        "--regulate-slo-ms", type=float, default=REG_SLO_MS_DEFAULT, metavar="MS",
         help="Soft target, used only to express readings as a percentage in log "
              "messages (default 75). --regulate-pause-ms is what actually gates.",
     )
     parser.add_argument(
-        "--regulate-period-s", type=int, default=30, metavar="SEC",
+        "--regulate-period-s", type=int, default=REG_PERIOD_S_DEFAULT, metavar="SEC",
         help="Seconds between samples (default 30).",
     )
     parser.add_argument(
-        "--regulate-floor-ms", type=int, default=0, metavar="MS",
+        "--regulate-floor-ms", type=int, default=REG_FLOOR_MS_DEFAULT, metavar="MS",
         help="Lower bound on --file-delay that regulation may ease down to. "
              "Repeated pauses raise it; sustained quiet releases it back to this "
              "baseline (default 0).",
     )
     parser.add_argument(
-        "--regulate-quiet-ticks", type=int, default=10, metavar="N",
+        "--regulate-quiet-ticks", type=int, default=REG_QUIET_TICKS_DEFAULT, metavar="N",
         help="Consecutive clean samples before easing the delay (default 10).",
     )
     parser.add_argument(
@@ -2408,14 +2477,20 @@ def main():
                         args.min_size // 8,
                         args.prune_budget_bytes,
                     )
-        for _k, _label in (('regulate_pause_ms', 'regulate pause threshold'),
-                           ('regulate_slo_ms', 'regulate soft target'),
-                           ('regulate_period_s', 'regulate poll period'),
-                           ('regulate_quiet_ticks', 'regulate quiet ticks')):
+        for _k, _label in REGULATE_APPLY:
             if _k in cfg and cfg[_k] != getattr(args, _k, None):
                 _old = getattr(args, _k, None)
                 setattr(args, _k, cfg[_k])
                 logging.info("Config: %s %s -> %s", _label, _old, cfg[_k])
+                # The regulator is started once, so these two decide only whether
+                # it came up at all. Changing them later looks like it worked.
+                if _k in ('regulate_prometheus_url', 'regulate_query') \
+                        and regulator is not None:
+                    logging.warning(
+                        "Config: %s changed, but the regulator is started once at "
+                        "startup -- restart the job for this to take effect", _label)
+                if _k == 'regulate_floor_ms' and regulator is not None:
+                    regulator.set_floor_base(cfg[_k])
         for _k, _label in (('prune_subtree_max_bytes', 'prune subtree ceiling'),
                            ('prune_budget_bytes', 'prune budget')):
             if _k in cfg and cfg[_k] != getattr(args, _k):
