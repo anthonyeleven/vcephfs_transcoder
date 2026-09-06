@@ -835,6 +835,8 @@ class Stats:
     files_skipped_symlink: int = 0
     files_skipped_large: int = 0
     files_skipped_source_pool: int = 0
+    files_vanished: int = 0
+    files_outside_root: int = 0
     dirs_pruned: int = 0
     subtrees_pruned: int = 0
     bytes_pruned: int = 0
@@ -1578,6 +1580,211 @@ def handler(future):
         thread_count.release()
 
 
+def _under_roots(path, roots):
+    """Is *path* inside one of *roots*?
+
+    Separate function so the prefix comparison is testable. A bare startswith()
+    would put /vol/abc under /vol/ab, which is how a list for one volume ends up
+    silently rewriting another.
+    """
+    return any(path == r or path.startswith(r.rstrip(os.sep) + os.sep)
+               for r in roots)
+
+
+def _iter_listed_paths(src):
+    """Yield paths from a --paths-from source, streaming.
+
+    NUL- or newline-delimited, detected from the first block rather than from a
+    second flag: a list built with `find -print0` is NUL-delimited, one scraped
+    out of a previous run's log is newline-delimited, and a flag for it is one
+    more thing to get wrong silently. Read in chunks -- a candidate list for a
+    large volume runs to tens of millions of lines, which is not something to
+    hold in memory just to split it.
+    """
+    fh = sys.stdin.buffer if src == "-" else open(src, "rb")
+    try:
+        first = fh.read(1 << 16)
+        sep = b"\0" if b"\0" in first else b"\n"
+        logging.info("--paths-from %s: %s-delimited", src,
+                     "NUL" if sep == b"\0" else "newline")
+        buf = first
+        while True:
+            parts = buf.split(sep)
+            buf = parts.pop()
+            for raw in parts:
+                # surrogateescape: a path the filesystem accepts is not always
+                # valid UTF-8, and refusing to process it would be worse than
+                # round-tripping the bytes.
+                t = raw.decode("utf-8", "surrogateescape").strip("\r\n")
+                if t:
+                    yield t
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                break
+            buf += chunk
+        t = buf.decode("utf-8", "surrogateescape").strip("\r\n")
+        if t:
+            yield t
+    finally:
+        if src != "-":
+            fh.close()
+
+
+def process_paths(args, hard_links, executor, dir_layouts, roots):
+    """Transcode an explicit list of paths instead of walking the tree.
+
+    A second pass at a lower --min-size already knows its candidates from the
+    previous pass's log, and rediscovering them is the expensive part: the
+    walker sleeps file_delay once per file ENCOUNTERED, before the stat, so a
+    pass costs roughly rfiles x delay however few files actually qualify. On one
+    production volume that is 195M paths visited to reach 8.7M candidates -- 45
+    days of walking for 2 days of work.
+
+    The list is a snapshot and it decays. Measured on that volume, 63% of the
+    listed paths no longer existed six days later and 39% of the survivors had
+    already moved to the target pool. So nothing here trusts the list: every
+    path is re-stat'ed and re-checked exactly as the walker would, and a path
+    that has since vanished is an expected outcome rather than an error.
+    """
+    def _limit_reached():
+        return args.max_files is not None and stats.files_submitted >= args.max_files
+
+    last_progress = time.monotonic()
+    outside_logged = 0
+
+    for filepath in _iter_listed_paths(args.paths_from):
+        if do_exit.is_set() or _limit_reached():
+            return
+
+        if runtime_config is not None:
+            runtime_config.poll(apply_config)
+
+        delay = file_delay_ms
+        if delay > 0:
+            time.sleep(delay / 1000.0)
+
+        if time.monotonic() - last_progress > 60:
+            stats.log_progress()
+            last_progress = time.monotonic()
+
+        filepath = os.path.abspath(filepath)
+
+        # Containment. A list is easy to generate against the wrong volume, and
+        # the damage would be silent and large, so a path outside the roots
+        # given on the command line is refused rather than followed.
+        if not _under_roots(filepath, roots):
+            with stats._lock:
+                stats.files_outside_root += 1
+            outside_logged += 1
+            if outside_logged <= 10:
+                logging.warning("Skipping %s: outside the directories given on the "
+                                "command line", filepath)
+            elif outside_logged == 11:
+                logging.warning("Further out-of-tree paths will be counted but not "
+                                "logged individually")
+            continue
+
+        try:
+            st = os.stat(filepath, follow_symlinks=False)
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ESTALE, errno.ENOTDIR):
+                with stats._lock:
+                    stats.files_vanished += 1
+                logging.info("Skipping %s: no longer exists", filepath)
+            else:
+                logging.warning("Skipping %s: %s", filepath, e)
+                with stats._lock:
+                    stats.files_failed += 1
+            continue
+
+        if not stat.S_ISREG(st.st_mode):
+            msg = stats.note_skipped_symlink()
+            if msg:
+                logging.info(msg)
+            continue
+
+        dirpath = os.path.dirname(filepath)
+        layout = dir_layouts.get(dirpath)
+        if layout is None:
+            layout = get_layout_walking_up(dirpath)
+            if layout is None:
+                logging.error(f"Could not determine layout for {dirpath}, skipping")
+                with stats._lock:
+                    stats.files_failed += 1
+                continue
+            dir_layouts[dirpath] = layout
+
+        # Layout is checked BEFORE size here, the reverse of the walker. The
+        # walker tests size first because that is the cheaper rejection: most of
+        # what it encounters is tiny, and a stat alone settles it, so reading a
+        # layout for every file would add an MDS round trip to the common case.
+        # A path list is already filtered to plausible candidates, and its
+        # staleest entries are precisely the ones an earlier pass has since
+        # moved -- testing size first would log those as "below --min-size" and
+        # conceal that they are already done, which is exactly how a previous
+        # analysis came to overstate the remaining work.
+        file_layout = CephLayout.from_file(filepath)
+        if file_layout is None:
+            logging.error(f"Could not read layout for {filepath}, skipping")
+            with stats._lock:
+                stats.files_failed += 1
+            continue
+        if file_layout == layout:
+            with stats._lock:
+                stats.files_skipped_layout_match += 1
+            continue
+        if args.source_pool is not None and file_layout.pool != args.source_pool:
+            with stats._lock:
+                stats.files_skipped_source_pool += 1
+            continue
+
+        if st.st_nlink == 1 and st.st_size < args.min_size:
+            logging.info(
+                f"Skipping {filepath}: size {st.st_size} below --min-size {args.min_size}"
+            )
+            with stats._lock:
+                stats.files_skipped_small += 1
+            continue
+        if (st.st_nlink == 1 and args.max_size is not None
+                and st.st_size > args.max_size):
+            logging.info(
+                f"Skipping {filepath}: size {st.st_size} above --max-size {args.max_size}"
+            )
+            with stats._lock:
+                stats.files_skipped_large += 1
+            continue
+        if st.st_mtime > (time.time() - 86400 * min_age_days):
+            logging.info(f"Skipping {filepath}: modified too recently")
+            with stats._lock:
+                stats.files_skipped_recent += 1
+            continue
+
+        # Multiply-linked files need every link in hand before any of them can
+        # be replaced, and a path list cannot promise it contains them all.
+        # Transcoding a partial set would break the link relationship, so this
+        # mode declines regardless of --process-hardlinks. Walk for those.
+        if st.st_nlink != 1:
+            logging.info(
+                f"Skipping {filepath}: has {st.st_nlink} hard links -- --paths-from "
+                f"cannot see the other links, use a walk for these"
+            )
+            with stats._lock:
+                stats.files_skipped_hardlink += 1
+            continue
+
+        if not thread_count.acquire(
+                cancel=lambda: do_exit.is_set() or _limit_reached()):
+            return
+        try:
+            future = executor.submit(
+                process_file, args, [filepath], st, layout, file_layout
+            )
+            future.add_done_callback(handler)
+        except Exception:
+            thread_count.release()
+            raise
+
+
 def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts):
     def _limit_reached():
         return args.max_files is not None and stats.files_submitted >= args.max_files
@@ -1833,6 +2040,30 @@ def process_files(args):
 
     with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
         tmpdir_dev = os.stat(args.tmpdir).st_dev
+
+        if args.paths_from:
+            roots = []
+            for start_dir in args.dirs:
+                start_dir = os.path.abspath(start_dir)
+                if os.stat(start_dir).st_dev != tmpdir_dev:
+                    logging.error(
+                        f"tmpdir {args.tmpdir} is on a different filesystem than "
+                        f"{start_dir}. os.rename() will fail with EXDEV. Aborting."
+                    )
+                    sys.exit(1)
+                roots.append(start_dir)
+            for opt, val in (("--prune-dir-regex", args.prune_re),
+                             ("--prune-small-subtrees",
+                              getattr(args, "prune_small_subtrees", False))):
+                if val:
+                    logging.warning(
+                        "%s has no effect with --paths-from: it prunes the walk, "
+                        "and the list replaces the walk", opt)
+            logging.info("Processing the list in %s, under %s",
+                         args.paths_from, ", ".join(roots))
+            process_paths(args, hard_links, executor, dir_layouts, roots)
+            return
+
         for start_dir in args.dirs:
             start_dir = os.path.abspath(start_dir)
             if os.stat(start_dir).st_dev != tmpdir_dev:
@@ -1951,6 +2182,19 @@ def main():
         "--version", action="version", version=f"%(prog)s {_VERSION}"
     )
     parser.add_argument("dirs", help="Directories to scan", nargs="*")
+    parser.add_argument(
+        "--paths-from", metavar="FILE",
+        help="Transcode exactly the files listed in FILE ('-' for stdin) instead "
+             "of walking the directories. NUL- or newline-delimited, detected "
+             "from the content. The directories still have to be given: they "
+             "bound what the list is allowed to touch, and a listed path outside "
+             "them is refused. Every path is re-stat'ed and re-checked, so a list "
+             "that has gone stale is safe -- vanished files are counted and "
+             "logged, not treated as errors. Multiply-linked files are declined "
+             "in this mode because a list cannot promise it holds every link. "
+             "Intended for a second pass whose candidates are already known from "
+             "an earlier run's log, where walking the whole tree again to "
+             "rediscover them is the expensive part.")
     parser.add_argument(
         "--tmpdir",
         default="/data/tmp",
@@ -2585,6 +2829,7 @@ def main():
         f"{stats.files_failed} failed, "
         f"{stats.files_skipped_layout_match} already matched, "
         f"{stats.files_skipped_source_pool} wrong source pool, "
+        f"{stats.files_vanished} vanished, "
         f"{stats.subtrees_pruned} subtrees pruned ({stats.bytes_pruned} bytes), "
         f"{stats.files_skipped_recent} too recent, "
         f"{stats.files_skipped_changed} changed during processing, "

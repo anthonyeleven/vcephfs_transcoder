@@ -503,6 +503,76 @@ class RegulateConfigRouting(unittest.TestCase):
             self.assertIn(k, ex, "%s missing from the example config" % k)
 
 
+class PathsFromList(unittest.TestCase):
+    """--paths-from replaces the walk, so its reader and its containment check
+    are the only things standing between a stale or wrong list and the data."""
+
+    def _write(self, data):
+        import tempfile
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_newline_delimited(self):
+        p = self._write(b"/a/one\n/a/two\n/a/three\n")
+        self.assertEqual(list(vct._iter_listed_paths(p)),
+                         ["/a/one", "/a/two", "/a/three"])
+
+    def test_nul_delimited_detected(self):
+        """A list from find -print0 must not be read as one enormous path."""
+        p = self._write(b"/a/one\x00/a/two\x00")
+        self.assertEqual(list(vct._iter_listed_paths(p)), ["/a/one", "/a/two"])
+
+    def test_path_containing_newline_survives_nul_mode(self):
+        p = self._write(b"/a/we\nird\x00/a/two\x00")
+        self.assertEqual(list(vct._iter_listed_paths(p)), ["/a/we\nird", "/a/two"])
+
+    def test_blank_lines_and_crlf(self):
+        p = self._write(b"/a/one\r\n\n/a/two\n\n")
+        self.assertEqual(list(vct._iter_listed_paths(p)), ["/a/one", "/a/two"])
+
+    def test_no_trailing_separator(self):
+        p = self._write(b"/a/one\n/a/last")
+        self.assertEqual(list(vct._iter_listed_paths(p)), ["/a/one", "/a/last"])
+
+    def test_entry_spanning_the_read_boundary(self):
+        """Reads are chunked, so an entry straddling a chunk edge is the case
+        that silently truncates paths if the buffering is wrong."""
+        names = ["/vol/%06d/%s" % (i, "x" * 90) for i in range(4000)]
+        p = self._write(("\n".join(names) + "\n").encode())
+        got = list(vct._iter_listed_paths(p))
+        self.assertEqual(got, names)
+        self.assertTrue(len(("\n".join(names)).encode()) > (1 << 16),
+                        "test data too small to cross a chunk boundary")
+
+    def test_undecodable_bytes_round_trip(self):
+        """A path the filesystem accepts need not be valid UTF-8; it must still
+        be usable, not dropped."""
+        p = self._write(b"/a/bad\xff\n")
+        got = list(vct._iter_listed_paths(p))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].encode("utf-8", "surrogateescape"), b"/a/bad\xff")
+
+    def test_under_roots(self):
+        roots = ["/vol/ab"]
+        self.assertTrue(vct._under_roots("/vol/ab", roots))
+        self.assertTrue(vct._under_roots("/vol/ab/x/y", roots))
+        self.assertFalse(vct._under_roots("/vol/abc", roots),
+                         "sibling sharing a name prefix must not be included")
+        self.assertFalse(vct._under_roots("/other/ab/x", roots))
+
+    def test_under_roots_trailing_slash(self):
+        self.assertTrue(vct._under_roots("/vol/ab/x", ["/vol/ab/"]))
+
+    def test_naive_prefix_would_be_wrong(self):
+        """Control: the bug the helper exists to prevent. If _under_roots ever
+        degrades to a bare startswith, this documents what breaks."""
+        self.assertTrue("/vol/abc".startswith("/vol/ab"))
+        self.assertFalse(vct._under_roots("/vol/abc", ["/vol/ab"]))
+
+
 class Crossover(unittest.TestCase):
     """Generalized source scheme: comparing against 3x replication only is wrong."""
 
