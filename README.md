@@ -98,7 +98,13 @@ usage: vcephfs_transcoder.py [-h] [--version] [--tmpdir TMPDIR]
                              [--log-rotate-lines LOG_ROTATE_LINES]
                              [--log-rotate-time LOG_ROTATE_TIME]
                              [--log-rotate-size GIB] [--no-copy-file-range]
-                             [--copy-file-range] [--source-pool POOL]
+                             [--copy-file-range]
+                             [--regulate-prometheus-url URL]
+                             [--regulate-query PROMQL]
+                             [--regulate-pause-ms MS] [--regulate-slo-ms MS]
+                             [--regulate-period-s SEC]
+                             [--regulate-floor-ms MS]
+                             [--regulate-quiet-ticks N] [--source-pool POOL]
                              [--prune-small-subtrees]
                              [--prune-subtree-max-bytes BYTES]
                              [--prune-budget-bytes BYTES]
@@ -161,6 +167,31 @@ optional arguments:
   --copy-file-range     Opt back in to copy_file_range (server-side copy when
                         CephFS supports it). Off by default; see --no-copy-
                         file-range.
+  --regulate-prometheus-url URL
+                        Prometheus /api/v1/query endpoint for self-regulation.
+                        Unset (the default) disables regulation entirely and
+                        the job simply runs at --file-delay and --threads.
+  --regulate-query PROMQL
+                        A complete PromQL expression returning ONE value in
+                        MILLISECONDS for the latency to protect. {volume} is
+                        substituted with the CephFS name from the mount,
+                        regex-escaped; write the query without it if that
+                        cannot be derived. Single line, no '#'.
+  --regulate-pause-ms MS
+                        Pause the job while the query exceeds this (default
+                        150).
+  --regulate-slo-ms MS  Soft target, used only to express readings as a
+                        percentage in log messages (default 75). --regulate-
+                        pause-ms is what actually gates.
+  --regulate-period-s SEC
+                        Seconds between samples (default 30).
+  --regulate-floor-ms MS
+                        Lower bound on --file-delay that regulation may ease
+                        down to. Repeated pauses raise it; sustained quiet
+                        releases it back to this baseline (default 0).
+  --regulate-quiet-ticks N
+                        Consecutive clean samples before easing the delay
+                        (default 10).
   --source-pool POOL    Only transcode files whose CURRENT data pool is POOL.
                         Without it, every file not already on the target pool
                         is eligible. Use this to drain one pool into another
