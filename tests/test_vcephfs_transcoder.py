@@ -72,8 +72,8 @@ class ReplaceLockStriping(unittest.TestCase):
     """Per-path exclusion must survive; unrelated paths must not serialize."""
 
     def test_same_path_same_lock(self):
-        a = vct._replace_lock_for("/shared/ceph/eureq/a/b/c.gz")
-        b = vct._replace_lock_for("/shared/ceph/eureq/a/b/c.gz")
+        a = vct._replace_lock_for("/vol/a/b/c.gz")
+        b = vct._replace_lock_for("/vol/a/b/c.gz")
         self.assertIs(a, b)
 
     def test_same_path_mutually_excludes(self):
