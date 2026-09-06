@@ -271,6 +271,12 @@ def config_example(volume="VOLUME"):
         "#",
         "# Units are checked once at startup and called out, because seconds means",
         "# it never triggers and microseconds means it never stops -- both silent.",
+        "#",
+        "# Backslashes must be DOUBLED. PromQL string literals use Go escaping, so",
+        "# a regex dot is \\\\. inside the quotes; a single backslash is a parse",
+        "# error (HTTP 400: unknown escape sequence), not a wrong match. Example:",
+        "#   regulate_query = 1e3 * sum(increase(mds_lat_sum{n=~\"mds\\\\.{volume}\\\\..*\"}[1m]))",
+        "#                        / sum(increase(mds_lat_count{n=~\"mds\\\\.{volume}\\\\..*\"}[1m]))",
         "regulate_prometheus_url =",
         "regulate_query  =",
         "",
@@ -1209,6 +1215,22 @@ def _mds_namespace_for(path):
         return None
 
 
+def _promql_regex_literal(name):
+    """Escape a name for use as a regex INSIDE a PromQL double-quoted string.
+
+    Two layers, and missing the second one is a hard parse error rather than a
+    wrong match. re.escape() turns a dot into \\. , but PromQL string literals
+    use Go escaping, where \\. is not a valid escape sequence:
+
+        ceph_daemon=~"mds\\.myvol\\..*"   ->  HTTP 400
+          parse error: unknown escape sequence U+002E '.'
+
+    The backslash therefore has to survive the string layer as well, so every
+    one re.escape() produces is doubled.
+    """
+    return re.escape(name).replace("\\", "\\\\")
+
+
 def _resolve_query(args):
     """(query, why_disabled). Substitutes {volume} if the query asks for it."""
     q = getattr(args, "regulate_query", None)
@@ -1223,7 +1245,7 @@ def _resolve_query(args):
             "regulate_query uses {volume} but the filesystem name could not be "
             "resolved to exactly one value (found %s). Either run one volume per "
             "job, or write regulate_query without {volume}." % (sorted(names) or "none"))
-    return q.replace("{volume}", re.escape(names.pop())), None
+    return q.replace("{volume}", _promql_regex_literal(names.pop())), None
 
 
 class Regulator(threading.Thread):
