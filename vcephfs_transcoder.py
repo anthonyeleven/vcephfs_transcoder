@@ -1121,6 +1121,20 @@ def _mds_namespace_for(path):
     """
     try:
         path = os.path.abspath(path)
+        # Touch the path first. These trees are commonly autofs, and an autofs
+        # mount point has no ceph entry in /proc/self/mounts until something
+        # triggers it -- so reading the table cold reports "not a ceph mount" for
+        # a path that is one. The mounts also carry a timeout and unmount when
+        # idle, so this is not only a first-run concern.
+        try:
+            # os.stat is NOT enough: autofs answers a stat of the mount point
+            # itself without mounting anything. Opening the directory is what
+            # triggers it. Read at most one entry -- these are volume roots and
+            # we only need the mount, not a listing.
+            with os.scandir(path) as _it:
+                next(_it, None)
+        except OSError:
+            pass
         best, best_ns = "", None
         with open("/proc/self/mounts") as fh:
             for line in fh:

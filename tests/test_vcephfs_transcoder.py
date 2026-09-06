@@ -310,6 +310,32 @@ class RegulatorVolume(unittest.TestCase):
         self.assertIn("exactly one", why)
 
 
+class RegulatorAutofs(unittest.TestCase):
+    """Mount-point name != filesystem name, and the mount may not exist yet."""
+
+    def test_reads_mds_namespace_not_the_path(self):
+        """On the real fleet, several distinct mount points can live on one
+        filesystem, and a mount point can differ from its filesystem name. Deriving the
+        name from the path would query a filesystem that does not exist."""
+        src = open(os.path.abspath(TARGET)).read()
+        self.assertIn("mds_namespace=", src)
+        # must not fall back to basename-of-path anywhere in the resolver
+        fn = src.split("def _mds_namespace_for")[1].split("\ndef ")[0]
+        self.assertNotIn("basename", fn)
+        self.assertIn("/proc/self/mounts", fn)
+
+    def test_triggers_the_automount_before_reading(self):
+        """A bare stat is not enough -- autofs answers a stat of the mount point
+        without mounting. Verified on the fleet: stat returned an inode and the
+        ceph mount still did not appear."""
+        src = open(os.path.abspath(TARGET)).read()
+        fn = src.split("def _mds_namespace_for")[1].split("\ndef ")[0]
+        self.assertIn("scandir", fn)
+
+    def test_unmountable_path_returns_none(self):
+        self.assertIsNone(vct._mds_namespace_for("/definitely/not/here/at/all"))
+
+
 class RegulatorBehavior(unittest.TestCase):
     """Drive the decision logic with a stubbed sample()."""
 
