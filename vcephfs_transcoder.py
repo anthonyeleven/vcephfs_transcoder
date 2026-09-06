@@ -31,6 +31,48 @@ thread_count = None
 file_delay_ms = 0
 min_age_days = 1
 
+# --- the tmpdir is the throughput bottleneck, and why it has not moved yet ---
+#
+# Measured 2026-09-05. Renaming the finished temp file out of --tmpdir and into
+# its target directory is where nearly all per-file wall time goes. Controlled
+# A/B/C on one client, same file size, 12 trials each:
+#
+#     A. same directory (deep in the tree)     mean    0.3 ms  p50 0.3  max     0.4
+#     B. tmpdir -> deep dir (what we do)       mean 1266.7 ms  p50 8.2  max 14914.7
+#     C. sibling dir -> deep dir               mean  387.9 ms  p50 0.3  max  4637.0
+#
+# It is bimodal. B's median is a healthy 8.2 ms; the mean is set by a tail that
+# reaches fifteen seconds. Since a stalled worker blocks everything queued
+# behind it, the tail is what determines throughput, not the median. Only case A
+# had no outliers at all.
+#
+# For scale: on the same client, into the same pools, a 256 KiB write plus fsync
+# takes ~5 ms and a cold read ~3 ms. So the storage is roughly 100x faster than
+# what the transcoder extracts from it, and this rename is the reason.
+#
+# THE FIX would be to create the temp file beside its target instead of in a
+# shared tmpdir, making every rename intra-directory. Two documented objections
+# stood in the way; both have now been checked.
+#
+#   1. Detectability. --tmpdir must be on the default data pool so that a failed
+#      layout.apply_file() leaves the file somewhere visibly wrong. A sibling
+#      temp file inherits the target directory's layout, which would mask that.
+#      Answerable: apply the layout and then READ IT BACK before copying. That
+#      is a stronger check than inferring correctness from the tmpdir's pool.
+#
+#   2. "Excess backtrace objects", per the --tmpdir help text. Measured, and it
+#      does not block the change. Backtrace placement depends on the file's
+#      FINAL layout, not on where the temp file was staged: a file outside the
+#      first data pool costs two objects either way. The only case that adds a
+#      third is switching a file's layout after creation, which puts an entry in
+#      old_pools -- and a sibling temp file created directly in a target-pool
+#      directory performs no switch at all. Neutral, not worse.
+#
+# So the change is unblocked but deliberately NOT made here: it touches every
+# file of a petabyte-scale migration and wants its own review, its own PR, and
+# the A/B/C above as its regression test. Do not "simplify" the tmpdir away
+# without reading objection 1.
+
 # --- what transcoding costs in objects, and where it lands -------------------
 #
 # Measured on a 980-OSD production cluster, 2026-09-05. All figures from live
