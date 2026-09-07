@@ -1536,10 +1536,28 @@ def process_file(args, filepaths, st, layout, file_layout):
                     stats.files_skipped_changed += 1
                 return
 
+            # The FILE's mtime is preserved, by copystat above -- pipeline
+            # archival (archive_*) and rsync both key on it directly.
+            #
+            # The parent DIRECTORY's mtime is deliberately NOT restored, and the
+            # os.stat + os.utime that used to do it here are gone:
+            #
+            #   * It did not achieve its purpose. The point was to keep
+            #     ceph.dir.rctime from jumping to the transcode date, but
+            #     os.utime() updates the directory's ctime as a side effect, and
+            #     rctime is a monotonic high-water mark over subtree ctimes that
+            #     never rolls back. Verified live: a transcoded subtree's rctime
+            #     reads as today either way, so retention reports see it as
+            #     0 days old until it ages again. Deferring the utime to
+            #     directory exit would not have helped either.
+            #   * Nothing consumes it. Archive scripts select -type f, restic
+            #     handles directory nodes independently, and rsync compares
+            #     child file mtime and size.
+            #   * It was the contention. Setting a directory's times requires an
+            #     exclusive MDS auth cap (CEPH_CAP_AUTH_EXCL), which collides
+            #     with directory walkers and with sibling workers in the same
+            #     directory -- measured as utimensat stalls up to 4.94s.
             for i, path in enumerate(filepaths):
-                parent_path = os.path.split(path)[0]
-                parent_st = os.stat(parent_path, follow_symlinks=False)
-
                 if i == 0:
                     logging.info(f"Renaming {tmp_file} -> {path}")
                     os.rename(tmp_file, path)
@@ -1547,11 +1565,6 @@ def process_file(args, filepaths, st, layout, file_layout):
                     logging.info(f"Linking {filepaths[0]} -> {path}")
                     os.link(filepaths[0], tmp_file, follow_symlinks=False)
                     os.rename(tmp_file, path)
-                os.utime(
-                    parent_path,
-                    ns=(parent_st.st_atime_ns, parent_st.st_mtime_ns),
-                    follow_symlinks=False,
-                )
 
             with stats._lock:
                 stats.files_transcoded += 1
