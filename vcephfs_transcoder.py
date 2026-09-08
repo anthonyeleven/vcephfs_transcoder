@@ -1446,9 +1446,16 @@ TMP_ORPHAN_MIN_AGE_S = 24 * 3600
 _reclaimed_dirs = set()
 _reclaimed_lock = threading.Lock()
 
-# One journal per volume root records what this run did to rctime. Retention
-# reads it to recover the data-activity time for artifacts whose rctime we
-# pinned. See the module docstring of add_run_journal.py for why this is needed.
+# One journal per volume root records what this run did to rctime.
+#
+# ceph.dir.rctime is a monotonic high-water mark, so transcoding pins every
+# ancestor directory's rctime at the moment we ran, and a directory that is
+# never written again stays pinned forever. Retention reads rctime as the
+# answer rather than a hint (classify_retention.get_artifact_mtime, whose
+# docstring forbids walking the tree instead), so a transcoded artifact reads
+# as modified today and stops aging out. rctime cannot be restored: it is not
+# settable, there is no ceph.dir.rmtime, and it only climbs. Preserving the
+# answer before we destroy it is the only option left.
 RUN_JOURNAL_NAME = ".vcephfs-transcode-runs.jsonl"
 # Names an artifact root, matching retention_path_policy's own marker.
 RETENTION_MARKER = "RETENTION"
@@ -1470,6 +1477,9 @@ class RunJournal:
     the first sighting is what captures the pre-transcode rctime. Both call
     sites stat every file ahead of any gating, so that ordering holds for the
     walk and for --paths-from alike.
+
+    Consuming this requires a matching change in the retention scripts; without
+    that the journal is written but nothing reads it.
     """
 
     def __init__(self, enabled, stop_at=()):
@@ -2062,6 +2072,12 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
         # writing one right now, and transcoding a partial copy would be wrong.
         # Reclaim the aged ones here, for every directory the walk enters, so a
         # subtree that holds orphans but no current candidate is still swept.
+        if RUN_JOURNAL_NAME in filenames:
+            # Ours, and it lives at a volume root that is inside the walk.
+            # Being under --min-size already keeps it from being transcoded,
+            # but that is a coincidence of its size, not a rule.
+            filenames[:] = [f for f in filenames if f != RUN_JOURNAL_NAME]
+
         orphans = [f for f in filenames if TMP_RE.match(f)]
         if orphans:
             filenames[:] = [f for f in filenames if not TMP_RE.match(f)]
@@ -2312,62 +2328,67 @@ def process_files(args):
         stop_at=[os.path.abspath(d) for d in args.dirs],
     )
 
-    with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
-        tmpdir_dev = os.stat(args.tmpdir).st_dev
+    try:
+        with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
+            tmpdir_dev = os.stat(args.tmpdir).st_dev
 
-        if args.paths_from:
-            roots = []
+            if args.paths_from:
+                roots = []
+                for start_dir in args.dirs:
+                    start_dir = os.path.abspath(start_dir)
+                    if args.stage_in_tmpdir and os.stat(start_dir).st_dev != tmpdir_dev:
+                        logging.error(
+                            f"--stage-in-tmpdir was given and tmpdir {args.tmpdir} is on a "
+                            f"different filesystem than {start_dir}. os.rename() will fail "
+                            f"with EXDEV. Aborting."
+                        )
+                        sys.exit(1)
+                    roots.append(start_dir)
+                    roots_seen.append(start_dir)
+                for opt, val in (("--prune-dir-regex", args.prune_re),
+                                 ("--prune-small-subtrees",
+                                  getattr(args, "prune_small_subtrees", False))):
+                    if val:
+                        logging.warning(
+                            "%s has no effect with --paths-from: it prunes the walk, "
+                            "and the list replaces the walk", opt)
+                logging.info("Processing the list in %s, under %s",
+                             args.paths_from, ", ".join(roots))
+                process_paths(args, hard_links, executor, dir_layouts, roots)
+                return
+
             for start_dir in args.dirs:
                 start_dir = os.path.abspath(start_dir)
                 if args.stage_in_tmpdir and os.stat(start_dir).st_dev != tmpdir_dev:
                     logging.error(
                         f"--stage-in-tmpdir was given and tmpdir {args.tmpdir} is on a "
-                        f"different filesystem than {start_dir}. os.rename() will fail "
-                        f"with EXDEV. Aborting."
+                        f"different filesystem than {start_dir}. os.rename() will fail with "
+                        f"EXDEV. Aborting."
                     )
                     sys.exit(1)
-                roots.append(start_dir)
+
+                if start_dir in mountpoints:
+                    mountpoints.remove(start_dir)
+
+                layout = get_layout_walking_up(start_dir)
+
+                if layout is None:
+                    logging.error(f"Could not determine layout for {start_dir}, skipping")
+                    continue
+                dir_layouts[start_dir] = layout
+
+                logging.info(f"Starting at {start_dir} ({layout})")
                 roots_seen.append(start_dir)
-            for opt, val in (("--prune-dir-regex", args.prune_re),
-                             ("--prune-small-subtrees",
-                              getattr(args, "prune_small_subtrees", False))):
-                if val:
-                    logging.warning(
-                        "%s has no effect with --paths-from: it prunes the walk, "
-                        "and the list replaces the walk", opt)
-            logging.info("Processing the list in %s, under %s",
-                         args.paths_from, ", ".join(roots))
-            process_paths(args, hard_links, executor, dir_layouts, roots)
-            return
-
-        for start_dir in args.dirs:
-            start_dir = os.path.abspath(start_dir)
-            if args.stage_in_tmpdir and os.stat(start_dir).st_dev != tmpdir_dev:
-                logging.error(
-                    f"--stage-in-tmpdir was given and tmpdir {args.tmpdir} is on a "
-                    f"different filesystem than {start_dir}. os.rename() will fail with "
-                    f"EXDEV. Aborting."
-                )
-                sys.exit(1)
-
-            if start_dir in mountpoints:
-                mountpoints.remove(start_dir)
-
-            layout = get_layout_walking_up(start_dir)
-
-            if layout is None:
-                logging.error(f"Could not determine layout for {start_dir}, skipping")
-                continue
-            dir_layouts[start_dir] = layout
-
-            logging.info(f"Starting at {start_dir} ({layout})")
-            roots_seen.append(start_dir)
-            process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
-            if do_exit.is_set():
-                break
-
-    if run_journal is not None:
-        run_journal.write(roots_seen, args)
+                process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
+                if do_exit.is_set():
+                    break
+    finally:
+        # Every exit path, including the --paths-from branch's early return
+        # and an exception mid-walk. The journal is the only record of the
+        # pre-transcode rctime, and a run that died partway is exactly the
+        # one whose damage cannot be reconstructed afterwards.
+        if run_journal is not None:
+            run_journal.write(roots_seen, args)
 
     if hard_links and not do_exit.is_set():
         logging.warning(
