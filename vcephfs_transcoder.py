@@ -27,6 +27,7 @@ _replace_locks = [threading.Lock() for _ in range(_REPLACE_LOCK_STRIPES)]
 def _replace_lock_for(path):
     return _replace_locks[hash(path) % _REPLACE_LOCK_STRIPES]
 do_exit = threading.Event()
+run_journal = None
 thread_count = None
 file_delay_ms = 0
 min_age_days = 1
@@ -69,7 +70,7 @@ min_age_days = 1
 #      sibling temp created directly in a target-pool directory performs no
 #      switch at all.
 #
-# --stage-in-tmpdir restores the old behaviour. Keep the A/B/C above as this
+# --stage-in-tmpdir restores the old behavior. Keep the A/B/C above as this
 # change's regression test.
 
 # --- what transcoding costs in objects, and where it lands -------------------
@@ -1445,6 +1446,131 @@ TMP_ORPHAN_MIN_AGE_S = 24 * 3600
 _reclaimed_dirs = set()
 _reclaimed_lock = threading.Lock()
 
+# One journal per volume root records what this run did to rctime. Retention
+# reads it to recover the data-activity time for artifacts whose rctime we
+# pinned. See the module docstring of add_run_journal.py for why this is needed.
+RUN_JOURNAL_NAME = ".vcephfs-transcode-runs.jsonl"
+# Names an artifact root, matching retention_path_policy's own marker.
+RETENTION_MARKER = "RETENTION"
+
+
+def read_rctime(path):
+    """ceph.dir.rctime as a float, or None off CephFS."""
+    try:
+        raw = os.getxattr(path, "ceph.dir.rctime")
+        return float(raw.decode().strip().strip('"'))
+    except (OSError, ValueError, AttributeError, UnicodeDecodeError):
+        return None
+
+
+class RunJournal:
+    """Per-artifact record of the rctime this run is about to destroy.
+
+    note_file() must run BEFORE anything under an artifact is modified, because
+    the first sighting is what captures the pre-transcode rctime. Both call
+    sites stat every file ahead of any gating, so that ordering holds for the
+    walk and for --paths-from alike.
+    """
+
+    def __init__(self, enabled, stop_at=()):
+        self.enabled = enabled
+        self.run_id = uuid.uuid4().hex[:12]
+        self.started = time.time()
+        self._lock = threading.Lock()
+        self._artifacts = {}       # artifact root -> {pre_rctime, max_file_mtime}
+        self._artifact_of = {}     # directory -> artifact root or None
+        self._stop_at = set(stop_at)
+
+    def _artifact_root(self, dirpath):
+        """Nearest ancestor holding a RETENTION file, or None.
+
+        Memoized over the whole ancestor chain, so a directory costs one
+        walk-up once and its descendants cost a dict lookup.
+        """
+        with self._lock:
+            if dirpath in self._artifact_of:
+                return self._artifact_of[dirpath]
+        chain = []
+        d = dirpath
+        root = None
+        while True:
+            with self._lock:
+                if d in self._artifact_of:
+                    root = self._artifact_of[d]
+                    break
+            chain.append(d)
+            try:
+                if os.path.isfile(os.path.join(d, RETENTION_MARKER)):
+                    root = d
+                    break
+            except OSError:
+                pass
+            if d in self._stop_at:
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        with self._lock:
+            for c in chain:
+                self._artifact_of[c] = root
+        return root
+
+    def note_file(self, filepath, st):
+        """Fold one file into its artifact's record."""
+        if not self.enabled or not stat.S_ISREG(st.st_mode):
+            return
+        root = self._artifact_root(os.path.dirname(filepath))
+        if root is None:
+            return
+        with self._lock:
+            rec = self._artifacts.get(root)
+            if rec is None:
+                # First sighting: nothing under this root has been touched yet,
+                # so this rctime is still the owner's, not ours.
+                rec = {"pre_rctime": read_rctime(root), "max_file_mtime": 0.0}
+                self._artifacts[root] = rec
+            if st.st_mtime > rec["max_file_mtime"]:
+                rec["max_file_mtime"] = st.st_mtime
+
+    def write(self, roots, args):
+        """Append this run's records to a journal at each volume root."""
+        if not self.enabled:
+            return
+        with self._lock:
+            artifacts = dict(self._artifacts)
+        if not artifacts:
+            return
+        ended = time.time()
+        base = {
+            "run": self.run_id,
+            "host": os.uname().nodename,
+            "pid": os.getpid(),
+            "start": round(self.started, 6),
+            "end": round(ended, 6),
+            "min_size": getattr(args, "min_size", None),
+        }
+        for volume_root in roots:
+            prefix = volume_root.rstrip("/") + "/"
+            mine = {a: r for a, r in artifacts.items()
+                    if a == volume_root or a.startswith(prefix)}
+            if not mine:
+                continue
+            journal = os.path.join(volume_root, RUN_JOURNAL_NAME)
+            try:
+                with open(journal, "a") as fh:
+                    for artifact, rec in sorted(mine.items()):
+                        row = dict(base)
+                        row["artifact"] = artifact
+                        row["pre_rctime"] = rec["pre_rctime"]
+                        row["max_file_mtime"] = round(rec["max_file_mtime"], 6)
+                        fh.write(json.dumps(row, sort_keys=True) + "\n")
+                logging.info("Wrote %d artifact record(s) to %s",
+                             len(mine), journal)
+            except OSError as e:
+                logging.warning("Could not write run journal %s: %s", journal, e)
+
+
 
 def _reclaim_named(dirpath, names):
     """Unlink aged orphans from an already-enumerated name list.
@@ -1509,7 +1635,7 @@ def _tmp_path_for(args, target):
     """Where to stage the temp copy for `target`.
 
     Beside the target, so the later rename is intra-directory -- see the header.
-    Hidden and suffixed so an orphan left behind by a hard kill is recognisable.
+    Hidden and suffixed so an orphan left behind by a hard kill is recognizable.
     """
     if args.stage_in_tmpdir:
         return os.path.join(args.tmpdir, uuid.uuid4().hex)
@@ -1806,6 +1932,8 @@ def process_paths(args, hard_links, executor, dir_layouts, roots):
 
         try:
             st = os.stat(filepath, follow_symlinks=False)
+            if run_journal is not None:
+                run_journal.note_file(filepath, st)
         except OSError as e:
             if e.errno in (errno.ENOENT, errno.ESTALE, errno.ENOTDIR):
                 with stats._lock:
@@ -2036,6 +2164,10 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
 
             filepath = os.path.join(dirpath, filename)
             st = os.stat(filepath, follow_symlinks=False)
+            if run_journal is not None:
+                # Before any gating, and before anything here is modified: this
+                # is where the pre-transcode rctime is still recoverable.
+                run_journal.note_file(filepath, st)
             if not stat.S_ISREG(st.st_mode):
                 msg = stats.note_skipped_symlink()
                 if msg:
@@ -2164,6 +2296,7 @@ def process_files(args):
 
     hard_links = {}
     dir_layouts = {}
+    roots_seen = []
 
     mountpoints = set()
     with open("/proc/self/mounts", "r") as f:
@@ -2172,6 +2305,12 @@ def process_files(args):
 
     global regulator
     regulator = start_regulator(args)
+
+    global run_journal
+    run_journal = RunJournal(
+        enabled=args.run_journal,
+        stop_at=[os.path.abspath(d) for d in args.dirs],
+    )
 
     with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
         tmpdir_dev = os.stat(args.tmpdir).st_dev
@@ -2188,6 +2327,7 @@ def process_files(args):
                     )
                     sys.exit(1)
                 roots.append(start_dir)
+                roots_seen.append(start_dir)
             for opt, val in (("--prune-dir-regex", args.prune_re),
                              ("--prune-small-subtrees",
                               getattr(args, "prune_small_subtrees", False))):
@@ -2221,9 +2361,13 @@ def process_files(args):
             dir_layouts[start_dir] = layout
 
             logging.info(f"Starting at {start_dir} ({layout})")
+            roots_seen.append(start_dir)
             process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             if do_exit.is_set():
                 break
+
+    if run_journal is not None:
+        run_journal.write(roots_seen, args)
 
     if hard_links and not do_exit.is_set():
         logging.warning(
@@ -2403,7 +2547,7 @@ def main():
         action="store_true",
         default=False,
         help="Stage temp copies in --tmpdir instead of beside their target. This "
-             "is the pre-2026-09 behaviour and it is slow: staging elsewhere makes "
+             "is the pre-2026-09 behavior and it is slow: staging elsewhere makes "
              "every replace a cross-rank distributed rename (mean 1266 ms, tail to "
              "14.9 s) instead of an intra-directory one (mean 0.26 ms). Escape "
              "hatch only.",
@@ -2556,6 +2700,21 @@ def main():
         "names, e.g. '\\.runfiles$' to skip Bazel runfiles symlink farms. "
         "Overrides the built-in default set (see DEFAULT_PRUNE_DIRS); pass an "
         "empty string to disable pruning entirely.",
+    )
+
+    parser.add_argument(
+        "--no-run-journal",
+        dest="run_journal",
+        action="store_false",
+        default=True,
+        help="Do not write .vcephfs-transcode-runs.jsonl at each volume root. "
+        "The journal records, per artifact, the ceph.dir.rctime and newest file "
+        "mtime seen BEFORE this run modified anything, because transcoding pins "
+        "rctime at the time we ran and a directory that is never written again "
+        "stays pinned forever -- so retention reads transcoded data as fresh and "
+        "stops expiring it. rctime cannot be restored (it is monotonic and not "
+        "settable), so preserving the answer is the only option. Costs one "
+        "getxattr per artifact root. Disable only if nothing consumes rctime.",
     )
 
     args = parser.parse_args()
