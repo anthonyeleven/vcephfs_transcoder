@@ -1433,6 +1433,51 @@ def _recursive_stats(path):
 
 
 TMP_SUFFIX = ".vcephfs-tc-tmp"
+# A staged temp file is ".<32 hex>.vcephfs-tc-tmp". Matching on the whole shape
+# rather than the suffix alone keeps reclamation from touching anything a user
+# happened to name similarly.
+TMP_RE = re.compile(r"^\.[0-9a-f]{32}" + re.escape(TMP_SUFFIX) + r"$")
+
+# Never reclaim a temp file younger than this: a concurrent job may be mid-copy
+# into it. No single file copy runs for a day.
+TMP_ORPHAN_MIN_AGE_S = 24 * 3600
+
+_reclaimed_dirs = set()
+_reclaimed_lock = threading.Lock()
+
+
+def reclaim_orphans(dirpath):
+    """Unlink aged `.<hex>.vcephfs-tc-tmp` orphans in dirpath, once per directory.
+
+    Sibling staging puts the temp file beside its target, so cleanup_tmpdir --
+    which only scans --tmpdir -- can no longer see it. Without this a SIGKILL
+    mid-copy strands hidden objects on exactly the pools this tool exists to keep
+    object counts down on.
+    """
+    with _reclaimed_lock:
+        if dirpath in _reclaimed_dirs:
+            return
+        _reclaimed_dirs.add(dirpath)
+    now = time.time()
+    count = 0
+    try:
+        for entry in os.scandir(dirpath):
+            if not TMP_RE.match(entry.name):
+                continue
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if now - entry.stat(follow_symlinks=False).st_mtime < TMP_ORPHAN_MIN_AGE_S:
+                    continue
+                os.unlink(entry.path)
+                count += 1
+            except OSError:
+                pass
+    except OSError:
+        return
+    if count:
+        logging.info(f"Reclaimed {count} orphaned temp file(s) from {dirpath}")
+
 
 
 def _tmp_path_for(args, target):
@@ -1465,6 +1510,10 @@ def _apply_and_verify_layout(layout, path):
 def process_file(args, filepaths, st, layout, file_layout):
     if do_exit.is_set():
         return
+
+    if not args.stage_in_tmpdir:
+        # Covers both the walk and --paths-from, which has no walk to hook.
+        reclaim_orphans(os.path.dirname(filepaths[0]))
 
     tmp_file = _tmp_path_for(args, filepaths[0])
 
@@ -1856,6 +1905,10 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             del dirnames[:]
             continue
 
+        # Our own staged temp files are not candidates: a concurrent job may be
+        # writing one right now, and transcoding a partial copy would be wrong.
+        filenames[:] = [f for f in filenames if not TMP_RE.match(f)]
+
         layout = dir_layouts.get(dirpath, None)
         if layout is None:
             layout = CephLayout.from_dir(dirpath)
@@ -2055,8 +2108,11 @@ def cleanup_tmpdir(tmpdir):
     for entry in os.scandir(tmpdir):
         if entry.is_file(follow_symlinks=False):
             try:
-                # Only remove files that look like our UUID hex temp files
-                uuid.UUID(entry.name)
+                # Both staging shapes: the bare UUID hex used by --stage-in-tmpdir,
+                # and the ".<hex>.vcephfs-tc-tmp" a sibling-staged run leaves if
+                # --tmpdir happens to sit inside the tree being walked.
+                if not TMP_RE.match(entry.name):
+                    uuid.UUID(entry.name)
                 os.unlink(entry.path)
                 count += 1
             except (ValueError, OSError):
@@ -2091,10 +2147,11 @@ def process_files(args):
             roots = []
             for start_dir in args.dirs:
                 start_dir = os.path.abspath(start_dir)
-                if os.stat(start_dir).st_dev != tmpdir_dev:
+                if args.stage_in_tmpdir and os.stat(start_dir).st_dev != tmpdir_dev:
                     logging.error(
-                        f"tmpdir {args.tmpdir} is on a different filesystem than "
-                        f"{start_dir}. os.rename() will fail with EXDEV. Aborting."
+                        f"--stage-in-tmpdir was given and tmpdir {args.tmpdir} is on a "
+                        f"different filesystem than {start_dir}. os.rename() will fail "
+                        f"with EXDEV. Aborting."
                     )
                     sys.exit(1)
                 roots.append(start_dir)
@@ -2112,10 +2169,11 @@ def process_files(args):
 
         for start_dir in args.dirs:
             start_dir = os.path.abspath(start_dir)
-            if os.stat(start_dir).st_dev != tmpdir_dev:
+            if args.stage_in_tmpdir and os.stat(start_dir).st_dev != tmpdir_dev:
                 logging.error(
-                    f"tmpdir {args.tmpdir} is on a different filesystem than {start_dir}. "
-                    f"os.rename() will fail with EXDEV. Aborting."
+                    f"--stage-in-tmpdir was given and tmpdir {args.tmpdir} is on a "
+                    f"different filesystem than {start_dir}. os.rename() will fail with "
+                    f"EXDEV. Aborting."
                 )
                 sys.exit(1)
 
