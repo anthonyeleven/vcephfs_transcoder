@@ -31,47 +31,46 @@ thread_count = None
 file_delay_ms = 0
 min_age_days = 1
 
-# --- the tmpdir is the throughput bottleneck, and why it has not moved yet ---
+# --- staging: the temp copy goes beside its target, not in a shared tmpdir ---
 #
-# Measured 2026-09-05. Renaming the finished temp file out of --tmpdir and into
-# its target directory is where nearly all per-file wall time goes. Controlled
-# A/B/C on one client, same file size, 12 trials each:
+# Renaming the finished temp file into place is where nearly all per-file wall
+# time used to go. Controlled A/B/C, one client, same file size, 12 trials each
+# (2026-09-05):
 #
 #     A. same directory (deep in the tree)     mean    0.3 ms  p50 0.3  max     0.4
-#     B. tmpdir -> deep dir (what we do)       mean 1266.7 ms  p50 8.2  max 14914.7
+#     B. tmpdir -> deep dir (the old default)  mean 1266.7 ms  p50 8.2  max 14914.7
 #     C. sibling dir -> deep dir               mean  387.9 ms  p50 0.3  max  4637.0
 #
-# It is bimodal. B's median is a healthy 8.2 ms; the mean is set by a tail that
-# reaches fifteen seconds. Since a stalled worker blocks everything queued
-# behind it, the tail is what determines throughput, not the median. Only case A
-# had no outliers at all.
+# B is bimodal: its median is a healthy 8.2 ms, but the mean is set by a tail
+# reaching fifteen seconds, and a stalled worker blocks everything queued behind
+# it. The cause is a cross-rank distributed rename -- with `distributed=1` export
+# pinning, a shared tmpdir and a deep destination hash to different MDS ranks, so
+# every replace needs a two-phase commit between two MDSs.
 #
-# For scale: on the same client, into the same pools, a 256 KiB write plus fsync
-# takes ~5 ms and a cold read ~3 ms. So the storage is roughly 100x faster than
-# what the transcoder extracts from it, and this rename is the reason.
+# So the temp file is now created in the SAME directory as its target, making
+# every replace an intra-directory rename. Re-measured 2026-09-08 on 62 real
+# files, straced: 62/62 intra-directory, mean 0.26 ms, p50 0.21 ms, max 1.27 ms.
+# That is case A, not C -- a true sibling, not a sibling directory.
 #
-# THE FIX would be to create the temp file beside its target instead of in a
-# shared tmpdir, making every rename intra-directory. Two documented objections
-# stood in the way; both have now been checked.
+# Two objections stood in the way; both were checked before this landed.
 #
-#   1. Detectability. --tmpdir must be on the default data pool so that a failed
-#      layout.apply_file() leaves the file somewhere visibly wrong. A sibling
-#      temp file inherits the target directory's layout, which would mask that.
-#      Answerable: apply the layout and then READ IT BACK before copying. That
-#      is a stronger check than inferring correctness from the tmpdir's pool.
+#   1. Detectability. The old --tmpdir had to sit on the default data pool so a
+#      failed layout.apply_file() left the file somewhere visibly wrong. A
+#      sibling temp file inherits the target directory's layout, which would mask
+#      that. Answered by _apply_and_verify_layout(): apply the layout, then READ
+#      IT BACK and compare, before any data is copied. That verifies the property
+#      we care about instead of inferring it from where the file happens to live.
 #
-#   2. "Excess backtrace objects", per the --tmpdir help text. Measured, and it
-#      does not block the change. Backtrace placement depends on the file's
-#      FINAL layout, not on where the temp file was staged: a file outside the
-#      first data pool costs two objects either way. The only case that adds a
-#      third is switching a file's layout after creation, which puts an entry in
-#      old_pools -- and a sibling temp file created directly in a target-pool
-#      directory performs no switch at all. Neutral, not worse.
+#   2. "Excess backtrace objects", per the old --tmpdir help. Measured, and
+#      neutral: backtrace placement depends on the file's FINAL layout, not on
+#      where the temp copy was staged. A file outside the first data pool costs
+#      two objects either way. The only case that adds a third is switching a
+#      file's layout after creation, which puts an entry in old_pools -- and a
+#      sibling temp created directly in a target-pool directory performs no
+#      switch at all.
 #
-# So the change is unblocked but deliberately NOT made here: it touches every
-# file of a petabyte-scale migration and wants its own review, its own PR, and
-# the A/B/C above as its regression test. Do not "simplify" the tmpdir away
-# without reading objection 1.
+# --stage-in-tmpdir restores the old behaviour. Keep the A/B/C above as this
+# change's regression test.
 
 # --- what transcoding costs in objects, and where it lands -------------------
 #
@@ -1433,11 +1432,41 @@ def _recursive_stats(path):
         return None, None
 
 
+TMP_SUFFIX = ".vcephfs-tc-tmp"
+
+
+def _tmp_path_for(args, target):
+    """Where to stage the temp copy for `target`.
+
+    Beside the target, so the later rename is intra-directory -- see the header.
+    Hidden and suffixed so an orphan left behind by a hard kill is recognisable.
+    """
+    if args.stage_in_tmpdir:
+        return os.path.join(args.tmpdir, uuid.uuid4().hex)
+    return os.path.join(os.path.dirname(target),
+                        f".{uuid.uuid4().hex}{TMP_SUFFIX}")
+
+
+def _apply_and_verify_layout(layout, path):
+    """Apply the layout, then read it back and confirm it took.
+
+    A shared --tmpdir on the default pool caught a failed apply_file() implicitly:
+    the file stayed visibly in the wrong pool. A sibling temp file inherits the
+    target directory's layout, so that signal is gone and the check has to be
+    explicit -- which is the stronger of the two.
+    """
+    layout.apply_file(path)
+    got = CephLayout.from_file(path)
+    if got != layout:
+        raise RuntimeError(
+            f"layout did not apply to {path}: wanted {layout}, read back {got}")
+
+
 def process_file(args, filepaths, st, layout, file_layout):
     if do_exit.is_set():
         return
 
-    tmp_file = os.path.join(args.tmpdir, uuid.uuid4().hex)
+    tmp_file = _tmp_path_for(args, filepaths[0])
 
     if len(filepaths) == 1:
         logging.info(
@@ -1450,7 +1479,7 @@ def process_file(args, filepaths, st, layout, file_layout):
 
     try:
         with open(tmp_file, "wb") as ofd:
-            layout.apply_file(tmp_file)
+            _apply_and_verify_layout(layout, tmp_file)
             with open(filepaths[0], "rb") as ifd:
                 with stats._lock:
                     stats.files_submitted += 1
@@ -1562,9 +1591,13 @@ def process_file(args, filepaths, st, layout, file_layout):
                     logging.info(f"Renaming {tmp_file} -> {path}")
                     os.rename(tmp_file, path)
                 else:
+                    # Hard links can live in different directories, so the staging
+                    # path is recomputed per target; reusing one would reintroduce
+                    # the cross-directory rename for every extra link.
+                    link_tmp = _tmp_path_for(args, path)
                     logging.info(f"Linking {filepaths[0]} -> {path}")
-                    os.link(filepaths[0], tmp_file, follow_symlinks=False)
-                    os.rename(tmp_file, path)
+                    os.link(filepaths[0], link_tmp, follow_symlinks=False)
+                    os.rename(link_tmp, path)
 
             with stats._lock:
                 stats.files_transcoded += 1
@@ -2273,6 +2306,16 @@ def main():
         default=10.0,
         metavar="SEC",
         help="how often to stat --config for changes (default: 10)",
+    )
+    parser.add_argument(
+        "--stage-in-tmpdir",
+        action="store_true",
+        default=False,
+        help="Stage temp copies in --tmpdir instead of beside their target. This "
+             "is the pre-2026-09 behaviour and it is slow: staging elsewhere makes "
+             "every replace a cross-rank distributed rename (mean 1266 ms, tail to "
+             "14.9 s) instead of an intra-directory one (mean 0.26 ms). Escape "
+             "hatch only.",
     )
     parser.add_argument(
         "--force-tmpdir-pool",
