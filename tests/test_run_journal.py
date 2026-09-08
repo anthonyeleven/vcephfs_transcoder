@@ -148,25 +148,42 @@ check("a second run APPENDS rather than truncating",
 import ast as _ast
 
 
+def _mentions_paths_from(node):
+    return any(isinstance(n, _ast.Attribute) and n.attr == "paths_from"
+               for n in _ast.walk(node))
+
+
 def _finally_covers_returns(source):
-    """True when process_files wraps its body in try/finally and the finally
-    calls run_journal.write, with the early return(s) enclosed."""
+    """True when the --paths-from early return is covered by a finally that
+    calls run_journal.write.
+
+    Deliberately specific on both halves. An earlier version accepted any
+    Return inside any try whose finally held any `.write` attribute, which an
+    unrelated `fh.write` would have satisfied -- it pinned a family of shapes
+    rather than this regression.
+    """
     tree = _ast.parse(source)
     fn = [n for n in _ast.walk(tree)
           if isinstance(n, _ast.FunctionDef) and n.name == "process_files"]
     if not fn:
         return False
-    tries = [n for n in fn[0].body if isinstance(n, _ast.Try)]
-    if not tries:
-        return False
-    covered = 0
-    for t in tries:
-        writes = [n for n in _ast.walk(_ast.Module(body=t.finalbody, type_ignores=[]))
-                  if isinstance(n, _ast.Attribute) and n.attr == "write"]
-        if not writes:
+    for t in [n for n in fn[0].body if isinstance(n, _ast.Try)]:
+        journal_write = any(
+            isinstance(n, _ast.Call)
+            and isinstance(n.func, _ast.Attribute)
+            and n.func.attr == "write"
+            and isinstance(n.func.value, _ast.Name)
+            and n.func.value.id == "run_journal"
+            for n in _ast.walk(_ast.Module(body=t.finalbody, type_ignores=[])))
+        if not journal_write:
             continue
-        covered += len([n for n in _ast.walk(t) if isinstance(n, _ast.Return)])
-    return covered > 0
+        for node in _ast.walk(t):
+            if (isinstance(node, _ast.If)
+                    and _mentions_paths_from(node.test)
+                    and any(isinstance(x, _ast.Return)
+                            for x in _ast.walk(node))):
+                return True
+    return False
 
 
 print("\ncm#3999 regression -- the journal write survives an early return:")
@@ -190,6 +207,42 @@ def process_files(args):
 """
 check("guard REJECTS the pre-fix shape (write after the with-block)",
       not _finally_covers_returns(_broken))
+
+# The reviewer's case: an unrelated try/finally holding some other .write and
+# some other return must NOT satisfy the guard.
+_decoy = """
+def process_files(args):
+    roots_seen = []
+    try:
+        with ThreadPoolExecutor() as executor:
+            if args.paths_from:
+                process_paths(args)
+                return
+            for d in args.dirs:
+                process_dir(args, d)
+    finally:
+        fh.write('unrelated')
+"""
+check("guard REJECTS an unrelated .write in the finally",
+      not _finally_covers_returns(_decoy))
+
+# A finally that does call run_journal.write, but with the paths-from return
+# left outside the try, must also be rejected.
+_escaped = """
+def process_files(args):
+    roots_seen = []
+    if args.paths_from:
+        process_paths(args)
+        return
+    try:
+        with ThreadPoolExecutor() as executor:
+            for d in args.dirs:
+                process_dir(args, d)
+    finally:
+        run_journal.write(roots_seen, args)
+"""
+check("guard REJECTS the paths-from return escaping the try",
+      not _finally_covers_returns(_escaped))
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}"))
 sys.exit(1 if fails else 0)
