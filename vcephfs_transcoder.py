@@ -1446,6 +1446,31 @@ _reclaimed_dirs = set()
 _reclaimed_lock = threading.Lock()
 
 
+def _reclaim_named(dirpath, names):
+    """Unlink aged orphans from an already-enumerated name list.
+
+    The walk has the names in hand from os.walk, so this costs one stat per
+    candidate and no extra scandir.
+    """
+    now = time.time()
+    count = 0
+    for name in names:
+        p = os.path.join(dirpath, name)
+        try:
+            st = os.lstat(p)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if now - st.st_mtime < TMP_ORPHAN_MIN_AGE_S:
+                continue
+            os.unlink(p)
+            count += 1
+        except OSError:
+            pass
+    if count:
+        logging.info(f"Reclaimed {count} orphaned temp file(s) from {dirpath}")
+    return count
+
+
 def reclaim_orphans(dirpath):
     """Unlink aged `.<hex>.vcephfs-tc-tmp` orphans in dirpath, once per directory.
 
@@ -1907,7 +1932,15 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
 
         # Our own staged temp files are not candidates: a concurrent job may be
         # writing one right now, and transcoding a partial copy would be wrong.
-        filenames[:] = [f for f in filenames if not TMP_RE.match(f)]
+        # Reclaim the aged ones here, for every directory the walk enters, so a
+        # subtree that holds orphans but no current candidate is still swept.
+        orphans = [f for f in filenames if TMP_RE.match(f)]
+        if orphans:
+            filenames[:] = [f for f in filenames if not TMP_RE.match(f)]
+            if not args.stage_in_tmpdir:
+                _reclaim_named(dirpath, orphans)
+        with _reclaimed_lock:
+            _reclaimed_dirs.add(dirpath)
 
         layout = dir_layouts.get(dirpath, None)
         if layout is None:
