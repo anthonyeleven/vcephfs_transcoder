@@ -244,5 +244,54 @@ def process_files(args):
 check("guard REJECTS the paths-from return escaping the try",
       not _finally_covers_returns(_escaped))
 
+# ---------------------------------------------------------------------------
+# Cross-repo format contract. The consumer is Voleon/infra,
+# jenkins/scripts/retention_path_policy.py (transcode_pinned_rctime), which
+# reads these key names and types out of the journal. It lives in a different
+# repo and cannot import this one, so the two halves are pinned by this test
+# and its mirror there -- not by prose in a PR description. Changing a key name
+# or a value type here silently turns the consumer into a no-op: every mismatch
+# degrades to "trust rctime", with no error and no log line.
+print("\ncross-repo journal contract (consumer: infra retention_path_policy):")
+
+_contract_dir = tempfile.mkdtemp()
+_art = os.path.join(_contract_dir, "artifact")
+os.makedirs(_art)
+open(os.path.join(_art, tc.RETENTION_MARKER), "w").write("30d\n")
+_data = os.path.join(_art, "d.parquet")
+_st = touch(_data, OLD)
+
+tc.read_rctime = lambda p: 1757000000.123456
+_j = tc.RunJournal(enabled=True, stop_at=[_contract_dir])
+_j.note_file(_data, _st)
+
+
+class _CArgs:
+    min_size = 131072
+
+
+_j.write([_contract_dir], _CArgs())
+_line = open(os.path.join(_contract_dir, tc.RUN_JOURNAL_NAME)).readline()
+_row = json.loads(_line)
+
+check("journal filename is the name the consumer looks for",
+      tc.RUN_JOURNAL_NAME == ".vcephfs-transcode-runs.jsonl")
+check("emits every key the consumer reads",
+      {"artifact", "start", "end", "pre_rctime", "max_file_mtime"} <= set(_row))
+check("artifact is an absolute path string",
+      isinstance(_row["artifact"], str) and os.path.isabs(_row["artifact"]))
+check("start/end are numeric epoch seconds, not ISO strings",
+      all(isinstance(_row[k], (int, float)) for k in ("start", "end"))
+      and _row["start"] > 1_600_000_000)
+check("pre_rctime and max_file_mtime are numeric or null",
+      all(_row[k] is None or isinstance(_row[k], (int, float))
+          for k in ("pre_rctime", "max_file_mtime")))
+check("one JSON object per line", len(_line.splitlines()) == 1)
+
+# The consumer keys on the artifact path. Prove the producer writes the same
+# spelling the walk would hand a consumer standing in the same tree.
+check("artifact key matches the directory as walked",
+      _row["artifact"] == _art)
+
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}"))
 sys.exit(1 if fails else 0)
