@@ -285,8 +285,14 @@ class RegulatorVolume(unittest.TestCase):
         self.assertIsNone(q)
         self.assertIn("{volume}", why)
 
-    def test_volume_is_regex_escaped(self):
-        """A name containing a dot must not widen the match."""
+    def test_volume_is_escaped_for_regex_and_for_promql(self):
+        """A dot in the name must not widen the match, and the backslash that
+        stops it has to survive PromQL's string layer as well.
+
+        re.escape() alone gives a\\.b, and inside a PromQL double-quoted string
+        that is "unknown escape sequence U+002E" -- an HTTP 400 at every poll,
+        so the regulator silently never comes up.
+        """
         real = vct._mds_namespace_for
         vct._mds_namespace_for = lambda d: "a.b"
         try:
@@ -295,7 +301,19 @@ class RegulatorVolume(unittest.TestCase):
         finally:
             vct._mds_namespace_for = real
         self.assertIsNone(why)
-        self.assertIn("a\\.b", q)
+        self.assertIn(r"a\\.b", q)
+        # and not the single-backslash form, which is the one that 400s
+        self.assertNotIn(r"a\.b", q.replace(r"a\\.b", "<v>"))
+
+    def test_plain_volume_name_is_untouched(self):
+        real = vct._mds_namespace_for
+        vct._mds_namespace_for = lambda d: "myvol"
+        try:
+            a = Args(regulate_query="x{volume}y", dirs=["/x"])
+            q, why = vct._resolve_query(a)
+        finally:
+            vct._mds_namespace_for = real
+        self.assertEqual(q, "xmyvoly")
 
     def test_dirs_on_different_volumes_disables(self):
         real = vct._mds_namespace_for
@@ -399,6 +417,160 @@ class RegulatorBehavior(unittest.TestCase):
                         r_.sample()
                 finally:
                     vct.urllib.request.urlopen = real
+
+
+class RegulateConfigRouting(unittest.TestCase):
+    """A regulate_* key that parses but is never copied onto args is invisible.
+
+    This is the bug these tests exist for: regulate_prometheus_url and
+    regulate_query validated cleanly and were then discarded, so a fully
+    configured job still logged "Self-regulation disabled (no
+    regulate_prometheus_url)" and ran unthrottled. Nothing failed; the feature
+    simply was not there.
+    """
+
+    @staticmethod
+    def _routed():
+        return {k for k, _ in vct.REGULATE_APPLY}
+
+    @staticmethod
+    def _declared():
+        return {k for k in vct.RuntimeConfig.KEYS if k.startswith("regulate_")}
+
+    def test_every_declared_key_is_routed(self):
+        missing = self._declared() - self._routed()
+        self.assertEqual(missing, set(),
+                         "accepted from the config file but never applied: %s"
+                         % sorted(missing))
+
+    def test_every_routed_key_is_declared(self):
+        """The other direction: routing a key the parser rejects is dead code."""
+        extra = self._routed() - self._declared()
+        self.assertEqual(extra, set(),
+                         "applied but not accepted from the config file: %s"
+                         % sorted(extra))
+
+    def test_the_invariant_catches_a_dropped_key(self):
+        """Control. Remove a key from the routing table and the check must fail,
+        otherwise the two tests above would pass against any table at all."""
+        crippled = tuple(e for e in vct.REGULATE_APPLY
+                         if e[0] != "regulate_prometheus_url")
+        routed = {k for k, _ in crippled}
+        self.assertTrue(self._declared() - routed,
+                        "invariant did not notice a missing key")
+
+    def test_routing_lands_the_url_and_query_on_args(self):
+        """Walk the same table _apply_config walks, against a real parse."""
+        text = ("regulate_prometheus_url = http://prom.example/api/v1/query\n"
+                'regulate_query = 1e3 * avg(x{a="b"})\n'
+                "regulate_pause_ms = 200\n"
+                "regulate_floor_ms = 25\n")
+        cfg, errs = vct.RuntimeConfig._parse(text)
+        self.assertEqual(errs, [])
+        a = Args()
+        for k, _label in vct.REGULATE_APPLY:
+            if k in cfg:
+                setattr(a, k, cfg[k])
+        self.assertEqual(a.regulate_prometheus_url,
+                         "http://prom.example/api/v1/query")
+        self.assertEqual(a.regulate_query, '1e3 * avg(x{a="b"})')
+        self.assertEqual(a.regulate_pause_ms, 200.0)
+        self.assertEqual(a.regulate_floor_ms, 25)
+
+    def test_floor_ms_accepted_and_range_checked(self):
+        cfg, errs = vct.RuntimeConfig._parse("regulate_floor_ms = 20\n")
+        self.assertEqual(errs, [])
+        self.assertEqual(cfg["regulate_floor_ms"], 20)
+        for bad in ("regulate_floor_ms = -1\n",
+                    "regulate_floor_ms = %d\n" % (vct.DELAY_MAX_MS + 1)):
+            _, errs = vct.RuntimeConfig._parse(bad)
+            self.assertTrue(errs, "accepted %r" % bad)
+
+    def test_set_floor_base_moves_the_baseline(self):
+        a = Args(regulate_prometheus_url="http://x", regulate_query="q",
+                 regulate_floor_ms=20, dirs=["/x"])
+        r = vct.Regulator(a, "q")
+        self.assertEqual(r._floor_base, 20)
+        r.set_floor_base(50)
+        self.assertEqual(r._floor_base, 50)
+        self.assertGreaterEqual(r.floor_ms, 50,
+                                "floor left sitting below its own baseline")
+
+    def test_example_config_documents_every_key(self):
+        """--help prints this; a key absent from it is undiscoverable."""
+        ex = vct.config_example("vol")
+        for k in self._declared():
+            self.assertIn(k, ex, "%s missing from the example config" % k)
+
+
+class PathsFromList(unittest.TestCase):
+    """--paths-from replaces the walk, so its reader and its containment check
+    are the only things standing between a stale or wrong list and the data."""
+
+    def _write(self, data):
+        import tempfile
+        fd, path = tempfile.mkstemp()
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_newline_delimited(self):
+        p = self._write(b"/a/one\n/a/two\n/a/three\n")
+        self.assertEqual(list(vct._iter_listed_paths(p)),
+                         ["/a/one", "/a/two", "/a/three"])
+
+    def test_nul_delimited_detected(self):
+        """A list from find -print0 must not be read as one enormous path."""
+        p = self._write(b"/a/one\x00/a/two\x00")
+        self.assertEqual(list(vct._iter_listed_paths(p)), ["/a/one", "/a/two"])
+
+    def test_path_containing_newline_survives_nul_mode(self):
+        p = self._write(b"/a/we\nird\x00/a/two\x00")
+        self.assertEqual(list(vct._iter_listed_paths(p)), ["/a/we\nird", "/a/two"])
+
+    def test_blank_lines_and_crlf(self):
+        p = self._write(b"/a/one\r\n\n/a/two\n\n")
+        self.assertEqual(list(vct._iter_listed_paths(p)), ["/a/one", "/a/two"])
+
+    def test_no_trailing_separator(self):
+        p = self._write(b"/a/one\n/a/last")
+        self.assertEqual(list(vct._iter_listed_paths(p)), ["/a/one", "/a/last"])
+
+    def test_entry_spanning_the_read_boundary(self):
+        """Reads are chunked, so an entry straddling a chunk edge is the case
+        that silently truncates paths if the buffering is wrong."""
+        names = ["/vol/%06d/%s" % (i, "x" * 90) for i in range(4000)]
+        p = self._write(("\n".join(names) + "\n").encode())
+        got = list(vct._iter_listed_paths(p))
+        self.assertEqual(got, names)
+        self.assertTrue(len(("\n".join(names)).encode()) > (1 << 16),
+                        "test data too small to cross a chunk boundary")
+
+    def test_undecodable_bytes_round_trip(self):
+        """A path the filesystem accepts need not be valid UTF-8; it must still
+        be usable, not dropped."""
+        p = self._write(b"/a/bad\xff\n")
+        got = list(vct._iter_listed_paths(p))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0].encode("utf-8", "surrogateescape"), b"/a/bad\xff")
+
+    def test_under_roots(self):
+        roots = ["/vol/ab"]
+        self.assertTrue(vct._under_roots("/vol/ab", roots))
+        self.assertTrue(vct._under_roots("/vol/ab/x/y", roots))
+        self.assertFalse(vct._under_roots("/vol/abc", roots),
+                         "sibling sharing a name prefix must not be included")
+        self.assertFalse(vct._under_roots("/other/ab/x", roots))
+
+    def test_under_roots_trailing_slash(self):
+        self.assertTrue(vct._under_roots("/vol/ab/x", ["/vol/ab/"]))
+
+    def test_naive_prefix_would_be_wrong(self):
+        """Control: the bug the helper exists to prevent. If _under_roots ever
+        degrades to a bare startswith, this documents what breaks."""
+        self.assertTrue("/vol/abc".startswith("/vol/ab"))
+        self.assertFalse(vct._under_roots("/vol/abc", ["/vol/ab"]))
 
 
 class Crossover(unittest.TestCase):

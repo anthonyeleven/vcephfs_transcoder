@@ -12,7 +12,7 @@ import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
 import threading, uuid, argparse
 
-_VERSION = "2001"
+_VERSION = "2010"
 
 # Replacing a file must be serialized against another worker replacing the
 # SAME file -- that is the only invariant here. A single global lock also
@@ -27,51 +27,51 @@ _replace_locks = [threading.Lock() for _ in range(_REPLACE_LOCK_STRIPES)]
 def _replace_lock_for(path):
     return _replace_locks[hash(path) % _REPLACE_LOCK_STRIPES]
 do_exit = threading.Event()
+run_journal = None
 thread_count = None
 file_delay_ms = 0
 min_age_days = 1
 
-# --- the tmpdir is the throughput bottleneck, and why it has not moved yet ---
+# --- staging: the temp copy goes beside its target, not in a shared tmpdir ---
 #
-# Measured 2026-09-05. Renaming the finished temp file out of --tmpdir and into
-# its target directory is where nearly all per-file wall time goes. Controlled
-# A/B/C on one client, same file size, 12 trials each:
+# Renaming the finished temp file into place is where nearly all per-file wall
+# time used to go. Controlled A/B/C, one client, same file size, 12 trials each
+# (2026-09-05):
 #
 #     A. same directory (deep in the tree)     mean    0.3 ms  p50 0.3  max     0.4
-#     B. tmpdir -> deep dir (what we do)       mean 1266.7 ms  p50 8.2  max 14914.7
+#     B. tmpdir -> deep dir (the old default)  mean 1266.7 ms  p50 8.2  max 14914.7
 #     C. sibling dir -> deep dir               mean  387.9 ms  p50 0.3  max  4637.0
 #
-# It is bimodal. B's median is a healthy 8.2 ms; the mean is set by a tail that
-# reaches fifteen seconds. Since a stalled worker blocks everything queued
-# behind it, the tail is what determines throughput, not the median. Only case A
-# had no outliers at all.
+# B is bimodal: its median is a healthy 8.2 ms, but the mean is set by a tail
+# reaching fifteen seconds, and a stalled worker blocks everything queued behind
+# it. The cause is a cross-rank distributed rename -- with `distributed=1` export
+# pinning, a shared tmpdir and a deep destination hash to different MDS ranks, so
+# every replace needs a two-phase commit between two MDSs.
 #
-# For scale: on the same client, into the same pools, a 256 KiB write plus fsync
-# takes ~5 ms and a cold read ~3 ms. So the storage is roughly 100x faster than
-# what the transcoder extracts from it, and this rename is the reason.
+# So the temp file is now created in the SAME directory as its target, making
+# every replace an intra-directory rename. Re-measured 2026-09-08 on 62 real
+# files, straced: 62/62 intra-directory, mean 0.26 ms, p50 0.21 ms, max 1.27 ms.
+# That is case A, not C -- a true sibling, not a sibling directory.
 #
-# THE FIX would be to create the temp file beside its target instead of in a
-# shared tmpdir, making every rename intra-directory. Two documented objections
-# stood in the way; both have now been checked.
+# Two objections stood in the way; both were checked before this landed.
 #
-#   1. Detectability. --tmpdir must be on the default data pool so that a failed
-#      layout.apply_file() leaves the file somewhere visibly wrong. A sibling
-#      temp file inherits the target directory's layout, which would mask that.
-#      Answerable: apply the layout and then READ IT BACK before copying. That
-#      is a stronger check than inferring correctness from the tmpdir's pool.
+#   1. Detectability. The old --tmpdir had to sit on the default data pool so a
+#      failed layout.apply_file() left the file somewhere visibly wrong. A
+#      sibling temp file inherits the target directory's layout, which would mask
+#      that. Answered by _apply_and_verify_layout(): apply the layout, then READ
+#      IT BACK and compare, before any data is copied. That verifies the property
+#      we care about instead of inferring it from where the file happens to live.
 #
-#   2. "Excess backtrace objects", per the --tmpdir help text. Measured, and it
-#      does not block the change. Backtrace placement depends on the file's
-#      FINAL layout, not on where the temp file was staged: a file outside the
-#      first data pool costs two objects either way. The only case that adds a
-#      third is switching a file's layout after creation, which puts an entry in
-#      old_pools -- and a sibling temp file created directly in a target-pool
-#      directory performs no switch at all. Neutral, not worse.
+#   2. "Excess backtrace objects", per the old --tmpdir help. Measured, and
+#      neutral: backtrace placement depends on the file's FINAL layout, not on
+#      where the temp copy was staged. A file outside the first data pool costs
+#      two objects either way. The only case that adds a third is switching a
+#      file's layout after creation, which puts an entry in old_pools -- and a
+#      sibling temp created directly in a target-pool directory performs no
+#      switch at all.
 #
-# So the change is unblocked but deliberately NOT made here: it touches every
-# file of a petabyte-scale migration and wants its own review, its own PR, and
-# the A/B/C above as its regression test. Do not "simplify" the tmpdir away
-# without reading objection 1.
+# --stage-in-tmpdir restores the old behavior. Keep the A/B/C above as this
+# change's regression test.
 
 # --- what transcoding costs in objects, and where it lands -------------------
 #
@@ -147,6 +147,14 @@ min_age_days = 1
 DELAY_STEP_UP = 1.25
 DELAY_STEP_DOWN = 1.25
 DELAY_MAX_MS = 600000
+
+# Regulator defaults. Defined here, above config_example(), so the example
+# file can interpolate them rather than retyping values that would drift.
+REG_PAUSE_MS_DEFAULT = 150.0
+REG_SLO_MS_DEFAULT = 75.0
+REG_PERIOD_S_DEFAULT = 30
+REG_FLOOR_MS_DEFAULT = 0
+REG_QUIET_TICKS_DEFAULT = 10
 # Floor for the DOWN direction. 0 keeps the historical behavior of allowing a
 # step to unthrottled; set it in the config to guarantee the signal path can
 # never produce an unbounded stat rate on a live filesystem.
@@ -189,6 +197,7 @@ DEFAULT_PRUNE_REGEX = "^(%s)$" % "|".join(re.escape(d) for d in DEFAULT_PRUNE_DI
 # Set in main() when --config is given; polled from the walker loop.
 runtime_config = None
 apply_config = None
+regulator = None
 
 
 def config_example(volume="VOLUME"):
@@ -249,6 +258,39 @@ def config_example(volume="VOLUME"):
         "# descended into or statted. Cost is one regex match per directory, not",
         "# per file. Set empty to disable pruning entirely.",
         "prune_dir_regex = %s" % DEFAULT_PRUNE_REGEX,
+        "",
+        "# --- self-regulation ----------------------------------------------------",
+        "# Throttle against what the filesystem's OTHER clients experience, which",
+        "# this job cannot observe from its own copy latency. Entirely optional:",
+        "# leave the URL empty and the regulator never starts.",
+        "#",
+        "# The query is a complete PromQL expression and must evaluate to exactly",
+        "# one series whose value is MILLISECONDS. Nothing here assumes Ceph, or",
+        "# any particular exporter. {volume} is substituted with this filesystem's",
+        "# name (regex-escaped); omit it and the query is used verbatim.",
+        "#",
+        "# Units are checked once at startup and called out, because seconds means",
+        "# it never triggers and microseconds means it never stops -- both silent.",
+        "#",
+        "# Backslashes must be DOUBLED. PromQL string literals use Go escaping, so",
+        "# a regex dot is \\\\. inside the quotes; a single backslash is a parse",
+        "# error (HTTP 400: unknown escape sequence), not a wrong match. Example:",
+        "#   regulate_query = 1e3 * sum(increase(mds_lat_sum{n=~\"mds\\\\.{volume}\\\\..*\"}[1m]))",
+        "#                        / sum(increase(mds_lat_count{n=~\"mds\\\\.{volume}\\\\..*\"}[1m]))",
+        "regulate_prometheus_url =",
+        "regulate_query  =",
+        "",
+        "# Pause above this. The soft target is what it eases back toward; it does",
+        "# not gate the pause.",
+        "regulate_pause_ms   = %s" % REG_PAUSE_MS_DEFAULT,
+        "regulate_slo_ms     = %s" % REG_SLO_MS_DEFAULT,
+        "",
+        "# Poll period, and the delay floor the regulator decays back down to",
+        "# after a quiet spell. Repeated pauses ratchet the floor UP; quiet time",
+        "# releases it, but never below this baseline.",
+        "regulate_period_s   = %d" % REG_PERIOD_S_DEFAULT,
+        "regulate_floor_ms   = %d" % REG_FLOOR_MS_DEFAULT,
+        "regulate_quiet_ticks = %d" % REG_QUIET_TICKS_DEFAULT,
         "",
     ))
 
@@ -312,7 +354,8 @@ class RuntimeConfig:
             'prune_dir_regex', 'delay_step_up', 'delay_step_down',
             'delay_min_ms', 'prune_subtree_max_bytes', 'prune_budget_bytes',
             'regulate_prometheus_url', 'regulate_query', 'regulate_pause_ms',
-            'regulate_slo_ms', 'regulate_period_s', 'regulate_quiet_ticks')
+            'regulate_slo_ms', 'regulate_period_s', 'regulate_quiet_ticks',
+            'regulate_floor_ms')
 
     def __init__(self, path, poll_seconds=10.0):
         self.path = path
@@ -436,6 +479,11 @@ class RuntimeConfig:
                     iv = int(v)
                     if iv < 1:
                         raise ValueError("must be >= 1")
+                    out[k] = iv
+                elif k == 'regulate_floor_ms':
+                    iv = int(v)
+                    if not 0 <= iv <= DELAY_MAX_MS:
+                        raise ValueError("out of range 0..%d" % DELAY_MAX_MS)
                     out[k] = iv
                 elif k in ('prune_subtree_max_bytes', 'prune_budget_bytes'):
                     iv = int(v)
@@ -787,6 +835,8 @@ class Stats:
     files_skipped_symlink: int = 0
     files_skipped_large: int = 0
     files_skipped_source_pool: int = 0
+    files_vanished: int = 0
+    files_outside_root: int = 0
     dirs_pruned: int = 0
     subtrees_pruned: int = 0
     bytes_pruned: int = 0
@@ -1086,14 +1136,30 @@ def _prune_inert_warning(args):
 # Everything is optional. With no regulate_prometheus_url the thread never starts
 # and the job runs at whatever file_delay_ms and threads say -- the tool has to be
 # fully usable by anyone who does not have these metrics, or indeed any Prometheus.
+# Every regulate_* key in RuntimeConfig.KEYS must appear here, or it parses,
+# validates, and is then discarded. That is exactly what happened to
+# regulate_prometheus_url and regulate_query: a fully configured file still
+# started with "Self-regulation disabled (no regulate_prometheus_url)", because
+# only the four tuning keys below were ever copied onto args. Tested as an
+# invariant rather than trusted to review.
+REGULATE_APPLY = (
+    ('regulate_prometheus_url', 'regulate Prometheus URL'),
+    ('regulate_query', 'regulate query'),
+    ('regulate_pause_ms', 'regulate pause threshold'),
+    ('regulate_slo_ms', 'regulate soft target'),
+    ('regulate_period_s', 'regulate poll period'),
+    ('regulate_quiet_ticks', 'regulate quiet ticks'),
+    ('regulate_floor_ms', 'regulate delay floor'),
+)
+
 REG_DEFAULTS = {
     'regulate_prometheus_url': None,
     'regulate_query': None,
-    'regulate_pause_ms': 150.0,
-    'regulate_slo_ms': 75.0,
-    'regulate_period_s': 30,
-    'regulate_floor_ms': 0,
-    'regulate_quiet_ticks': 10,
+    'regulate_pause_ms': REG_PAUSE_MS_DEFAULT,
+    'regulate_slo_ms': REG_SLO_MS_DEFAULT,
+    'regulate_period_s': REG_PERIOD_S_DEFAULT,
+    'regulate_floor_ms': REG_FLOOR_MS_DEFAULT,
+    'regulate_quiet_ticks': REG_QUIET_TICKS_DEFAULT,
 }
 # Raise the delay floor after repeated pauses: pausing repeatedly means the delay
 # is set lower than this filesystem will sustain, and recovering within a tick is
@@ -1151,6 +1217,22 @@ def _mds_namespace_for(path):
         return None
 
 
+def _promql_regex_literal(name):
+    """Escape a name for use as a regex INSIDE a PromQL double-quoted string.
+
+    Two layers, and missing the second one is a hard parse error rather than a
+    wrong match. re.escape() turns a dot into \\. , but PromQL string literals
+    use Go escaping, where \\. is not a valid escape sequence:
+
+        ceph_daemon=~"mds\\.myvol\\..*"   ->  HTTP 400
+          parse error: unknown escape sequence U+002E '.'
+
+    The backslash therefore has to survive the string layer as well, so every
+    one re.escape() produces is doubled.
+    """
+    return re.escape(name).replace("\\", "\\\\")
+
+
 def _resolve_query(args):
     """(query, why_disabled). Substitutes {volume} if the query asks for it."""
     q = getattr(args, "regulate_query", None)
@@ -1165,7 +1247,7 @@ def _resolve_query(args):
             "regulate_query uses {volume} but the filesystem name could not be "
             "resolved to exactly one value (found %s). Either run one volume per "
             "job, or write regulate_query without {volume}." % (sorted(names) or "none"))
-    return q.replace("{volume}", re.escape(names.pop())), None
+    return q.replace("{volume}", _promql_regex_literal(names.pop())), None
 
 
 class Regulator(threading.Thread):
@@ -1184,6 +1266,16 @@ class Regulator(threading.Thread):
         self._quiet = 0
         self._last_err = 0.0
         self._paused_threads = None
+
+    def set_floor_base(self, ms):
+        """Move the baseline the floor decays back to.
+
+        The baseline is captured at construction, so without this a config
+        change to regulate_floor_ms would be accepted and have no effect.
+        """
+        self._floor_base = int(ms)
+        if self.floor_ms < self._floor_base:
+            self.floor_ms = self._floor_base
 
     # -- data -----------------------------------------------------------------
     def sample(self):
@@ -1341,11 +1433,250 @@ def _recursive_stats(path):
         return None, None
 
 
+TMP_SUFFIX = ".vcephfs-tc-tmp"
+# A staged temp file is ".<32 hex>.vcephfs-tc-tmp". Matching on the whole shape
+# rather than the suffix alone keeps reclamation from touching anything a user
+# happened to name similarly.
+TMP_RE = re.compile(r"^\.[0-9a-f]{32}" + re.escape(TMP_SUFFIX) + r"$")
+
+# Never reclaim a temp file younger than this: a concurrent job may be mid-copy
+# into it. No single file copy runs for a day.
+TMP_ORPHAN_MIN_AGE_S = 24 * 3600
+
+_reclaimed_dirs = set()
+_reclaimed_lock = threading.Lock()
+
+# One journal per volume root records what this run did to rctime.
+#
+# ceph.dir.rctime is a monotonic high-water mark, so transcoding pins every
+# ancestor directory's rctime at the moment we ran, and a directory that is
+# never written again stays pinned forever. Retention reads rctime as the
+# answer rather than a hint (classify_retention.get_artifact_mtime, whose
+# docstring forbids walking the tree instead), so a transcoded artifact reads
+# as modified today and stops aging out. rctime cannot be restored: it is not
+# settable, there is no ceph.dir.rmtime, and it only climbs. Preserving the
+# answer before we destroy it is the only option left.
+RUN_JOURNAL_NAME = ".vcephfs-transcode-runs.jsonl"
+# Names an artifact root, matching retention_path_policy's own marker.
+RETENTION_MARKER = "RETENTION"
+
+
+def read_rctime(path):
+    """ceph.dir.rctime as a float, or None off CephFS."""
+    try:
+        raw = os.getxattr(path, "ceph.dir.rctime")
+        return float(raw.decode().strip().strip('"'))
+    except (OSError, ValueError, AttributeError, UnicodeDecodeError):
+        return None
+
+
+class RunJournal:
+    """Per-artifact record of the rctime this run is about to destroy.
+
+    note_file() must run BEFORE anything under an artifact is modified, because
+    the first sighting is what captures the pre-transcode rctime. Both call
+    sites stat every file ahead of any gating, so that ordering holds for the
+    walk and for --paths-from alike.
+
+    Consuming this requires a matching change in the retention scripts; without
+    that the journal is written but nothing reads it.
+    """
+
+    def __init__(self, enabled, stop_at=()):
+        self.enabled = enabled
+        self.run_id = uuid.uuid4().hex[:12]
+        self.started = time.time()
+        self._lock = threading.Lock()
+        self._artifacts = {}       # artifact root -> {pre_rctime, max_file_mtime}
+        self._artifact_of = {}     # directory -> artifact root or None
+        self._stop_at = set(stop_at)
+
+    def _artifact_root(self, dirpath):
+        """Nearest ancestor holding a RETENTION file, or None.
+
+        Memoized over the whole ancestor chain, so a directory costs one
+        walk-up once and its descendants cost a dict lookup.
+        """
+        with self._lock:
+            if dirpath in self._artifact_of:
+                return self._artifact_of[dirpath]
+        chain = []
+        d = dirpath
+        root = None
+        while True:
+            with self._lock:
+                if d in self._artifact_of:
+                    root = self._artifact_of[d]
+                    break
+            chain.append(d)
+            try:
+                if os.path.isfile(os.path.join(d, RETENTION_MARKER)):
+                    root = d
+                    break
+            except OSError:
+                pass
+            if d in self._stop_at:
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        with self._lock:
+            for c in chain:
+                self._artifact_of[c] = root
+        return root
+
+    def note_file(self, filepath, st):
+        """Fold one file into its artifact's record."""
+        if not self.enabled or not stat.S_ISREG(st.st_mode):
+            return
+        root = self._artifact_root(os.path.dirname(filepath))
+        if root is None:
+            return
+        with self._lock:
+            rec = self._artifacts.get(root)
+            if rec is None:
+                # First sighting: nothing under this root has been touched yet,
+                # so this rctime is still the owner's, not ours.
+                rec = {"pre_rctime": read_rctime(root), "max_file_mtime": 0.0}
+                self._artifacts[root] = rec
+            if st.st_mtime > rec["max_file_mtime"]:
+                rec["max_file_mtime"] = st.st_mtime
+
+    def write(self, roots, args):
+        """Append this run's records to a journal at each volume root."""
+        if not self.enabled:
+            return
+        with self._lock:
+            artifacts = dict(self._artifacts)
+        if not artifacts:
+            return
+        ended = time.time()
+        base = {
+            "run": self.run_id,
+            "host": os.uname().nodename,
+            "pid": os.getpid(),
+            "start": round(self.started, 6),
+            "end": round(ended, 6),
+            "min_size": getattr(args, "min_size", None),
+        }
+        for volume_root in roots:
+            prefix = volume_root.rstrip("/") + "/"
+            mine = {a: r for a, r in artifacts.items()
+                    if a == volume_root or a.startswith(prefix)}
+            if not mine:
+                continue
+            journal = os.path.join(volume_root, RUN_JOURNAL_NAME)
+            try:
+                with open(journal, "a") as fh:
+                    for artifact, rec in sorted(mine.items()):
+                        row = dict(base)
+                        row["artifact"] = artifact
+                        row["pre_rctime"] = rec["pre_rctime"]
+                        row["max_file_mtime"] = round(rec["max_file_mtime"], 6)
+                        fh.write(json.dumps(row, sort_keys=True) + "\n")
+                logging.info("Wrote %d artifact record(s) to %s",
+                             len(mine), journal)
+            except OSError as e:
+                logging.warning("Could not write run journal %s: %s", journal, e)
+
+
+
+def _reclaim_named(dirpath, names):
+    """Unlink aged orphans from an already-enumerated name list.
+
+    The walk has the names in hand from os.walk, so this costs one stat per
+    candidate and no extra scandir.
+    """
+    now = time.time()
+    count = 0
+    for name in names:
+        p = os.path.join(dirpath, name)
+        try:
+            st = os.lstat(p)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if now - st.st_mtime < TMP_ORPHAN_MIN_AGE_S:
+                continue
+            os.unlink(p)
+            count += 1
+        except OSError:
+            pass
+    if count:
+        logging.info(f"Reclaimed {count} orphaned temp file(s) from {dirpath}")
+    return count
+
+
+def reclaim_orphans(dirpath):
+    """Unlink aged `.<hex>.vcephfs-tc-tmp` orphans in dirpath, once per directory.
+
+    Sibling staging puts the temp file beside its target, so cleanup_tmpdir --
+    which only scans --tmpdir -- can no longer see it. Without this a SIGKILL
+    mid-copy strands hidden objects on exactly the pools this tool exists to keep
+    object counts down on.
+    """
+    with _reclaimed_lock:
+        if dirpath in _reclaimed_dirs:
+            return
+        _reclaimed_dirs.add(dirpath)
+    now = time.time()
+    count = 0
+    try:
+        for entry in os.scandir(dirpath):
+            if not TMP_RE.match(entry.name):
+                continue
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if now - entry.stat(follow_symlinks=False).st_mtime < TMP_ORPHAN_MIN_AGE_S:
+                    continue
+                os.unlink(entry.path)
+                count += 1
+            except OSError:
+                pass
+    except OSError:
+        return
+    if count:
+        logging.info(f"Reclaimed {count} orphaned temp file(s) from {dirpath}")
+
+
+
+def _tmp_path_for(args, target):
+    """Where to stage the temp copy for `target`.
+
+    Beside the target, so the later rename is intra-directory -- see the header.
+    Hidden and suffixed so an orphan left behind by a hard kill is recognizable.
+    """
+    if args.stage_in_tmpdir:
+        return os.path.join(args.tmpdir, uuid.uuid4().hex)
+    return os.path.join(os.path.dirname(target),
+                        f".{uuid.uuid4().hex}{TMP_SUFFIX}")
+
+
+def _apply_and_verify_layout(layout, path):
+    """Apply the layout, then read it back and confirm it took.
+
+    A shared --tmpdir on the default pool caught a failed apply_file() implicitly:
+    the file stayed visibly in the wrong pool. A sibling temp file inherits the
+    target directory's layout, so that signal is gone and the check has to be
+    explicit -- which is the stronger of the two.
+    """
+    layout.apply_file(path)
+    got = CephLayout.from_file(path)
+    if got != layout:
+        raise RuntimeError(
+            f"layout did not apply to {path}: wanted {layout}, read back {got}")
+
+
 def process_file(args, filepaths, st, layout, file_layout):
     if do_exit.is_set():
         return
 
-    tmp_file = os.path.join(args.tmpdir, uuid.uuid4().hex)
+    if not args.stage_in_tmpdir:
+        # Covers both the walk and --paths-from, which has no walk to hook.
+        reclaim_orphans(os.path.dirname(filepaths[0]))
+
+    tmp_file = _tmp_path_for(args, filepaths[0])
 
     if len(filepaths) == 1:
         logging.info(
@@ -1358,7 +1689,7 @@ def process_file(args, filepaths, st, layout, file_layout):
 
     try:
         with open(tmp_file, "wb") as ofd:
-            layout.apply_file(tmp_file)
+            _apply_and_verify_layout(layout, tmp_file)
             with open(filepaths[0], "rb") as ifd:
                 with stats._lock:
                     stats.files_submitted += 1
@@ -1444,22 +1775,39 @@ def process_file(args, filepaths, st, layout, file_layout):
                     stats.files_skipped_changed += 1
                 return
 
+            # The FILE's mtime is preserved, by copystat above -- pipeline
+            # archival (archive_*) and rsync both key on it directly.
+            #
+            # The parent DIRECTORY's mtime is deliberately NOT restored, and the
+            # os.stat + os.utime that used to do it here are gone:
+            #
+            #   * It did not achieve its purpose. The point was to keep
+            #     ceph.dir.rctime from jumping to the transcode date, but
+            #     os.utime() updates the directory's ctime as a side effect, and
+            #     rctime is a monotonic high-water mark over subtree ctimes that
+            #     never rolls back. Verified live: a transcoded subtree's rctime
+            #     reads as today either way, so retention reports see it as
+            #     0 days old until it ages again. Deferring the utime to
+            #     directory exit would not have helped either.
+            #   * Nothing consumes it. Archive scripts select -type f, restic
+            #     handles directory nodes independently, and rsync compares
+            #     child file mtime and size.
+            #   * It was the contention. Setting a directory's times requires an
+            #     exclusive MDS auth cap (CEPH_CAP_AUTH_EXCL), which collides
+            #     with directory walkers and with sibling workers in the same
+            #     directory -- measured as utimensat stalls up to 4.94s.
             for i, path in enumerate(filepaths):
-                parent_path = os.path.split(path)[0]
-                parent_st = os.stat(parent_path, follow_symlinks=False)
-
                 if i == 0:
                     logging.info(f"Renaming {tmp_file} -> {path}")
                     os.rename(tmp_file, path)
                 else:
+                    # Hard links can live in different directories, so the staging
+                    # path is recomputed per target; reusing one would reintroduce
+                    # the cross-directory rename for every extra link.
+                    link_tmp = _tmp_path_for(args, path)
                     logging.info(f"Linking {filepaths[0]} -> {path}")
-                    os.link(filepaths[0], tmp_file, follow_symlinks=False)
-                    os.rename(tmp_file, path)
-                os.utime(
-                    parent_path,
-                    ns=(parent_st.st_atime_ns, parent_st.st_mtime_ns),
-                    follow_symlinks=False,
-                )
+                    os.link(filepaths[0], link_tmp, follow_symlinks=False)
+                    os.rename(link_tmp, path)
 
             with stats._lock:
                 stats.files_transcoded += 1
@@ -1488,6 +1836,213 @@ def handler(future):
         thread_count.release()
 
 
+def _under_roots(path, roots):
+    """Is *path* inside one of *roots*?
+
+    Separate function so the prefix comparison is testable. A bare startswith()
+    would put /vol/abc under /vol/ab, which is how a list for one volume ends up
+    silently rewriting another.
+    """
+    return any(path == r or path.startswith(r.rstrip(os.sep) + os.sep)
+               for r in roots)
+
+
+def _iter_listed_paths(src):
+    """Yield paths from a --paths-from source, streaming.
+
+    NUL- or newline-delimited, detected from the first block rather than from a
+    second flag: a list built with `find -print0` is NUL-delimited, one scraped
+    out of a previous run's log is newline-delimited, and a flag for it is one
+    more thing to get wrong silently. Read in chunks -- a candidate list for a
+    large volume runs to tens of millions of lines, which is not something to
+    hold in memory just to split it.
+    """
+    fh = sys.stdin.buffer if src == "-" else open(src, "rb")
+    try:
+        first = fh.read(1 << 16)
+        sep = b"\0" if b"\0" in first else b"\n"
+        logging.info("--paths-from %s: %s-delimited", src,
+                     "NUL" if sep == b"\0" else "newline")
+        buf = first
+        while True:
+            parts = buf.split(sep)
+            buf = parts.pop()
+            for raw in parts:
+                # surrogateescape: a path the filesystem accepts is not always
+                # valid UTF-8, and refusing to process it would be worse than
+                # round-tripping the bytes.
+                t = raw.decode("utf-8", "surrogateescape").strip("\r\n")
+                if t:
+                    yield t
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                break
+            buf += chunk
+        t = buf.decode("utf-8", "surrogateescape").strip("\r\n")
+        if t:
+            yield t
+    finally:
+        if src != "-":
+            fh.close()
+
+
+def process_paths(args, hard_links, executor, dir_layouts, roots):
+    """Transcode an explicit list of paths instead of walking the tree.
+
+    A second pass at a lower --min-size already knows its candidates from the
+    previous pass's log, and rediscovering them is the expensive part: the
+    walker sleeps file_delay once per file ENCOUNTERED, before the stat, so a
+    pass costs roughly rfiles x delay however few files actually qualify. On one
+    production volume that is 195M paths visited to reach 8.7M candidates -- 45
+    days of walking for 2 days of work.
+
+    The list is a snapshot and it decays. Measured on that volume, 63% of the
+    listed paths no longer existed six days later and 39% of the survivors had
+    already moved to the target pool. So nothing here trusts the list: every
+    path is re-stat'ed and re-checked exactly as the walker would, and a path
+    that has since vanished is an expected outcome rather than an error.
+    """
+    def _limit_reached():
+        return args.max_files is not None and stats.files_submitted >= args.max_files
+
+    last_progress = time.monotonic()
+    outside_logged = 0
+
+    for filepath in _iter_listed_paths(args.paths_from):
+        if do_exit.is_set() or _limit_reached():
+            return
+
+        if runtime_config is not None:
+            runtime_config.poll(apply_config)
+
+        delay = file_delay_ms
+        if delay > 0:
+            time.sleep(delay / 1000.0)
+
+        if time.monotonic() - last_progress > 60:
+            stats.log_progress()
+            last_progress = time.monotonic()
+
+        filepath = os.path.abspath(filepath)
+
+        # Containment. A list is easy to generate against the wrong volume, and
+        # the damage would be silent and large, so a path outside the roots
+        # given on the command line is refused rather than followed.
+        if not _under_roots(filepath, roots):
+            with stats._lock:
+                stats.files_outside_root += 1
+            outside_logged += 1
+            if outside_logged <= 10:
+                logging.warning("Skipping %s: outside the directories given on the "
+                                "command line", filepath)
+            elif outside_logged == 11:
+                logging.warning("Further out-of-tree paths will be counted but not "
+                                "logged individually")
+            continue
+
+        try:
+            st = os.stat(filepath, follow_symlinks=False)
+            if run_journal is not None:
+                run_journal.note_file(filepath, st)
+        except OSError as e:
+            if e.errno in (errno.ENOENT, errno.ESTALE, errno.ENOTDIR):
+                with stats._lock:
+                    stats.files_vanished += 1
+                logging.info("Skipping %s: no longer exists", filepath)
+            else:
+                logging.warning("Skipping %s: %s", filepath, e)
+                with stats._lock:
+                    stats.files_failed += 1
+            continue
+
+        if not stat.S_ISREG(st.st_mode):
+            msg = stats.note_skipped_symlink()
+            if msg:
+                logging.info(msg)
+            continue
+
+        dirpath = os.path.dirname(filepath)
+        layout = dir_layouts.get(dirpath)
+        if layout is None:
+            layout = get_layout_walking_up(dirpath)
+            if layout is None:
+                logging.error(f"Could not determine layout for {dirpath}, skipping")
+                with stats._lock:
+                    stats.files_failed += 1
+                continue
+            dir_layouts[dirpath] = layout
+
+        # Layout is checked BEFORE size here, the reverse of the walker. The
+        # walker tests size first because that is the cheaper rejection: most of
+        # what it encounters is tiny, and a stat alone settles it, so reading a
+        # layout for every file would add an MDS round trip to the common case.
+        # A path list is already filtered to plausible candidates, and its
+        # staleest entries are precisely the ones an earlier pass has since
+        # moved -- testing size first would log those as "below --min-size" and
+        # conceal that they are already done, which is exactly how a previous
+        # analysis came to overstate the remaining work.
+        file_layout = CephLayout.from_file(filepath)
+        if file_layout is None:
+            logging.error(f"Could not read layout for {filepath}, skipping")
+            with stats._lock:
+                stats.files_failed += 1
+            continue
+        if file_layout == layout:
+            with stats._lock:
+                stats.files_skipped_layout_match += 1
+            continue
+        if args.source_pool is not None and file_layout.pool != args.source_pool:
+            with stats._lock:
+                stats.files_skipped_source_pool += 1
+            continue
+
+        if st.st_nlink == 1 and st.st_size < args.min_size:
+            logging.info(
+                f"Skipping {filepath}: size {st.st_size} below --min-size {args.min_size}"
+            )
+            with stats._lock:
+                stats.files_skipped_small += 1
+            continue
+        if (st.st_nlink == 1 and args.max_size is not None
+                and st.st_size > args.max_size):
+            logging.info(
+                f"Skipping {filepath}: size {st.st_size} above --max-size {args.max_size}"
+            )
+            with stats._lock:
+                stats.files_skipped_large += 1
+            continue
+        if st.st_mtime > (time.time() - 86400 * min_age_days):
+            logging.info(f"Skipping {filepath}: modified too recently")
+            with stats._lock:
+                stats.files_skipped_recent += 1
+            continue
+
+        # Multiply-linked files need every link in hand before any of them can
+        # be replaced, and a path list cannot promise it contains them all.
+        # Transcoding a partial set would break the link relationship, so this
+        # mode declines regardless of --process-hardlinks. Walk for those.
+        if st.st_nlink != 1:
+            logging.info(
+                f"Skipping {filepath}: has {st.st_nlink} hard links -- --paths-from "
+                f"cannot see the other links, use a walk for these"
+            )
+            with stats._lock:
+                stats.files_skipped_hardlink += 1
+            continue
+
+        if not thread_count.acquire(
+                cancel=lambda: do_exit.is_set() or _limit_reached()):
+            return
+        try:
+            future = executor.submit(
+                process_file, args, [filepath], st, layout, file_layout
+            )
+            future.add_done_callback(handler)
+        except Exception:
+            thread_count.release()
+            raise
+
+
 def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts):
     def _limit_reached():
         return args.max_files is not None and stats.files_submitted >= args.max_files
@@ -1512,6 +2067,24 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             logging.info(f"Skipping {dirpath}: path is the temporary dir")
             del dirnames[:]
             continue
+
+        # Our own staged temp files are not candidates: a concurrent job may be
+        # writing one right now, and transcoding a partial copy would be wrong.
+        # Reclaim the aged ones here, for every directory the walk enters, so a
+        # subtree that holds orphans but no current candidate is still swept.
+        if RUN_JOURNAL_NAME in filenames:
+            # Ours, and it lives at a volume root that is inside the walk.
+            # Being under --min-size already keeps it from being transcoded,
+            # but that is a coincidence of its size, not a rule.
+            filenames[:] = [f for f in filenames if f != RUN_JOURNAL_NAME]
+
+        orphans = [f for f in filenames if TMP_RE.match(f)]
+        if orphans:
+            filenames[:] = [f for f in filenames if not TMP_RE.match(f)]
+            if not args.stage_in_tmpdir:
+                _reclaim_named(dirpath, orphans)
+        with _reclaimed_lock:
+            _reclaimed_dirs.add(dirpath)
 
         layout = dir_layouts.get(dirpath, None)
         if layout is None:
@@ -1607,6 +2180,10 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
 
             filepath = os.path.join(dirpath, filename)
             st = os.stat(filepath, follow_symlinks=False)
+            if run_journal is not None:
+                # Before any gating, and before anything here is modified: this
+                # is where the pre-transcode rctime is still recoverable.
+                run_journal.note_file(filepath, st)
             if not stat.S_ISREG(st.st_mode):
                 msg = stats.note_skipped_symlink()
                 if msg:
@@ -1712,8 +2289,11 @@ def cleanup_tmpdir(tmpdir):
     for entry in os.scandir(tmpdir):
         if entry.is_file(follow_symlinks=False):
             try:
-                # Only remove files that look like our UUID hex temp files
-                uuid.UUID(entry.name)
+                # Both staging shapes: the bare UUID hex used by --stage-in-tmpdir,
+                # and the ".<hex>.vcephfs-tc-tmp" a sibling-staged run leaves if
+                # --tmpdir happens to sit inside the tree being walked.
+                if not TMP_RE.match(entry.name):
+                    uuid.UUID(entry.name)
                 os.unlink(entry.path)
                 count += 1
             except (ValueError, OSError):
@@ -1732,39 +2312,83 @@ def process_files(args):
 
     hard_links = {}
     dir_layouts = {}
+    roots_seen = []
 
     mountpoints = set()
     with open("/proc/self/mounts", "r") as f:
         for line in f:
             mountpoints.add(line.split()[1])
 
-    start_regulator(args)
+    global regulator
+    regulator = start_regulator(args)
 
-    with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
-        tmpdir_dev = os.stat(args.tmpdir).st_dev
-        for start_dir in args.dirs:
-            start_dir = os.path.abspath(start_dir)
-            if os.stat(start_dir).st_dev != tmpdir_dev:
-                logging.error(
-                    f"tmpdir {args.tmpdir} is on a different filesystem than {start_dir}. "
-                    f"os.rename() will fail with EXDEV. Aborting."
-                )
-                sys.exit(1)
+    global run_journal
+    run_journal = RunJournal(
+        enabled=args.run_journal,
+        stop_at=[os.path.abspath(d) for d in args.dirs],
+    )
 
-            if start_dir in mountpoints:
-                mountpoints.remove(start_dir)
+    try:
+        with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
+            tmpdir_dev = os.stat(args.tmpdir).st_dev
 
-            layout = get_layout_walking_up(start_dir)
+            if args.paths_from:
+                roots = []
+                for start_dir in args.dirs:
+                    start_dir = os.path.abspath(start_dir)
+                    if args.stage_in_tmpdir and os.stat(start_dir).st_dev != tmpdir_dev:
+                        logging.error(
+                            f"--stage-in-tmpdir was given and tmpdir {args.tmpdir} is on a "
+                            f"different filesystem than {start_dir}. os.rename() will fail "
+                            f"with EXDEV. Aborting."
+                        )
+                        sys.exit(1)
+                    roots.append(start_dir)
+                    roots_seen.append(start_dir)
+                for opt, val in (("--prune-dir-regex", args.prune_re),
+                                 ("--prune-small-subtrees",
+                                  getattr(args, "prune_small_subtrees", False))):
+                    if val:
+                        logging.warning(
+                            "%s has no effect with --paths-from: it prunes the walk, "
+                            "and the list replaces the walk", opt)
+                logging.info("Processing the list in %s, under %s",
+                             args.paths_from, ", ".join(roots))
+                process_paths(args, hard_links, executor, dir_layouts, roots)
+                return
 
-            if layout is None:
-                logging.error(f"Could not determine layout for {start_dir}, skipping")
-                continue
-            dir_layouts[start_dir] = layout
+            for start_dir in args.dirs:
+                start_dir = os.path.abspath(start_dir)
+                if args.stage_in_tmpdir and os.stat(start_dir).st_dev != tmpdir_dev:
+                    logging.error(
+                        f"--stage-in-tmpdir was given and tmpdir {args.tmpdir} is on a "
+                        f"different filesystem than {start_dir}. os.rename() will fail with "
+                        f"EXDEV. Aborting."
+                    )
+                    sys.exit(1)
 
-            logging.info(f"Starting at {start_dir} ({layout})")
-            process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
-            if do_exit.is_set():
-                break
+                if start_dir in mountpoints:
+                    mountpoints.remove(start_dir)
+
+                layout = get_layout_walking_up(start_dir)
+
+                if layout is None:
+                    logging.error(f"Could not determine layout for {start_dir}, skipping")
+                    continue
+                dir_layouts[start_dir] = layout
+
+                logging.info(f"Starting at {start_dir} ({layout})")
+                roots_seen.append(start_dir)
+                process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
+                if do_exit.is_set():
+                    break
+    finally:
+        # Every exit path, including the --paths-from branch's early return
+        # and an exception mid-walk. The journal is the only record of the
+        # pre-transcode rctime, and a run that died partway is exactly the
+        # one whose damage cannot be reconstructed afterwards.
+        if run_journal is not None:
+            run_journal.write(roots_seen, args)
 
     if hard_links and not do_exit.is_set():
         logging.warning(
@@ -1861,6 +2485,19 @@ def main():
     )
     parser.add_argument("dirs", help="Directories to scan", nargs="*")
     parser.add_argument(
+        "--paths-from", metavar="FILE",
+        help="Transcode exactly the files listed in FILE ('-' for stdin) instead "
+             "of walking the directories. NUL- or newline-delimited, detected "
+             "from the content. The directories still have to be given: they "
+             "bound what the list is allowed to touch, and a listed path outside "
+             "them is refused. Every path is re-stat'ed and re-checked, so a list "
+             "that has gone stale is safe -- vanished files are counted and "
+             "logged, not treated as errors. Multiply-linked files are declined "
+             "in this mode because a list cannot promise it holds every link. "
+             "Intended for a second pass whose candidates are already known from "
+             "an earlier run's log, where walking the whole tree again to "
+             "rediscover them is the expensive part.")
+    parser.add_argument(
         "--tmpdir",
         default="/data/tmp",
         help="Temporary directory to which to copy files.\nImportant: This directory should have its layout set to\nthe *default* data pool for the FS, to avoid excess backtrace objects.",
@@ -1927,6 +2564,16 @@ def main():
         help="how often to stat --config for changes (default: 10)",
     )
     parser.add_argument(
+        "--stage-in-tmpdir",
+        action="store_true",
+        default=False,
+        help="Stage temp copies in --tmpdir instead of beside their target. This "
+             "is the pre-2026-09 behavior and it is slow: staging elsewhere makes "
+             "every replace a cross-rank distributed rename (mean 1266 ms, tail to "
+             "14.9 s) instead of an intra-directory one (mean 0.26 ms). Escape "
+             "hatch only.",
+    )
+    parser.add_argument(
         "--force-tmpdir-pool",
         action="store_true",
         help="proceed even if the tmpdir is in a target pool. Disables the only "
@@ -1990,26 +2637,26 @@ def main():
              "it if that cannot be derived. Single line, no '#'.",
     )
     parser.add_argument(
-        "--regulate-pause-ms", type=float, default=150.0, metavar="MS",
+        "--regulate-pause-ms", type=float, default=REG_PAUSE_MS_DEFAULT, metavar="MS",
         help="Pause the job while the query exceeds this (default 150).",
     )
     parser.add_argument(
-        "--regulate-slo-ms", type=float, default=75.0, metavar="MS",
+        "--regulate-slo-ms", type=float, default=REG_SLO_MS_DEFAULT, metavar="MS",
         help="Soft target, used only to express readings as a percentage in log "
              "messages (default 75). --regulate-pause-ms is what actually gates.",
     )
     parser.add_argument(
-        "--regulate-period-s", type=int, default=30, metavar="SEC",
+        "--regulate-period-s", type=int, default=REG_PERIOD_S_DEFAULT, metavar="SEC",
         help="Seconds between samples (default 30).",
     )
     parser.add_argument(
-        "--regulate-floor-ms", type=int, default=0, metavar="MS",
+        "--regulate-floor-ms", type=int, default=REG_FLOOR_MS_DEFAULT, metavar="MS",
         help="Lower bound on --file-delay that regulation may ease down to. "
              "Repeated pauses raise it; sustained quiet releases it back to this "
              "baseline (default 0).",
     )
     parser.add_argument(
-        "--regulate-quiet-ticks", type=int, default=10, metavar="N",
+        "--regulate-quiet-ticks", type=int, default=REG_QUIET_TICKS_DEFAULT, metavar="N",
         help="Consecutive clean samples before easing the delay (default 10).",
     )
     parser.add_argument(
@@ -2074,6 +2721,21 @@ def main():
         "names, e.g. '\\.runfiles$' to skip Bazel runfiles symlink farms. "
         "Overrides the built-in default set (see DEFAULT_PRUNE_DIRS); pass an "
         "empty string to disable pruning entirely.",
+    )
+
+    parser.add_argument(
+        "--no-run-journal",
+        dest="run_journal",
+        action="store_false",
+        default=True,
+        help="Do not write .vcephfs-transcode-runs.jsonl at each volume root. "
+        "The journal records, per artifact, the ceph.dir.rctime and newest file "
+        "mtime seen BEFORE this run modified anything, because transcoding pins "
+        "rctime at the time we ran and a directory that is never written again "
+        "stays pinned forever -- so retention reads transcoded data as fresh and "
+        "stops expiring it. rctime cannot be restored (it is monotonic and not "
+        "settable), so preserving the answer is the only option. Costs one "
+        "getxattr per artifact root. Disable only if nothing consumes rctime.",
     )
 
     args = parser.parse_args()
@@ -2408,14 +3070,20 @@ def main():
                         args.min_size // 8,
                         args.prune_budget_bytes,
                     )
-        for _k, _label in (('regulate_pause_ms', 'regulate pause threshold'),
-                           ('regulate_slo_ms', 'regulate soft target'),
-                           ('regulate_period_s', 'regulate poll period'),
-                           ('regulate_quiet_ticks', 'regulate quiet ticks')):
+        for _k, _label in REGULATE_APPLY:
             if _k in cfg and cfg[_k] != getattr(args, _k, None):
                 _old = getattr(args, _k, None)
                 setattr(args, _k, cfg[_k])
                 logging.info("Config: %s %s -> %s", _label, _old, cfg[_k])
+                # The regulator is started once, so these two decide only whether
+                # it came up at all. Changing them later looks like it worked.
+                if _k in ('regulate_prometheus_url', 'regulate_query') \
+                        and regulator is not None:
+                    logging.warning(
+                        "Config: %s changed, but the regulator is started once at "
+                        "startup -- restart the job for this to take effect", _label)
+                if _k == 'regulate_floor_ms' and regulator is not None:
+                    regulator.set_floor_base(cfg[_k])
         for _k, _label in (('prune_subtree_max_bytes', 'prune subtree ceiling'),
                            ('prune_budget_bytes', 'prune budget')):
             if _k in cfg and cfg[_k] != getattr(args, _k):
@@ -2488,6 +3156,7 @@ def main():
         f"{stats.files_failed} failed, "
         f"{stats.files_skipped_layout_match} already matched, "
         f"{stats.files_skipped_source_pool} wrong source pool, "
+        f"{stats.files_vanished} vanished, "
         f"{stats.subtrees_pruned} subtrees pruned ({stats.bytes_pruned} bytes), "
         f"{stats.files_skipped_recent} too recent, "
         f"{stats.files_skipped_changed} changed during processing, "
