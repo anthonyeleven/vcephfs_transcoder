@@ -1478,6 +1478,26 @@ class RunJournal:
     sites stat every file ahead of any gating, so that ordering holds for the
     walk and for --paths-from alike.
 
+    note_write() must run AFTER each replace, because what the consumer needs is
+    the timestamp of the write whose value the MDS then stamped into rctime.
+    Only that identifies which write an rctime is showing. The run's own
+    start/end cannot: a run lasts days, so an rctime somewhere inside the window
+    is as likely to be an owner write that landed mid-run as it is to be ours,
+    and a consumer that treats it as ours discards real activity.
+
+    WHAT A MATCH OBLIGES THE CONSUMER TO DO. If an artifact's current rctime
+    matches its pinned_at, that rctime is ours and carries no information about
+    owner activity -- but pre_rctime and max_file_mtime are NOT a substitute for
+    it. Both are captured before or during the walk, so neither can see a write
+    that landed after we stat'd a file and before our last replace beneath the
+    artifact: a file created after the walk passed its directory is never
+    note_file()'d at all, and one modified after we stat'd it keeps its old
+    mtime here. That window is the whole time the run spends in the subtree,
+    which is hours to days. So a match means RESCAN -- walk the artifact for a
+    real max mtime. It does not mean "fall back to pre_rctime", which would
+    silently date the artifact to before an owner write we never saw. Treat
+    pre_rctime and max_file_mtime as a floor, not an answer.
+
     Consuming this requires a matching change in the retention scripts; without
     that the journal is written but nothing reads it.
     """
@@ -1487,7 +1507,8 @@ class RunJournal:
         self.run_id = uuid.uuid4().hex[:12]
         self.started = time.time()
         self._lock = threading.Lock()
-        self._artifacts = {}       # artifact root -> {pre_rctime, max_file_mtime}
+        # artifact root -> {pre_rctime, max_file_mtime, pinned_at}
+        self._artifacts = {}
         self._artifact_of = {}     # directory -> artifact root or None
         self._stop_at = set(stop_at)
 
@@ -1538,10 +1559,39 @@ class RunJournal:
             if rec is None:
                 # First sighting: nothing under this root has been touched yet,
                 # so this rctime is still the owner's, not ours.
-                rec = {"pre_rctime": read_rctime(root), "max_file_mtime": 0.0}
+                rec = {"pre_rctime": read_rctime(root), "max_file_mtime": 0.0,
+                       "pinned_at": None}
                 self._artifacts[root] = rec
             if st.st_mtime > rec["max_file_mtime"]:
                 rec["max_file_mtime"] = st.st_mtime
+
+    def note_write(self, filepath):
+        """Record that we have just replaced a file beneath its artifact.
+
+        The last of these is the write rctime ends up showing, which is what
+        lets the consumer tell our pin from an owner write. Called after the
+        rename, so a failed replace leaves no claim on the artifact -- and an
+        artifact this run only READ keeps pinned_at null, because its rctime is
+        still the owner's and must go on being trusted.
+
+        Sampled and compared under the lock, and only ever moved forward. Two
+        workers replacing different files under one artifact take different
+        stripe locks, so nothing orders them against each other: sampling the
+        clock first and assigning unconditionally lets the earlier of two
+        interleaved writes land last and leave pinned_at BEHIND the write the
+        MDS actually stamped. The consumer then fails to recognise its own pin.
+        """
+        if not self.enabled:
+            return
+        root = self._artifact_root(os.path.dirname(filepath))
+        if root is None:
+            return
+        with self._lock:
+            rec = self._artifacts.get(root)
+            if rec is not None:
+                now = time.time()
+                if rec["pinned_at"] is None or now > rec["pinned_at"]:
+                    rec["pinned_at"] = now
 
     def write(self, roots, args):
         """Append this run's records to a journal at each volume root."""
@@ -1574,6 +1624,9 @@ class RunJournal:
                         row["artifact"] = artifact
                         row["pre_rctime"] = rec["pre_rctime"]
                         row["max_file_mtime"] = round(rec["max_file_mtime"], 6)
+                        pinned_at = rec.get("pinned_at")
+                        row["pinned_at"] = (round(pinned_at, 6)
+                                            if pinned_at is not None else None)
                         fh.write(json.dumps(row, sort_keys=True) + "\n")
                 logging.info("Wrote %d artifact record(s) to %s",
                              len(mine), journal)
@@ -1808,6 +1861,13 @@ def process_file(args, filepaths, st, layout, file_layout):
                     logging.info(f"Linking {filepaths[0]} -> {path}")
                     os.link(filepaths[0], link_tmp, follow_symlinks=False)
                     os.rename(link_tmp, path)
+
+            if run_journal is not None:
+                # After the renames: this is the write rctime now reflects.
+                # Hard links can sit under different artifacts, so every target
+                # is claimed, not just the first.
+                for path in filepaths:
+                    run_journal.note_write(path)
 
             with stats._lock:
                 stats.files_transcoded += 1

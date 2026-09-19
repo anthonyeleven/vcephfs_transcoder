@@ -119,6 +119,65 @@ j5 = tc.RunJournal(enabled=True, stop_at=[])       # no boundary -> it escapes
 check("without stop_at it WOULD escape (so the guard is doing work)",
       j5._artifact_root(os.path.dirname(f_out)) == outside)
 
+print("\npinned_at -- which write rctime is showing:")
+check("an artifact only READ has pinned_at null",
+      j._artifacts[artA]["pinned_at"] is None
+      and j._artifacts[artB]["pinned_at"] is None)
+
+
+class _Clock:
+    """Hand-cranked time.time() so ordering is asserted, not raced."""
+
+    def __init__(self, *values):
+        self.values = list(values)
+
+    def time(self):
+        return self.values.pop(0) if len(self.values) > 1 else self.values[0]
+
+
+real_time = tc.time
+tc.time = _Clock(5000.0, 6000.0)
+j.note_write(f_a)
+check("note_write claims the artifact the file belongs to",
+      j._artifacts[artA]["pinned_at"] == 5000.0)
+check("and does not touch a sibling artifact",
+      j._artifacts[artB]["pinned_at"] is None)
+j.note_write(f_a2)                 # also under A, later
+check("the LAST write wins -- that is the one rctime ends up showing",
+      j._artifacts[artA]["pinned_at"] == 6000.0)
+
+# Two workers under one artifact take different stripe locks, so they are not
+# ordered against each other and their clock samples can arrive out of order.
+# pinned_at must track the newest sample, never the last one to arrive: if it
+# slid backwards it would sit behind the write the MDS stamped into rctime, and
+# the consumer would stop recognising its own pin. Sampling outside the lock and
+# assigning unconditionally -- the previous shape -- fails this check at 4000.0.
+tc.time = _Clock(9000.0, 4000.0)
+j.note_write(f_a)
+check("a newer write advances pinned_at", j._artifacts[artA]["pinned_at"] == 9000.0)
+j.note_write(f_a2)
+check("an out-of-order sample never drags pinned_at backwards",
+      j._artifacts[artA]["pinned_at"] == 9000.0)
+tc.time = real_time
+
+check("pinned_at is a per-write time, NOT the run start (the whole point)",
+      j._artifacts[artA]["pinned_at"] != j.started)
+
+j.note_write(f_loose)
+check("a write under no artifact records nothing",
+      os.path.join(vol, "loose") not in j._artifacts)
+
+j6 = tc.RunJournal(enabled=False, stop_at=[vol])
+j6.note_file(f_a, st_a)
+j6.note_write(f_a)
+check("--no-run-journal records no writes either", not j6._artifacts)
+
+print("\nnegative control -- would a missing note_write be caught?")
+j7 = tc.RunJournal(enabled=True, stop_at=[vol])
+j7.note_file(f_b, st_b)
+check("without note_write the artifact stays unclaimed (so the check bites)",
+      j7._artifacts[artB]["pinned_at"] is None)
+
 print("\njournal file:")
 class A:
     min_size = 131072
@@ -128,8 +187,13 @@ check("journal written at the volume root", os.path.exists(jp))
 rows = [json.loads(l) for l in open(jp)]
 check("one row per artifact", len(rows) == 2)
 check("rows carry what retention needs",
-      all({"artifact", "pre_rctime", "max_file_mtime", "start", "end", "run"}
-          <= set(r) for r in rows))
+      all({"artifact", "pre_rctime", "max_file_mtime", "pinned_at",
+           "start", "end", "run"} <= set(r) for r in rows))
+by_artifact = {r["artifact"]: r for r in rows}
+check("a written artifact serializes pinned_at as a number",
+      isinstance(by_artifact[artA]["pinned_at"], float))
+check("a read-only artifact serializes pinned_at as null",
+      by_artifact[artB]["pinned_at"] is None)
 check("end >= start", all(r["end"] >= r["start"] for r in rows))
 check("min_size recorded", all(r["min_size"] == 131072 for r in rows))
 
@@ -264,6 +328,10 @@ _st = touch(_data, OLD)
 tc.read_rctime = lambda p: 1757000000.123456
 _j = tc.RunJournal(enabled=True, stop_at=[_contract_dir])
 _j.note_file(_data, _st)
+# The consumer only recovers for an artifact this run actually WROTE to, so the
+# contract line -- which is what the infra fixture is copied from -- has to be
+# the shape produced by a real replace, not by a read-only visit.
+_j.note_write(_data)
 
 
 class _CArgs:
@@ -277,7 +345,11 @@ _row = json.loads(_line)
 check("journal filename is the name the consumer looks for",
       tc.RUN_JOURNAL_NAME == ".vcephfs-transcode-runs.jsonl")
 check("emits every key the consumer reads",
-      {"artifact", "start", "end", "pre_rctime", "max_file_mtime"} <= set(_row))
+      {"artifact", "start", "end", "pre_rctime", "max_file_mtime",
+       "pinned_at"} <= set(_row))
+check("pinned_at is the numeric per-write timestamp the consumer matches on",
+      isinstance(_row["pinned_at"], float)
+      and _row["start"] <= _row["pinned_at"] <= _row["end"])
 check("artifact is an absolute path string",
       isinstance(_row["artifact"], str) and os.path.isabs(_row["artifact"]))
 check("start/end are numeric epoch seconds, not ISO strings",
@@ -290,6 +362,9 @@ check("one JSON object per line", len(_line.splitlines()) == 1)
 
 # The consumer keys on the artifact path. Prove the producer writes the same
 # spelling the walk would hand a consumer standing in the same tree.
+print("\n-- the contract line, copied verbatim into the infra fixture --")
+print(_line.rstrip("\n").replace(_art, "@ARTIFACT@"))
+
 check("artifact key matches the directory as walked",
       _row["artifact"] == _art)
 
