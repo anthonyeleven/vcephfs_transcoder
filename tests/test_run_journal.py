@@ -309,8 +309,9 @@ check("guard REJECTS the paths-from return escaping the try",
       not _finally_covers_returns(_escaped))
 
 # ---------------------------------------------------------------------------
-# Cross-repo format contract. The consumer is a separate internal repo,
-# jenkins/scripts/retention_path_policy.py (transcode_pinned_rctime), which
+# Cross-repo format contract. The consumer is a retention policy script in a
+# separate private repo (jenkins/scripts/retention_path_policy.py,
+# transcode_pinned_rctime), which
 # reads these key names and types out of the journal. It lives in a different
 # repo and cannot import this one, so the two halves are pinned by this test
 # and its mirror there -- not by prose in a PR description. Changing a key name
