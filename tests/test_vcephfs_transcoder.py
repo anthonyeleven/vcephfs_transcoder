@@ -38,6 +38,8 @@ class Args:
         self.regulate_period_s = 30
         self.regulate_floor_ms = 0
         self.regulate_quiet_ticks = 10
+        self.regulate_max_threads = 0
+        self.threads = 1
         self.__dict__.update(kw)
 
 
@@ -617,6 +619,129 @@ class Crossover(unittest.TestCase):
     def test_probe_degrades_without_ceph(self):
         """Must never be load-bearing: no ceph CLI -> None, not an exception."""
         self.assertIsNone(vct._pool_scheme("definitely-not-a-pool-xyzzy"))
+
+
+class ThreadAdaptivity(unittest.TestCase):
+    """Regulator-driven thread changes.
+
+    The property that matters is not that it climbs -- it is that a pause can
+    never be followed by a climb back to the count that caused it. Without the
+    learned ceiling the regulator pauses at N, resumes at N, climbs to N, and
+    oscillates forever at the one setting the filesystem has already rejected.
+    """
+
+    def setUp(self):
+        self._saved = (vct.thread_count, vct.file_delay_ms, vct._setproctitle)
+        vct._setproctitle = None      # keep ps(1) out of the unit tests
+
+    def tearDown(self):
+        vct.thread_count, vct.file_delay_ms, vct._setproctitle = self._saved
+
+    def _reg(self, threads=1, maxt=0, floor=0):
+        a = Args(regulate_prometheus_url="http://x", regulate_query="q",
+                 regulate_pause_ms=150.0, regulate_slo_ms=75.0,
+                 regulate_period_s=30, regulate_floor_ms=floor,
+                 regulate_quiet_ticks=3, dirs=["/x"],
+                 threads=threads, regulate_max_threads=maxt)
+        vct.thread_count = vct.DynamicSemaphore(threads)
+        vct.file_delay_ms = floor
+        return vct.Regulator(a, "q")
+
+    # -- opt-in ---------------------------------------------------------------
+    def test_off_by_default_never_touches_threads(self):
+        r = self._reg(threads=2, maxt=0)
+        for _ in range(10):
+            r._maybe_raise_threads(1.0)
+        self.assertEqual(vct.thread_count.limit, 2)
+
+    def test_control_identical_conditions_do_raise_when_enabled(self):
+        """Same latency, same delay, opt-in flipped on. Proves the assertion
+        above is held by the opt-in and not by some unrelated precondition."""
+        r = self._reg(threads=2, maxt=6)
+        r._maybe_raise_threads(1.0)
+        self.assertEqual(vct.thread_count.limit, 3)
+
+    # -- the two gates --------------------------------------------------------
+    def test_will_not_raise_while_the_delay_is_above_its_floor(self):
+        r = self._reg(threads=1, maxt=4, floor=20)
+        vct.file_delay_ms = 21
+        r._maybe_raise_threads(1.0)
+        self.assertEqual(vct.thread_count.limit, 1, "raised with delay left to give back")
+        vct.file_delay_ms = 20
+        r._maybe_raise_threads(1.0)
+        self.assertEqual(vct.thread_count.limit, 2, "never raised even at the floor")
+
+    def test_will_not_raise_at_or_above_the_slo(self):
+        r = self._reg(threads=1, maxt=4)
+        r._maybe_raise_threads(75.0)
+        self.assertEqual(vct.thread_count.limit, 1, "raised while at the target")
+        r._maybe_raise_threads(74.9)
+        self.assertEqual(vct.thread_count.limit, 2, "never raised even under target")
+
+    # -- climb ----------------------------------------------------------------
+    def test_one_step_per_interval_and_stops_at_the_ceiling(self):
+        r = self._reg(threads=1, maxt=5)
+        for expected in (2, 3, 4, 5):
+            r._maybe_raise_threads(1.0)
+            self.assertEqual(vct.thread_count.limit, expected)
+        r._maybe_raise_threads(1.0)
+        self.assertEqual(vct.thread_count.limit, 5, "climbed past the ceiling")
+
+    # -- hysteresis -----------------------------------------------------------
+    def test_pause_lowers_the_ceiling_below_the_level_that_paused(self):
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(6)
+        r._pause(200.0)
+        self.assertEqual(vct.thread_count.limit, 0)
+        self.assertEqual(r._thread_ceiling(), 5)
+
+    def test_resume_is_held_under_the_learned_ceiling(self):
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(6)
+        r._pause(200.0)
+        r._resume()
+        self.assertEqual(vct.thread_count.limit, 5,
+                         "resumed straight back to the count that just paused")
+
+    def test_cannot_oscillate_back_to_the_level_that_paused(self):
+        """The anti-thrash property, end to end."""
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(5)
+        r._pause(200.0)
+        r._resume()
+        for _ in range(20):
+            r._maybe_raise_threads(1.0)
+        self.assertLessEqual(vct.thread_count.limit, 4,
+                             "climbed back to the count that caused the pause")
+
+    def test_ceiling_never_drops_below_what_the_operator_asked_for(self):
+        """--threads is a floor on ambition, not a starting suggestion. Unlike
+        the delay floor this ratchet has no release valve, so if it could fall
+        past the operator's own setting the job would be stuck slow for the
+        rest of the run."""
+        r = self._reg(threads=4, maxt=8)
+        for level in (8, 7, 6, 5, 4, 3, 2):
+            vct.thread_count.set_limit(level)
+            r._pause(200.0)
+        self.assertGreaterEqual(r._thread_ceiling(), 4)
+
+    # -- config ---------------------------------------------------------------
+    def test_regulate_max_threads_parsed_and_range_checked(self):
+        cfg, errs = vct.RuntimeConfig._parse("regulate_max_threads = 6\n")
+        self.assertEqual(errs, [])
+        self.assertEqual(cfg["regulate_max_threads"], 6)
+        _, errs = vct.RuntimeConfig._parse("regulate_max_threads = -1\n")
+        self.assertTrue(errs, "accepted a negative ceiling")
+
+    def test_zero_is_accepted_as_the_disable_value(self):
+        cfg, errs = vct.RuntimeConfig._parse("regulate_max_threads = 0\n")
+        self.assertEqual(errs, [])
+        self.assertEqual(cfg["regulate_max_threads"], 0)
+
+    def test_it_is_live_reloadable(self):
+        self.assertIn("regulate_max_threads",
+                      [k for k, _ in vct.REGULATE_APPLY])
+        self.assertIn("regulate_max_threads", vct.RuntimeConfig.KEYS)
 
 
 if __name__ == "__main__":
