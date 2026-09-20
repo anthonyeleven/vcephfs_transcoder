@@ -155,6 +155,10 @@ REG_SLO_MS_DEFAULT = 75.0
 REG_PERIOD_S_DEFAULT = 30
 REG_FLOOR_MS_DEFAULT = 0
 REG_QUIET_TICKS_DEFAULT = 10
+# Thread adaptivity is OPT-IN: 0 means the regulator never changes the thread
+# count except for the existing pause/resume. Set it to the most threads the
+# volume may use and the regulator will climb toward it one step at a time.
+REG_MAX_THREADS_DEFAULT = 0
 # Floor for the DOWN direction. 0 keeps the historical behavior of allowing a
 # step to unthrottled; set it in the config to guarantee the signal path can
 # never produce an unbounded stat rate on a live filesystem.
@@ -292,6 +296,14 @@ def config_example(volume="VOLUME"):
         "regulate_floor_ms   = %d" % REG_FLOOR_MS_DEFAULT,
         "regulate_quiet_ticks = %d" % REG_QUIET_TICKS_DEFAULT,
         "",
+        "# Thread adaptivity, opt-in. 0 leaves the thread count exactly where",
+        "# --threads put it. Set it to a ceiling and the regulator adds one",
+        "# thread per quiet interval, but only once the delay has already",
+        "# decayed to its floor -- delay is the cheaper knob, so it is spent",
+        "# first. A pause lowers an internal ceiling below the level that",
+        "# caused it, so the climb does not simply repeat.",
+        "regulate_max_threads = %d" % REG_MAX_THREADS_DEFAULT,
+        "",
     ))
 
 
@@ -355,7 +367,7 @@ class RuntimeConfig:
             'delay_min_ms', 'prune_subtree_max_bytes', 'prune_budget_bytes',
             'regulate_prometheus_url', 'regulate_query', 'regulate_pause_ms',
             'regulate_slo_ms', 'regulate_period_s', 'regulate_quiet_ticks',
-            'regulate_floor_ms')
+            'regulate_floor_ms', 'regulate_max_threads')
 
     def __init__(self, path, poll_seconds=10.0):
         self.path = path
@@ -479,6 +491,11 @@ class RuntimeConfig:
                     iv = int(v)
                     if iv < 1:
                         raise ValueError("must be >= 1")
+                    out[k] = iv
+                elif k == 'regulate_max_threads':
+                    iv = int(v)
+                    if iv < 0:
+                        raise ValueError("must be >= 0 (0 disables)")
                     out[k] = iv
                 elif k == 'regulate_floor_ms':
                     iv = int(v)
@@ -1150,6 +1167,7 @@ REGULATE_APPLY = (
     ('regulate_period_s', 'regulate poll period'),
     ('regulate_quiet_ticks', 'regulate quiet ticks'),
     ('regulate_floor_ms', 'regulate delay floor'),
+    ('regulate_max_threads', 'regulate max threads'),
 )
 
 REG_DEFAULTS = {
@@ -1160,6 +1178,7 @@ REG_DEFAULTS = {
     'regulate_period_s': REG_PERIOD_S_DEFAULT,
     'regulate_floor_ms': REG_FLOOR_MS_DEFAULT,
     'regulate_quiet_ticks': REG_QUIET_TICKS_DEFAULT,
+    'regulate_max_threads': REG_MAX_THREADS_DEFAULT,
 }
 # Raise the delay floor after repeated pauses: pausing repeatedly means the delay
 # is set lower than this filesystem will sustain, and recovering within a tick is
@@ -1266,6 +1285,11 @@ class Regulator(threading.Thread):
         self._quiet = 0
         self._last_err = 0.0
         self._paused_threads = None
+        # Learned ceiling for regulator-driven thread increases. It only ever
+        # moves DOWN within a run, and never below the operator's own --threads
+        # value -- so unlike the delay floor this ratchet cannot leave the job
+        # slower than it was configured to be, and needs no release valve.
+        self._ceiling = None
 
     def set_floor_base(self, ms):
         """Move the baseline the floor decays back to.
@@ -1294,12 +1318,80 @@ class Regulator(threading.Thread):
             raise ValueError("query returned %r" % v)
         return v
 
+    # -- thread adaptivity ----------------------------------------------------
+    def _thread_base(self):
+        """Never drop the ceiling below what the operator asked for."""
+        return max(1, int(getattr(self.args, "threads", 1) or 1))
+
+    def _thread_ceiling(self):
+        """Current ceiling, or 0 when thread adaptivity is switched off."""
+        mx = int(getattr(self.args, "regulate_max_threads", 0) or 0)
+        if mx <= 0:
+            return 0
+        if self._ceiling is None or self._ceiling > mx:
+            self._ceiling = mx
+        return max(self._ceiling, self._thread_base())
+
+    def _lower_ceiling(self, level):
+        """A pause at `level` threads is evidence `level` is too many here.
+
+        Without this the regulator would climb straight back to the count that
+        just caused a pause, pause again, and oscillate. Lowering the ceiling
+        below that level makes each pause cost one step of future ambition.
+        """
+        if int(getattr(self.args, "regulate_max_threads", 0) or 0) <= 0:
+            return
+        base = self._thread_base()
+        new = max(level - 1, base)
+        cur = self._thread_ceiling()
+        if new < cur:
+            self._ceiling = new
+            logging.warning(
+                "Regulator: thread ceiling %d -> %d after pausing at %d threads",
+                cur, new, level)
+
+    def _maybe_raise_threads(self, lat):
+        """Add one thread, but only once the cheaper knob is exhausted.
+
+        Ordering matters. File delay and thread count both change MDS load, so
+        moving both in the same interval makes the next sample unattributable.
+        The delay is eased first and this runs only when the delay has already
+        reached its floor -- the point at which the regulator otherwise has no
+        way left to turn spare headroom into throughput.
+
+        Raising is deliberately slower to decide than shedding, because the two
+        are not symmetric in effect: DynamicSemaphore hands out a new permit to
+        a waiting worker within its 0.5 s poll, while a REDUCTION only takes
+        hold as workers finish their current file and fail to re-acquire. Acting
+        late on the way up costs one quiet interval; acting late on the way down
+        costs however long the in-flight copies run.
+        """
+        ceil = self._thread_ceiling()
+        if not ceil:
+            return
+        cur = thread_count.limit
+        if cur <= 0 or cur >= ceil:
+            return
+        if file_delay_ms > self.floor_ms:
+            return
+        # "Not paused" is not the same as "has headroom": climb only while the
+        # measurement is under the soft target, not merely under the pause line.
+        if lat >= self.args.regulate_slo_ms:
+            return
+        thread_count.set_limit(cur + 1)
+        _update_proctitle()
+        logging.info(
+            "Regulator: %.1f ms is under the %.0f ms target and the delay is at "
+            "its %dms floor -- threads %d -> %d (ceiling %d)",
+            lat, self.args.regulate_slo_ms, self.floor_ms, cur, cur + 1, ceil)
+
     # -- actions --------------------------------------------------------------
     def _pause(self, lat):
         global file_delay_ms
         extra = self._note_pause()
         if thread_count.limit > 0:
             self._paused_threads = thread_count.limit
+            self._lower_ceiling(thread_count.limit)
             thread_count.set_limit(0)
             logging.warning(
                 "Regulator: PAUSE at %.1f ms (%.0f%% of the %.0f ms target) -- "
@@ -1309,8 +1401,16 @@ class Regulator(threading.Thread):
 
     def _resume(self):
         if thread_count.limit == 0 and self._paused_threads:
-            thread_count.set_limit(self._paused_threads)
-            logging.info("Regulator: resumed, threads 0 -> %d", self._paused_threads)
+            want = self._paused_threads
+            ceil = self._thread_ceiling()
+            if ceil and want > ceil:
+                thread_count.set_limit(ceil)
+                logging.info(
+                    "Regulator: resumed, threads 0 -> %d (held under the %d it "
+                    "paused at by the learned ceiling)", ceil, want)
+            else:
+                thread_count.set_limit(want)
+                logging.info("Regulator: resumed, threads 0 -> %d", want)
             self._paused_threads = None
 
     def _ease(self):
@@ -1379,6 +1479,9 @@ class Regulator(threading.Thread):
                 if self._quiet >= int(self.args.regulate_quiet_ticks):
                     self._quiet = 0
                     self._ease()
+                    # _ease() is a no-op once the delay is at its floor, which
+                    # is exactly when this can act; they never both fire.
+                    self._maybe_raise_threads(lat)
             do_exit.wait(period)
 
 
@@ -2718,6 +2821,14 @@ def main():
     parser.add_argument(
         "--regulate-quiet-ticks", type=int, default=REG_QUIET_TICKS_DEFAULT, metavar="N",
         help="Consecutive clean samples before easing the delay (default 10).",
+    )
+    parser.add_argument(
+        "--regulate-max-threads", type=int, default=REG_MAX_THREADS_DEFAULT,
+        metavar="N",
+        help="Ceiling for regulator-driven thread increases (default 0 = never "
+             "change the thread count). The regulator adds at most one thread "
+             "per quiet interval, and only after the file delay has already "
+             "decayed to its floor.",
     )
     parser.add_argument(
         "--source-pool",
