@@ -12,7 +12,7 @@ import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
 import threading, uuid, argparse
 
-_VERSION = "2061"
+_VERSION = "2062"
 
 # Replacing a file must be serialized against another worker replacing the
 # SAME file -- that is the only invariant here. A single global lock also
@@ -1197,6 +1197,7 @@ REG_FLOOR_CAP_MS = 2000
 # the job stays throttled long after the cause has gone.
 REG_FLOOR_DECAY_S = 1800
 REG_ERR_QUIET_S = 600          # rate-limit repeated query failures to one line
+REG_TIGHTEN_CAP_MS = 200       # bound on the soft-band file-delay climb
 
 
 def _mds_namespace_for(path):
@@ -1290,11 +1291,15 @@ class Regulator(threading.Thread):
         self._quiet = 0
         self._last_err = 0.0
         self._paused_threads = None
-        # Learned ceiling for regulator-driven thread increases. It only ever
-        # moves DOWN within a run, and never below the operator's own --threads
-        # value -- so unlike the delay floor this ratchet cannot leave the job
-        # slower than it was configured to be, and needs no release valve.
+        # Learned ceiling for regulator-driven thread increases. A pause
+        # lowers it and it never falls below the operator's own --threads
+        # value. It moves UP only when the operator raises
+        # regulate_max_threads, which _thread_ceiling treats as an explicit
+        # instruction -- see there for why that matters.
         self._ceiling = None
+        # The regulate_max_threads value this ceiling was last reconciled
+        # against, so a live change to it can be told from a steady state.
+        self._cfg_max = None
 
     def set_floor_base(self, ms):
         """Move the baseline the floor decays back to.
@@ -1329,10 +1334,40 @@ class Regulator(threading.Thread):
         return max(1, int(getattr(self.args, "threads", 1) or 1))
 
     def _thread_ceiling(self):
-        """Current ceiling, or 0 when thread adaptivity is switched off."""
+        """Current ceiling, or 0 when thread adaptivity is switched off.
+
+        regulate_max_threads is a live tunable, and it used to be a one-way
+        one: this clamped the ceiling DOWN toward it and never up, so raising
+        it on a job that had already climbed to its ceiling did nothing at all
+        and gave no hint why. Measured on a drain sitting at 6 threads
+        with MDS reply latency at 0.3 ms against a 51 ms target -- there was
+        two orders of magnitude of headroom and no supported way to use it
+        short of SIGUSR1.
+
+        An operator moving the configured maximum is an explicit instruction,
+        so it wins over a ceiling this regulator earned by pausing. Pause
+        evidence is still respected between such changes.
+
+        This is the single reconciliation point for regulate_max_threads.
+        _lower_ceiling() reads the raw option to decide whether adaptivity is
+        on at all, but the ceiling itself is only ever moved here, so a live
+        change is noticed exactly once however many callers observe it.
+        """
         mx = int(getattr(self.args, "regulate_max_threads", 0) or 0)
         if mx <= 0:
             return 0
+        if self._cfg_max is None:
+            self._cfg_max = mx
+        elif mx != self._cfg_max:
+            # _ceiling is None only if the very first call here already sees a
+            # changed mx, which the seeding above normally prevents; report the
+            # effective ceiling rather than the word "None".
+            logging.info(
+                "Regulator: configured max threads %d -> %d, ceiling %d -> %d",
+                self._cfg_max, mx,
+                self._ceiling if self._ceiling is not None else mx, mx)
+            self._cfg_max = mx
+            self._ceiling = mx
         if self._ceiling is None or self._ceiling > mx:
             self._ceiling = mx
         return max(self._ceiling, self._thread_base())
@@ -1430,6 +1465,56 @@ class Regulator(threading.Thread):
             logging.info("Regulator: quiet, file delay %dms -> %dms (floor %dms)",
                          old, new, self.floor_ms)
 
+    def _tighten(self, lat):
+        """Give a step back while latency sits above the soft target.
+
+        Mirror of _ease(). The cheap knob moves first -- raise the file delay
+        -- and concurrency is only surrendered once the delay has climbed back
+        to what the operator configured OR to REG_TIGHTEN_CAP_MS, whichever is
+        lower, so a brief excursion does not cost a thread that takes
+        quiet_ticks periods to earn back. With a configured delay above the cap
+        the delay stops at the cap and shedding starts there; it is a bound on
+        how long this will sit on the cheap knob, not a promise to restore an
+        arbitrarily large delay first.
+
+        A job configured with no file delay and no floor has want == 0, so
+        there is no cheap knob to exhaust and the first soft-band tick sheds a
+        thread. That is intended.
+
+        A floor at or above REG_TIGHTEN_CAP_MS collapses the cheap-knob phase
+        the same way. _note_pause() ratchets the floor up on repeated pauses,
+        as far as REG_FLOOR_CAP_MS, and _ease() will not take the delay below
+        it -- so a job that has been pausing enough to walk its floor past the
+        cap arrives here already above the climb guard and sheds on the first
+        soft-band tick. Also intended: the delay is at its floor, the cheap
+        knob really is exhausted, and concurrency is the only lever left.
+        """
+        global file_delay_ms
+        want = max(int(getattr(self.args, "file_delay", 0) or 0), self.floor_ms)
+        old = file_delay_ms
+        if old < min(want, REG_TIGHTEN_CAP_MS):
+            new = min(_delay_up(old), want, REG_TIGHTEN_CAP_MS)
+            if new != old:
+                file_delay_ms = new
+                _update_proctitle()
+                logging.info(
+                    "Regulator: %.1f ms is over the %.0f ms target -- file "
+                    "delay %dms -> %dms", lat, self.args.regulate_slo_ms,
+                    old, new)
+                return
+        cur = thread_count.limit
+        if cur <= self._thread_base():
+            return
+        thread_count.set_limit(cur - 1)
+        # Treat this the same as a pause for ceiling purposes, so the next
+        # quiet spell does not climb straight back into the same latency.
+        self._lower_ceiling(cur)
+        _update_proctitle()
+        logging.warning(
+            "Regulator: %.1f ms is over the %.0f ms target with the delay at "
+            "%dms -- threads %d -> %d", lat, self.args.regulate_slo_ms,
+            file_delay_ms, cur, cur - 1)
+
     def _note_pause(self):
         now = time.time()
         self._pauses = [t for t in self._pauses if now - t < REG_PAUSE_WINDOW_S] + [now]
@@ -1477,6 +1562,15 @@ class Regulator(threading.Thread):
             if lat >= self.args.regulate_pause_ms:
                 self._quiet = 0
                 self._pause(lat)
+            elif lat >= self.args.regulate_slo_ms:
+                # Between the soft target and the pause line the regulator had
+                # nothing to say. Worse, "not paused" counted as quiet, so it
+                # kept easing the delay DOWN while latency was already past
+                # the target it is supposed to defend, and the only protection
+                # left was the pause cliff. Back off a step instead.
+                self._quiet = 0
+                self._resume()
+                self._tighten(lat)
             else:
                 self._resume()
                 self._maybe_decay_floor()
