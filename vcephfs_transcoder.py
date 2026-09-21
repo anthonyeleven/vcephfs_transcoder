@@ -176,12 +176,12 @@ CONFIG_DIR = os.path.expanduser("~")
 # --prune-dir-regex to replace the set, or --prune-dir-regex '' to disable
 # pruning entirely. The effective pattern is logged at startup either way.
 #
-# Measured on one production volume: 86.5% of files sat inside virtualenvs, and
-# the largest of 585,309 of them is 503,423 bytes -- below the 512,000 byte
-# threshold, so nothing eligible is lost. Another volume spent 22 days at 1.17%
-# of its files grinding a Bazel .runfiles tree carrying a pip site-packages copy
-# of the awscli examples directory. A third's zero-yield stretch was inside
-# renv/packrat R package libraries.
+# Measured in production: 86.5% of files under the two largest volumes sit inside
+# virtualenvs, and the largest of 585,309 of them is 503,423 bytes -- below the
+# 512,000 byte threshold, so nothing eligible is lost. csa spent 22 days at
+# 1.17% of its volume grinding a Bazel .runfiles tree carrying a pip
+# site-packages copy of the awscli examples directory. gard4's zero-yield
+# stretch was inside renv/packrat R package libraries.
 #
 # Anchored to whole names: 'venv' prunes a directory called venv, not one
 # called conventions.
@@ -721,6 +721,11 @@ def parse_optional_max_size(s):
 def validate_size_bounds(min_size, max_size):
     if max_size is not None and max_size < min_size:
         raise ValueError("--max-size must be greater than or equal to --min-size")
+
+
+def validate_path_source(paths_from, paths_from_pool):
+    if paths_from and paths_from_pool:
+        raise ValueError("--paths-from and --paths-from-pool are mutually exclusive")
 
 
 def validate_age_bounds(min_age):
@@ -2010,6 +2015,441 @@ def _under_roots(path, roots):
                for r in roots)
 
 
+# ---------------------------------------------------------------------------
+# --paths-from-pool: read the candidate list out of a RADOS pool
+#
+# The walk prunes machine-generated directories by default, which is what makes
+# it affordable -- on some volumes 86.5% of files are inside virtualenvs -- but
+# it means those files are never moved, so a pool being drained never empties
+# and cannot be deleted. Reading the pool directly costs no MDS walk at all and
+# is proportional to what is LEFT rather than to the size of the tree. Measured
+# on a 44 TiB pool: 4,074 files/s enumerating versus 0.23 files/s walking.
+#
+# Only the first object of a file, "<ino-hex>.00000000", carries the `parent`
+# xattr, so this is one read per FILE rather than per object, and the backtrace
+# holds the whole ancestry -- no per-level lookups. The MDS creates that object
+# explicitly to store the backtrace (CInode.cc, op.create(false) before
+# op.setxattr("parent", ...)), so sparse files with no data at offset 0 and
+# zero-length files both still have one.
+#
+# Object naming lives above erasure coding: it is computed by the client-side
+# striper purely from file_layout_t, and src/osdc/Striper.cc contains no EC
+# references at all. Optimized/"fast" EC operates on the shards inside an
+# already-named object, so none of this is affected by it.
+#
+# RENAME STALENESS -- the important caveat. Pointing the volume root at another
+# pool freezes the pool's MEMBERSHIP: nothing new enters it. It does NOT freeze
+# PATHS. A rename marks the inode STATE_DIRTYPARENT and the corrected backtrace
+# is written only when the log segment holding that rename expires
+# (LogSegment::try_to_expire walks dirty_parent_inodes calling store_backtrace).
+# Until then the object still names the pre-rename path, this reads that stale
+# path, the file is not there, and it is counted "vanished" -- while the file is
+# alive under its new name and still in the pool. So a single enumeration is NOT
+# final even on a frozen pool.
+#
+# It converges by RE-ENUMERATION once the MDS has trimmed its journal, and
+# `ceph tell mds.<daemon> flush journal` forces that rather than waiting. For
+# the last few objects in a pool, `ceph tell mds.<daemon> dump inode <ino>`
+# returns the live path authoritatively; that is too costly per inode at scale
+# and exactly right for closing a pool out.
+# ---------------------------------------------------------------------------
+
+BACKTRACE_XATTR = "parent"
+
+# Cap on the distinct-inode set used by the end-of-listing cross-check.
+# Measured cost is ~66 bytes per entry, so 50M entries is ~3.3 GB; a
+# 665M-object pool would need ~44 GB. Past the cap the set is dropped and
+# the cross-check is reported as skipped rather than exhausting memory.
+INODE_TRACK_MAX = 50_000_000
+
+
+class BacktraceError(Exception):
+    """A backtrace that could not be decoded. Raised, never guessed around: a
+    decoder that always returns something yields plausible WRONG paths."""
+
+
+def decode_backtrace(blob):
+    """Decode an inode_backtrace_t. Returns (ino, [dname ...] root-first, pool).
+
+        u8 struct_v  u8 compat_v  u32 payload_len
+        u64 ino
+        u32 n_ancestors
+          each inode_backpointer_t:
+            u8 struct_v  u8 compat_v  u32 payload_len
+            u64 dirino   u32 dname_len  bytes dname   u64 version
+        s64 pool        u32 n_old_pools   repeated s64
+
+    Ancestors are child-first, so the result is reversed. compat_v is honored
+    rather than ignored: if the encoder says we need a newer decoder than we
+    are, refuse instead of misparsing.
+    """
+    import struct
+
+    # Highest inode_backtrace_t encoding this decoder understands.
+    SUPPORTED = 5
+    # inode_backpointer_t carries its own version, which can move
+    # independently of the enclosing backtrace.
+    SUPPORTED_BACKPOINTER = 2
+    off = 0
+
+    def u8():
+        nonlocal off
+        v = blob[off]
+        off += 1
+        return v
+
+    def fixed(fmt, n):
+        nonlocal off
+        v = struct.unpack_from(fmt, blob, off)[0]
+        off += n
+        return v
+
+    try:
+        struct_v, compat_v = u8(), u8()
+        if compat_v > SUPPORTED:
+            raise BacktraceError(
+                "encoded with compat_v %d; this decoder understands %d. Refusing "
+                "rather than risk a wrong path." % (compat_v, SUPPORTED))
+        if not 1 <= struct_v <= 16:
+            raise BacktraceError("implausible struct_v %d" % struct_v)
+        fixed("<I", 4)                      # payload length, unused
+        ino = fixed("<Q", 8)
+
+        names = []
+        n = fixed("<I", 4)
+        if n > 4096:
+            raise BacktraceError("implausible ancestor count %d" % n)
+        for _ in range(n):
+            bp_v, bp_compat = u8(), u8()
+            if bp_compat > SUPPORTED_BACKPOINTER:
+                raise BacktraceError(
+                    "backpointer encoded with compat_v %d; this decoder "
+                    "understands %d" % (bp_compat, SUPPORTED_BACKPOINTER))
+            if not 1 <= bp_v <= 16:
+                raise BacktraceError("implausible backpointer struct_v %d" % bp_v)
+            fixed("<I", 4)                  # backpointer payload length
+            fixed("<Q", 8)                  # dirino -- ancestry is by name
+            ln = fixed("<I", 4)
+            if ln > 4096:
+                raise BacktraceError("implausible dname length %d" % ln)
+            # A slice past the end truncates silently, so check explicitly
+            # instead of leaving the next field's unpack to catch it.
+            if off + ln > len(blob):
+                raise BacktraceError(
+                    "dname of %d bytes runs past the end of a %d byte backtrace"
+                    % (ln, len(blob)))
+            names.append(blob[off:off + ln])
+            off += ln
+            fixed("<Q", 8)                  # version
+
+        pool = fixed("<q", 8)
+        return ino, list(reversed(names)), pool
+    except BacktraceError:
+        raise
+    except (IndexError, struct.error) as e:
+        raise BacktraceError(str(e)) from e
+
+
+def _findmnt(field, path):
+    """One findmnt field, or "" when findmnt is unusable.
+
+    A minimal container image may not ship util-linux, in which case
+    subprocess.run raises FileNotFoundError. Callers want the curated error
+    about how to reach the cluster, not a traceback.
+    """
+    import subprocess
+    try:
+        r = subprocess.run(["findmnt", "-no", field, "--target", path],
+                           capture_output=True, text=True)
+    except OSError as e:
+        logging.debug("findmnt %s unavailable: %s", field, e)
+        return ""
+    if r.returncode != 0:
+        logging.debug("findmnt %s on %s failed: %s", field, path, r.stderr.strip())
+        return ""
+    return r.stdout.strip()
+
+
+def _ceph_connect_args(explicit, sample_path, mon_host=None):
+    """Work out how to reach the cluster, for package AND containerized hosts.
+
+    A missing /etc/ceph/ceph.conf is normal, not exceptional: containerized
+    (cephadm) deployments keep host packages and config minimal, and a host
+    attached to several clusters has only per-cluster files. So try, in order:
+    the explicit flag, CEPH_CONF, the conventional path, a single *.conf, and
+    finally mon addresses recovered from the mount itself -- a kernel CephFS
+    mount names its monitors in the mount source.
+
+    Returns (conffile, conf_overrides) for rados.Rados().
+    """
+    import glob
+    # Explicit monitors win outright: an operator who supplied them must not be
+    # refused by the discovery chain below, which can SystemExit.
+    if mon_host:
+        return "", {"mon_host": mon_host}
+    if explicit:
+        return explicit, {}
+    env = os.environ.get("CEPH_CONF")
+    if env:
+        return env, {}
+    if os.path.exists("/etc/ceph/ceph.conf"):
+        return "/etc/ceph/ceph.conf", {}
+    found = sorted(glob.glob("/etc/ceph/*.conf"))
+    if len(found) == 1:
+        return found[0], {}
+
+    # No usable file. A kernel mount source looks like
+    # "10.0.0.1:6789,10.0.0.2:6789:/sub" (or "name@fsid.fs=/sub", which carries
+    # no addresses). Recover mon_host from the address form if we can.
+    src = _findmnt("SOURCE", sample_path)
+    head = src.rsplit(":/", 1)[0] if ":/" in src else ""
+    mons = [a for a in head.split(",") if a and (a[0].isdigit() or a.startswith("["))]
+    if mons:
+        logging.info("no usable ceph.conf; using mon_host recovered from the mount: %s",
+                     ",".join(mons))
+        return "", {"mon_host": ",".join(mons)}
+
+    raise SystemExit(
+        "--paths-from-pool: cannot reach the cluster. No --rados-conffile, no "
+        "CEPH_CONF, no /etc/ceph/ceph.conf, %d candidates in /etc/ceph (%s), and no "
+        "monitor addresses in the mount source (%r -- cephadm-style sources do not "
+        "carry them). Pass --rados-conffile, or --rados-mon-host." % (
+            len(found), ", ".join(map(os.path.basename, found)) or "none", src)
+        + " Authentication may additionally need --rados-keyring/--rados-name.")
+
+
+def _mount_ancestry_prefix(path):
+    """Where a backtrace's ancestry is rooted, as an absolute local path.
+
+    A backtrace names the ancestry from the FILESYSTEM root. If the mount is at
+    the fs root the local path is just mountpoint + ancestry; if it is a subtree
+    mount, the leading ancestry components are already inside the mountpoint and
+    must not be repeated. Both shapes exist in the wild, so this is derived from
+    the mount rather than assumed, and the caller then verifies by stat.
+
+    Returns (mountpoint, subtree) where subtree is the fs-relative path the
+    mountpoint corresponds to ("/" for a root mount).
+    """
+    mp = _findmnt("TARGET", path)
+    src = _findmnt("SOURCE", path)
+    if not mp:
+        raise SystemExit("--paths-from-pool: %s is not on a mounted filesystem" % path)
+    # Kernel client sources look like "<mons>:/subtree" or
+    # "user@fsid.fsname=/subtree"; the fs-relative subtree is after the last
+    # ':' or '=' that is followed by a slash.
+    subtree = "/"
+    for sep in ("=", ":"):
+        i = src.rfind(sep + "/")
+        if i >= 0:
+            subtree = src[i + len(sep):]
+            break
+    return mp, (subtree or "/")
+
+
+
+def _path_source(args, roots):
+    """The candidate paths, from a list file or straight out of a pool."""
+    if args.paths_from_pool:
+        return _iter_pool_paths(args, roots)
+    return _iter_listed_paths(args.paths_from)
+
+
+def _prefix_error(checked, example):
+    """Message for "every derived path is missing".
+
+    Two causes, and they cannot be told apart from here, so name both: a wrong
+    ancestry prefix (the subtree-vs-root mount case) or a pool holding only
+    objects whose files have since been deleted. Either way, transcoding
+    nothing while reporting a clean pass is the wrong outcome.
+    """
+    return ("--paths-from-pool: none of the %d sampled derived paths exist (e.g. %s). "
+            "Either the ancestry prefix is wrong for this mount -- check whether it "
+            "is a subtree mount -- or every remaining object belongs to an "
+            "already-deleted file. Refusing rather than reporting a clean pass "
+            "that moved nothing." % (checked, example))
+
+
+def _iter_pool_paths(args, roots):
+    """Yield the CephFS path of every file currently in args.paths_from_pool.
+
+    Guards, in order, because each one is a way this silently produces a wrong
+    or incomplete list:
+
+      * the bindings may be absent -- name the PACKAGE, not the module
+      * the pool must not still be the volume's default write target, or the
+        drain cannot converge and the list is stale the moment it is made
+      * snapshots pin objects, so a snapshotted pool can never reach empty
+      * every inode with objects must have a bno-0 object carrying the
+        backtrace. That is what the MDS does today; asserting it at runtime
+        means a future change is caught rather than silently dropping files
+      * the derived path prefix must actually resolve, or the whole list is
+        phantom paths that get counted as "vanished"
+    """
+    try:
+        import rados
+    except ImportError as e:
+        raise SystemExit(
+            "--paths-from-pool needs the RADOS Python bindings ('import rados'), "
+            "which are missing.\n"
+            "  RPM  : dnf install python3-rados\n"
+            "  deb  : apt install python3-rados\n"
+            "  pip  : only where your distribution publishes the bindings that way "
+            "-- they wrap librados, so a pip install without librados present will "
+            "not work.\n"
+            "They also arrive as a dependency of ceph-common, which a host using a "
+            "kernel CephFS mount does not otherwise require.\n"
+            "Import error: %s" % e)
+
+    pool = args.paths_from_pool
+    conffile, conf_over = _ceph_connect_args(args.rados_conffile, roots[0],
+                                             args.rados_mon_host)
+
+    for r in roots:
+        try:
+            cur = os.getxattr(r, "ceph.dir.layout.pool").decode()
+        except OSError:
+            continue
+        if cur == pool:
+            raise SystemExit(
+                "--paths-from-pool %s is still the default write target of %s. New "
+                "files keep landing in it, so a drain cannot converge and the list "
+                "would be stale immediately. Repoint ceph.dir.layout.pool first."
+                % (pool, r))
+        snapdir = os.path.join(r, ".snap")
+        try:
+            snaps = [e for e in os.listdir(snapdir) if not e.startswith("_")]
+        except OSError:
+            snaps = []
+        if snaps:
+            logging.warning(
+                "%s has %d snapshot(s); snapshots pin objects, so %s may not reach "
+                "zero objects however complete this pass is", r, len(snaps), pool)
+
+    mp, subtree = _mount_ancestry_prefix(roots[0])
+    strip = [c for c in subtree.strip("/").split("/") if c]
+    logging.info("--paths-from-pool %s: conf %s, mount %s, fs subtree %s",
+                 pool, conffile, mp, subtree)
+
+    conf = dict(conf_over)
+    if args.rados_keyring:
+        conf["keyring"] = args.rados_keyring
+    cluster = rados.Rados(conffile=conffile, conf=conf,
+                          name=args.rados_name or "client.admin")
+    cluster.connect()
+    try:
+        ioctx = cluster.open_ioctx(pool)
+    except Exception as e:
+        cluster.shutdown()
+        raise SystemExit("--paths-from-pool: cannot open pool %s: %s" % (pool, e))
+
+    inodes_seen = set()
+    last_unresolved = None
+    first_objs = 0
+    unusable = 0
+    yielded = 0
+    checked = 0
+    resolved = 0
+    # The inode cross-check below is only meaningful after a COMPLETE listing.
+    # Stop early -- a break in the consumer, --max-files, an exception -- and
+    # stripe objects whose bno-0 object had not been reached yet look like
+    # inodes with no backtrace, which is a false alarm.
+    complete = False
+    try:
+        for obj in ioctx.list_objects():
+            key = obj.key
+            ino_s, _, bno_s = key.partition(".")
+            if not bno_s:
+                continue
+            try:
+                ino = int(ino_s, 16)
+                bno = int(bno_s, 16)      # integer, not a string suffix match
+            except ValueError:
+                continue
+            if inodes_seen is not None:
+                inodes_seen.add(ino)
+                if len(inodes_seen) > INODE_TRACK_MAX:
+                    logging.warning(
+                        "more than %d distinct inodes; dropping the inode set and "
+                        "skipping the bno-0 cross-check to bound memory",
+                        INODE_TRACK_MAX)
+                    inodes_seen = None
+            if bno != 0:
+                continue
+            first_objs += 1
+            try:
+                blob = ioctx.get_xattr(key, BACKTRACE_XATTR)
+            except rados.NoData:
+                logging.warning("%s has no %s xattr; skipping", key, BACKTRACE_XATTR)
+                unusable += 1
+                continue
+            try:
+                bt_ino, names, _pool = decode_backtrace(blob)
+            except BacktraceError as e:
+                logging.error("%s: undecodable backtrace: %s", key, e)
+                unusable += 1
+                continue
+            # The object name already carries the inode, so comparing it against
+            # the decoded one is a free corruption check: a backtrace that
+            # decodes cleanly but belongs to a different inode would otherwise
+            # contribute someone else's path.
+            if bt_ino != ino:
+                logging.error(
+                    "%s: backtrace is for inode 0x%x, not 0x%x -- skipping",
+                    key, bt_ino, ino)
+                unusable += 1
+                continue
+            if not names:
+                continue
+            rel = [n.decode("utf-8", "surrogateescape") for n in names]
+            if strip and rel[:len(strip)] == strip:
+                rel = rel[len(strip):]
+            path = os.path.join(mp, *rel) if rel else mp
+            # Verify the derived prefix on the first handful rather than
+            # emitting a whole list of paths that do not exist.
+            if checked < 64:
+                checked += 1
+                exists = os.path.lexists(path)
+                if exists:
+                    resolved += 1
+                else:
+                    last_unresolved = path
+                if checked == 64 and resolved == 0:
+                    raise SystemExit(_prefix_error(checked, path))
+            yielded += 1
+            yield path
+        # Evaluate the prefix guard again at end of listing. Gating it solely on
+        # reaching 64 samples meant a pool with fewer candidates than that never
+        # reached the abort -- and that is the near-empty pool a drain converges
+        # toward, so the guard was weakest exactly where it matters most.
+        if checked > 0 and resolved == 0:
+            raise SystemExit(_prefix_error(checked, last_unresolved))
+        complete = True
+    finally:
+        missing = (len(inodes_seen) - first_objs) if inodes_seen is not None else 0
+        if complete and inodes_seen is None:
+            logging.warning(
+                "bno-0 cross-check skipped: more than %d distinct inodes",
+                INODE_TRACK_MAX)
+        if complete and missing > 0:
+            logging.error(
+                "%d inode(s) in %s have objects but no .00000000 object: no "
+                "backtrace, no path, not in this list. Pool will not reach zero.",
+                missing, pool)
+        if complete and unusable > 0:
+            logging.error(
+                "%d inode(s) in %s have a .00000000 object whose backtrace could "
+                "not be used (absent, undecodable, or for a different inode): no "
+                "path was emitted for them and they will hold the pool above zero.",
+                unusable, pool)
+        logging.info(
+            "--paths-from-pool %s: %d inodes, %d bno-0 objects (%d unusable), "
+            "%d paths emitted, %d/%d sampled paths resolved%s",
+            pool, len(inodes_seen) if inodes_seen is not None else -1,
+            first_objs, unusable, yielded, resolved, checked,
+            "" if complete else " (listing stopped early; counts are partial)")
+        ioctx.close()
+        cluster.shutdown()
+
 def _iter_listed_paths(src):
     """Yield paths from a --paths-from source, streaming.
 
@@ -2071,7 +2511,7 @@ def process_paths(args, hard_links, executor, dir_layouts, roots):
     last_progress = time.monotonic()
     outside_logged = 0
 
-    for filepath in _iter_listed_paths(args.paths_from):
+    for filepath in _path_source(args, roots):
         if do_exit.is_set() or _limit_reached():
             return
 
@@ -2495,7 +2935,7 @@ def process_files(args):
         with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
             tmpdir_dev = os.stat(args.tmpdir).st_dev
 
-            if args.paths_from:
+            if args.paths_from or args.paths_from_pool:
                 roots = []
                 for start_dir in args.dirs:
                     start_dir = os.path.abspath(start_dir)
@@ -2516,7 +2956,7 @@ def process_files(args):
                             "%s has no effect with --paths-from: it prunes the walk, "
                             "and the list replaces the walk", opt)
                 logging.info("Processing the list in %s, under %s",
-                             args.paths_from, ", ".join(roots))
+                             args.paths_from_pool or args.paths_from, ", ".join(roots))
                 process_paths(args, hard_links, executor, dir_layouts, roots)
                 return
 
@@ -2648,6 +3088,38 @@ def main():
     )
     parser.add_argument("dirs", help="Directories to scan", nargs="*")
     parser.add_argument(
+        "--paths-from-pool", metavar="POOL",
+        help="Transcode exactly the files that are currently in POOL, discovered "
+             "by reading the pool itself instead of walking the tree. Costs no MDS "
+             "walk and is proportional to what is left in the pool rather than to "
+             "the size of the filesystem. POOL must no longer be the default write "
+             "target of the directories given, or the set keeps growing and the "
+             "drain cannot converge; that is checked and refused. Needs the RADOS "
+             "Python bindings. Mutually exclusive with --paths-from. NOTE: a file "
+             "renamed after the listing keeps its old backtrace until the MDS "
+             "trims the log segment holding the rename, so it is read at a stale "
+             "path and counted vanished while still occupying the pool. One pass "
+             "is therefore not final: re-run to converge, and "
+             "'ceph tell mds.<daemon> flush journal' forces the backtrace writes "
+             "instead of waiting for them.")
+    parser.add_argument(
+        "--rados-conffile", metavar="PATH",
+        help="ceph.conf for --paths-from-pool. Default: $CEPH_CONF, then "
+             "/etc/ceph/ceph.conf, then a single /etc/ceph/*.conf, then monitor "
+             "addresses recovered from the mount. Containerized hosts often have "
+             "no ceph.conf at all, hence the fallbacks.")
+    parser.add_argument(
+        "--rados-mon-host", metavar="ADDRS",
+        help="Comma-separated monitor addresses for --paths-from-pool, used "
+             "instead of a conffile.")
+    parser.add_argument(
+        "--rados-keyring", metavar="PATH",
+        help="Keyring for --paths-from-pool. Default: whatever the conffile says.")
+    parser.add_argument(
+        "--rados-name", metavar="NAME", default=None,
+        help="RADOS client name for --paths-from-pool (default client.admin). "
+             "Needs read access to the pool and to its objects' xattrs.")
+    parser.add_argument(
         "--paths-from", metavar="FILE",
         help="Transcode exactly the files listed in FILE ('-' for stdin) instead "
              "of walking the directories. NUL- or newline-delimited, detected "
@@ -2769,8 +3241,7 @@ def main():
         action="store_true",
         default=True,
         help="Disable use of copy_file_range and always use userspace copy. "
-             "DEFAULT since 2026-09-05: a 15-thread A/B on a production "
-             "volume measured "
+             "DEFAULT since 2026-09-05: a 15-thread A/B measured "
              "copy_file_range no faster overall (154.0 vs 170.1 MiB/s) and "
              "1.3-2.1x SLOWER for files under 1 MiB, which is the size range "
              "these jobs now work in.",
@@ -2930,6 +3401,11 @@ def main():
     except ValueError as e:
         parser.error(str(e))
 
+    try:
+        validate_path_source(args.paths_from, args.paths_from_pool)
+    except ValueError as e:
+        parser.error(str(e))
+
     thread_count = DynamicSemaphore(args.threads)
 
     # None means "not given" -> apply the default set. An explicitly empty
@@ -3041,8 +3517,8 @@ def main():
     #
     # Two distinct failures if it does. First, every file whose target is that
     # pool becomes a no-op that still pays a full data rewrite -- the exact
-    # churn that burned 41 TiB of already-EC data in one incident. Second, and
-    # worse, a silently failed apply_file() stops being detectable: the temp file
+    # churn that burned 41 TiB of already-EC data on one volume. Second, and worse,
+    # a silently failed apply_file() stops being detectable: the temp file
     # inherits the target pool from the tmpdir, so a broken layout call still
     # produces a correct-looking result and the bug ships.
     #

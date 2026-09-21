@@ -14,7 +14,6 @@ import threading
 import time
 import unittest
 
-# The script under test lives at the repository root.
 HERE = os.path.dirname(os.path.abspath(__file__))
 TARGET = os.path.join(HERE, "..", "vcephfs_transcoder.py")
 spec = importlib.util.spec_from_file_location("vct", os.path.abspath(TARGET))
@@ -82,8 +81,8 @@ class ReplaceLockStriping(unittest.TestCase):
     """Per-path exclusion must survive; unrelated paths must not serialize."""
 
     def test_same_path_same_lock(self):
-        a = vct._replace_lock_for("/vol/a/b/c.gz")
-        b = vct._replace_lock_for("/vol/a/b/c.gz")
+        a = vct._replace_lock_for("/shared/ceph/myvol/a/b/c.gz")
+        b = vct._replace_lock_for("/shared/ceph/myvol/a/b/c.gz")
         self.assertIs(a, b)
 
     def test_same_path_mutually_excludes(self):
@@ -293,7 +292,8 @@ class RegulatorVolume(unittest.TestCase):
 
         re.escape() alone gives a\\.b, and inside a PromQL double-quoted string
         that is "unknown escape sequence U+002E" -- an HTTP 400 at every poll,
-        so the regulator silently never comes up.
+        so the regulator silently never comes up. Observed on all three
+        production jobs 2026-09-06.
         """
         real = vct._mds_namespace_for
         vct._mds_namespace_for = lambda d: "a.b"
@@ -334,8 +334,8 @@ class RegulatorAutofs(unittest.TestCase):
     """Mount-point name != filesystem name, and the mount may not exist yet."""
 
     def test_reads_mds_namespace_not_the_path(self):
-        """On the real fleet, several distinct mount points can live on one
-        filesystem, and a mount point can differ from its filesystem name. Deriving the
+        """On the real fleet, mount points feeds2/pits/feeds3 all live on the
+        filesystem named 'feeds', and eartheq lives on 'eartheq2'. Deriving the
         name from the path would query a filesystem that does not exist."""
         src = open(os.path.abspath(TARGET)).read()
         self.assertIn("mds_namespace=", src)
