@@ -744,5 +744,319 @@ class ThreadAdaptivity(unittest.TestCase):
         self.assertIn("regulate_max_threads", vct.RuntimeConfig.KEYS)
 
 
+
+class ThreadCeilingFollowsConfig(unittest.TestCase):
+    """regulate_max_threads must work in both directions.
+
+    It is advertised as a live tunable, but the clamp only ever moved the
+    ceiling DOWN toward it. On a job that had already climbed to its ceiling,
+    raising the knob was therefore a silent no-op -- the operator edits the
+    config, the poller logs the new value, and nothing changes. Measured on a
+    drain pinned at 6 threads with MDS reply latency at 0.3 ms against
+    a 51 ms target.
+    """
+
+    def setUp(self):
+        self._saved = (vct.thread_count, vct.file_delay_ms, vct._setproctitle)
+        vct._setproctitle = None
+
+    def tearDown(self):
+        vct.thread_count, vct.file_delay_ms, vct._setproctitle = self._saved
+
+    def _reg(self, threads=1, maxt=6):
+        a = Args(regulate_prometheus_url="http://x", regulate_query="q",
+                 regulate_pause_ms=150.0, regulate_slo_ms=51.0,
+                 regulate_period_s=30, regulate_floor_ms=0,
+                 regulate_quiet_ticks=3, dirs=["/x"],
+                 threads=threads, regulate_max_threads=maxt)
+        vct.thread_count = vct.DynamicSemaphore(threads)
+        vct.file_delay_ms = 0
+        return vct.Regulator(a, "q")
+
+    def test_raising_the_max_lifts_an_established_ceiling(self):
+        r = self._reg(threads=1, maxt=6)
+        self.assertEqual(r._thread_ceiling(), 6)
+        r.args.regulate_max_threads = 12
+        self.assertEqual(r._thread_ceiling(), 12,
+                         "raising regulate_max_threads did not lift the ceiling")
+
+    def test_a_climbed_job_can_still_climb_further(self):
+        """End to end: the case that was stuck in production."""
+        r = self._reg(threads=1, maxt=6)
+        for _ in range(10):
+            r._maybe_raise_threads(1.0)
+        self.assertEqual(vct.thread_count.limit, 6)
+        r.args.regulate_max_threads = 8
+        for _ in range(10):
+            r._maybe_raise_threads(1.0)
+        self.assertEqual(vct.thread_count.limit, 8)
+
+    def test_raising_the_max_overrides_a_pause_earned_ceiling(self):
+        """An explicit operator instruction beats learned evidence."""
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(6)
+        r._pause(200.0)
+        self.assertEqual(r._thread_ceiling(), 5)
+        r.args.regulate_max_threads = 10
+        self.assertEqual(r._thread_ceiling(), 10)
+
+    def test_a_pause_ceiling_survives_a_steady_config(self):
+        """Control for the test above: absent a config CHANGE, nothing is lost."""
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(6)
+        r._pause(200.0)
+        for _ in range(5):
+            self.assertEqual(r._thread_ceiling(), 5,
+                             "a steady config erased the learned ceiling")
+
+    def test_lowering_the_max_still_clamps(self):
+        r = self._reg(threads=1, maxt=8)
+        self.assertEqual(r._thread_ceiling(), 8)
+        r.args.regulate_max_threads = 3
+        self.assertEqual(r._thread_ceiling(), 3)
+
+    def test_lowering_never_goes_below_what_the_operator_asked_for(self):
+        r = self._reg(threads=4, maxt=8)
+        r.args.regulate_max_threads = 1
+        self.assertEqual(r._thread_ceiling(), 4)
+
+    def test_zero_still_disables_adaptivity(self):
+        r = self._reg(threads=2, maxt=6)
+        r.args.regulate_max_threads = 0
+        self.assertEqual(r._thread_ceiling(), 0)
+        for _ in range(5):
+            r._maybe_raise_threads(1.0)
+        self.assertEqual(vct.thread_count.limit, 2)
+
+
+class SoftBandBackoff(unittest.TestCase):
+    """Latency between the soft target and the pause line must cost something.
+
+    It used to cost nothing. Worse, `not paused` counted as `quiet`, so the
+    regulator kept easing the file delay DOWN while latency sat past the
+    target it exists to defend, and the only remaining protection was the
+    pause cliff. For a job pushed above its ceiling by SIGUSR1 -- delay
+    already at its floor -- the whole band was a dead zone.
+    """
+
+    def setUp(self):
+        self._saved = (vct.thread_count, vct.file_delay_ms, vct._setproctitle,
+                       vct.do_exit)
+        vct._setproctitle = None
+
+    def tearDown(self):
+        (vct.thread_count, vct.file_delay_ms, vct._setproctitle,
+         vct.do_exit) = self._saved
+
+    def _reg(self, threads=1, maxt=6, delay_cfg=20, floor=2, delay_now=2):
+        a = Args(regulate_prometheus_url="http://x", regulate_query="q",
+                 regulate_pause_ms=150.0, regulate_slo_ms=51.0,
+                 regulate_period_s=30, regulate_floor_ms=floor,
+                 regulate_quiet_ticks=3, dirs=["/x"],
+                 threads=threads, regulate_max_threads=maxt,
+                 file_delay=delay_cfg)
+        vct.thread_count = vct.DynamicSemaphore(threads)
+        vct.file_delay_ms = delay_now
+        return vct.Regulator(a, "q")
+
+    def test_the_cheap_knob_moves_first(self):
+        r = self._reg(threads=6, delay_now=2)
+        vct.thread_count.set_limit(6)
+        r._tighten(100.0)
+        self.assertGreater(vct.file_delay_ms, 2, "file delay did not rise")
+        self.assertEqual(vct.thread_count.limit, 6,
+                         "surrendered a thread before easing off the delay")
+
+    def test_a_thread_goes_back_once_the_delay_is_restored(self):
+        r = self._reg(threads=1, delay_now=2)
+        vct.thread_count.set_limit(6)
+        for _ in range(40):
+            r._tighten(100.0)
+            if vct.thread_count.limit < 6:
+                break
+        self.assertEqual(vct.file_delay_ms, 20,
+                         "climbed past or stopped short of the configured delay")
+        self.assertEqual(vct.thread_count.limit, 5)
+
+    def test_giving_a_thread_back_also_lowers_the_ceiling(self):
+        """Otherwise the next quiet spell climbs straight back into it."""
+        r = self._reg(threads=1, maxt=8, delay_now=20)
+        vct.thread_count.set_limit(6)
+        r._tighten(100.0)
+        self.assertEqual(vct.thread_count.limit, 5)
+        self.assertLessEqual(r._thread_ceiling(), 5)
+
+    def test_never_drops_below_what_the_operator_asked_for(self):
+        r = self._reg(threads=4, delay_now=20)
+        vct.thread_count.set_limit(4)
+        for _ in range(20):
+            r._tighten(100.0)
+        self.assertEqual(vct.thread_count.limit, 4)
+
+    def test_the_delay_climb_is_bounded(self):
+        r = self._reg(threads=2, delay_cfg=10 ** 6, delay_now=2)
+        for _ in range(500):
+            r._tighten(100.0)
+            if vct.thread_count.limit < 2:
+                break
+        self.assertLessEqual(vct.file_delay_ms, vct.REG_TIGHTEN_CAP_MS)
+
+    def test_the_loop_routes_the_band_to_tighten_not_ease(self):
+        r = self._reg(threads=6)
+        calls = []
+        # Instance attributes, not class patches -- a class patch would leak
+        # into every other Regulator built in this run.
+        r._tighten = lambda lat: calls.append(("tighten", lat))
+        r._ease = lambda: calls.append(("ease",))
+        r.sample = lambda: 100.0
+
+        class OneShot:
+            def __init__(self):
+                self.n = 0
+
+            def is_set(self):
+                self.n += 1
+                return self.n > 1
+
+            def wait(self, _):
+                return None
+
+        vct.do_exit = OneShot()
+        r.run()
+        self.assertEqual([c[0] for c in calls], ["tighten"])
+
+    def test_under_the_target_still_eases(self):
+        """Control: the same loop, one number changed."""
+        r = self._reg(threads=6)
+        calls = []
+        r._tighten = lambda lat: calls.append(("tighten", lat))
+        r._ease = lambda: calls.append(("ease",))
+        r.sample = lambda: 1.0
+        r._quiet = r.args.regulate_quiet_ticks - 1
+
+        class OneShot:
+            def __init__(self):
+                self.n = 0
+
+            def is_set(self):
+                self.n += 1
+                return self.n > 1
+
+            def wait(self, _):
+                return None
+
+        vct.do_exit = OneShot()
+        r.run()
+        self.assertEqual([c[0] for c in calls], ["ease"])
+
+    def test_a_floor_above_the_cap_sheds_without_a_delay_step(self):
+        """Repeated pauses walk the floor up; past the cap there is no knob.
+
+        _note_pause() ratchets floor_ms as far as REG_FLOOR_CAP_MS and _ease()
+        will not go below it, so once the floor passes REG_TIGHTEN_CAP_MS the
+        delay cannot climb any further and the first soft-band tick must spend
+        itself on concurrency instead. Every other case in this class runs
+        with a 2ms floor, so without this the regime is untested.
+        """
+        floor = vct.REG_TIGHTEN_CAP_MS * 2
+        r = self._reg(threads=1, maxt=8, delay_cfg=20, floor=floor,
+                      delay_now=floor)
+        vct.thread_count.set_limit(6)
+        r._tighten(100.0)
+        self.assertEqual(vct.file_delay_ms, floor,
+                         "climbed the delay past a floor already over the cap")
+        self.assertEqual(vct.thread_count.limit, 5,
+                         "no cheap knob left, yet no thread was shed")
+
+    def test_ease_will_not_take_the_delay_below_the_floor(self):
+        """The invariant that makes the regime above reachable in production.
+
+        The test above hands _tighten its precondition directly. This one
+        earns it the way a live job does: _ease() decays the delay toward the
+        floor and stops there, so once repeated pauses have walked the floor
+        past REG_TIGHTEN_CAP_MS the delay can never come back under the climb
+        guard, and the next soft-band tick has nothing cheap to spend.
+        """
+        floor = vct.REG_TIGHTEN_CAP_MS * 2
+        r = self._reg(threads=1, maxt=8, delay_cfg=20, floor=floor,
+                      delay_now=floor * 4)
+        for _ in range(50):
+            r._ease()
+        self.assertEqual(vct.file_delay_ms, floor,
+                         "eased below the floor, or stopped short of it")
+        vct.thread_count.set_limit(6)
+        r._tighten(100.0)
+        self.assertEqual(vct.thread_count.limit, 5,
+                         "delay parked at a floor over the cap, yet nothing shed")
+
+    def test_resume_into_the_soft_band_then_backs_off(self):
+        """The one interval where _resume and _tighten both fire.
+
+        A paused job whose latency recovers only as far as the soft band is
+        resumed and tightened in the same tick. The resume is already held
+        under the ceiling the pause lowered, so this must not restore the
+        count that paused, and the back-off must then continue from there
+        rather than starting over.
+        """
+        r = self._reg(threads=1, maxt=8, delay_now=2)
+        vct.thread_count.set_limit(6)
+        r._pause(200.0)
+        self.assertEqual(vct.thread_count.limit, 0)
+
+        calls = []
+        real_tighten = r._tighten
+        r._tighten = lambda lat: (calls.append(lat), real_tighten(lat))[1]
+        r.sample = lambda: 100.0
+
+        class OneShot:
+            def __init__(self):
+                self.n = 0
+
+            def is_set(self):
+                self.n += 1
+                return self.n > 1
+
+            def wait(self, _):
+                return None
+
+        vct.do_exit = OneShot()
+        r.run()
+
+        self.assertEqual(calls, [100.0], "the soft band did not tighten")
+        self.assertEqual(vct.thread_count.limit, 5,
+                         "resumed to the count that paused, or failed to resume")
+        # First tick spends itself on the cheap knob, not on concurrency.
+        self.assertGreater(vct.file_delay_ms, 2)
+
+        for _ in range(40):
+            real_tighten(100.0)
+            if vct.thread_count.limit < 5:
+                break
+        self.assertEqual(vct.thread_count.limit, 4,
+                         "back-off did not continue from the resumed count")
+
+    def test_the_pause_line_still_wins(self):
+        r = self._reg(threads=6)
+        calls = []
+        r._tighten = lambda lat: calls.append(("tighten", lat))
+        r._pause = lambda lat: calls.append(("pause", lat))
+        r.sample = lambda: 200.0
+
+        class OneShot:
+            def __init__(self):
+                self.n = 0
+
+            def is_set(self):
+                self.n += 1
+                return self.n > 1
+
+            def wait(self, _):
+                return None
+
+        vct.do_exit = OneShot()
+        r.run()
+        self.assertEqual([c[0] for c in calls], ["pause"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
