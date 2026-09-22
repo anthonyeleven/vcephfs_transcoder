@@ -10,8 +10,10 @@ import argparse
 import importlib.util
 import os
 import sys
+import shutil
 import threading
 import time
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1056,6 +1058,275 @@ class SoftBandBackoff(unittest.TestCase):
         vct.do_exit = OneShot()
         r.run()
         self.assertEqual([c[0] for c in calls], ["pause"])
+
+
+
+class RegulatorStartsAnyway(unittest.TestCase):
+    """A failed FIRST sample must not disable self-regulation for the run.
+
+    The startup path used to return None on any sample() exception, which is
+    strictly less tolerant than the poll loop it gates -- that loop already
+    logs "no usable sample" and holds. Causes are all transient: nan from a
+    query window shorter than the volume's request interval, a Prometheus 503
+    at the moment the job starts, or a volume with no MDS traffic yet. Measured
+    cost of getting this wrong: two volumes pinned at 1 thread / 20ms delay for
+    nearly seven hours, 35-80x slower than their siblings.
+    """
+
+    def setUp(self):
+        self._saved = (vct.thread_count, vct.file_delay_ms, vct._setproctitle)
+        vct._setproctitle = None
+        vct.thread_count = vct.DynamicSemaphore(1)
+        vct.file_delay_ms = 20
+
+    def tearDown(self):
+        vct.thread_count, vct.file_delay_ms, vct._setproctitle = self._saved
+
+    def _args(self, **kw):
+        a = Args(regulate_prometheus_url="http://x", regulate_query="q",
+                 regulate_pause_ms=150.0, regulate_slo_ms=51.0,
+                 regulate_period_s=30, regulate_floor_ms=0,
+                 regulate_quiet_ticks=3, dirs=["/x"], threads=1,
+                 regulate_max_threads=6)
+        a.__dict__.update(kw)
+        return a
+
+    def _start(self, args, sample):
+        """start_regulator with sample() stubbed, and the thread never run."""
+        started = []
+        real_init = vct.Regulator.__init__
+
+        class Stub(vct.Regulator):
+            def __init__(self, a, q):
+                real_init(self, a, q)
+
+            def sample(self):
+                return sample()
+
+            def start(self):
+                started.append(True)   # do not actually run the poll loop
+
+        orig = vct.Regulator
+        vct.Regulator = Stub
+        try:
+            return vct.start_regulator(args), started
+        finally:
+            vct.Regulator = orig
+
+    def test_nan_sample_still_starts(self):
+        def boom():
+            raise ValueError("query returned nan")
+        reg, started = self._start(self._args(), boom)
+        self.assertIsNotNone(reg, "a nan first sample disabled the regulator")
+        self.assertEqual(started, [True], "regulator was returned but never started")
+
+    def test_transient_query_error_still_starts(self):
+        def boom():
+            raise OSError("HTTP 503")
+        reg, started = self._start(self._args(), boom)
+        self.assertIsNotNone(reg, "a transient query error disabled the regulator")
+        self.assertEqual(started, [True])
+
+    def test_a_good_sample_still_starts(self):
+        """Control: the happy path is unchanged."""
+        reg, started = self._start(self._args(), lambda: 0.5)
+        self.assertIsNotNone(reg)
+        self.assertEqual(started, [True])
+
+    def test_no_url_still_disables(self):
+        """Control: an unconfigured regulator is still off, not started blind."""
+        reg, started = self._start(self._args(regulate_prometheus_url=None),
+                                   lambda: 0.5)
+        self.assertIsNone(reg)
+        self.assertEqual(started, [])
+
+    def test_slo_not_below_pause_disables(self):
+        """An inverted band cannot be regulated, so say so and stay off."""
+        reg, started = self._start(
+            self._args(regulate_slo_ms=200.0, regulate_pause_ms=150.0),
+            lambda: 0.5)
+        self.assertIsNone(reg, "an inverted soft band was accepted")
+        self.assertEqual(started, [])
+
+    def test_slo_equal_to_pause_disables(self):
+        """Equal is also empty -- no band at all between them."""
+        reg, started = self._start(
+            self._args(regulate_slo_ms=150.0, regulate_pause_ms=150.0),
+            lambda: 0.5)
+        self.assertIsNone(reg)
+
+    def test_slo_just_below_pause_is_accepted(self):
+        """Control for the two above: one unit of band is enough."""
+        reg, started = self._start(
+            self._args(regulate_slo_ms=149.0, regulate_pause_ms=150.0),
+            lambda: 0.5)
+        self.assertIsNotNone(reg)
+
+
+class ReclaimNameGuard(unittest.TestCase):
+    """_reclaim_named unlinks; therefore _reclaim_named checks the name.
+
+    Its only caller filters on TMP_RE, so this was not a live bug -- but the
+    function's blast radius without the check is "unlink every aged regular
+    file in this directory", on a filesystem holding other people's data.
+    """
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.old = time.time() - vct.TMP_ORPHAN_MIN_AGE_S - 3600
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _aged(self, name):
+        p = os.path.join(self.d, name)
+        with open(p, "w") as f:
+            f.write("x")
+        os.utime(p, (self.old, self.old))
+        return p
+
+    def test_real_data_is_not_unlinked(self):
+        keep = self._aged("quarterly-results.parquet")
+        vct._reclaim_named(self.d, ["quarterly-results.parquet"])
+        self.assertTrue(os.path.exists(keep),
+                        "an aged non-temp file was unlinked")
+
+    def test_a_genuine_orphan_is_still_unlinked(self):
+        """Control: the guard must not break the function's actual job."""
+        orphan = self._aged("." + "a" * 32 + vct.TMP_SUFFIX)
+        self.assertTrue(vct.TMP_RE.match(os.path.basename(orphan)),
+                        "test fixture does not match TMP_RE")
+        vct._reclaim_named(self.d, [os.path.basename(orphan)])
+        self.assertFalse(os.path.exists(orphan), "a real orphan survived")
+
+    def test_a_young_orphan_is_left_alone(self):
+        p = os.path.join(self.d, "." + "b" * 32 + vct.TMP_SUFFIX)
+        with open(p, "w") as f:
+            f.write("x")
+        vct._reclaim_named(self.d, [os.path.basename(p)])
+        self.assertTrue(os.path.exists(p), "a young orphan was unlinked")
+
+
+class ExampleConfigQueryWindow(unittest.TestCase):
+    """The example config is where operators copy their query from.
+
+    A [1m] window returns nan on any volume served fewer than a few requests
+    a minute, and that nan is what disabled the regulator on two volumes.
+    """
+
+    def test_window_is_not_one_minute(self):
+        text = vct.config_example("myvol")
+        self.assertIn("mds_lat_sum", text, "example no longer shows a query")
+        self.assertNotIn("[1m]", text, "example still recommends a 1m window")
+        self.assertIn("[5m]", text)
+
+    def test_the_reason_is_stated(self):
+        text = vct.config_example("myvol").lower()
+        self.assertIn("nan", text,
+                      "example widens the window without saying why")
+
+
+
+class HardlinkStagingOrder(unittest.TestCase):
+    """A failure partway through relinking must not split the hardlinks.
+
+    The old order renamed the first path, then linked and renamed each
+    remaining one. If link number two failed, the first name already pointed at
+    the new inode while the rest still pointed at the old one: files that were
+    hardlinks to a single inode became two inodes with identical contents, and
+    nothing detected or reported it. Staging every link from tmp_file before
+    any rename makes that window empty.
+    """
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self._saved = (vct.thread_count, vct.file_delay_ms, vct._setproctitle,
+                       os.link, os.rename, os.chown,
+                       vct._apply_and_verify_layout, vct.run_journal)
+        vct._setproctitle = None
+        vct.thread_count = vct.DynamicSemaphore(1)
+        vct.run_journal = None
+        vct._apply_and_verify_layout = lambda layout, path: None
+        os.chown = lambda *a, **k: None          # unprivileged test runner
+
+    def tearDown(self):
+        (vct.thread_count, vct.file_delay_ms, vct._setproctitle,
+         os.link, os.rename, os.chown,
+         vct._apply_and_verify_layout, vct.run_journal) = self._saved
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    class _Layout:
+        object_size = 1 << 22
+
+        def diff(self, other):
+            return "fake-layout-diff"
+
+    def _args(self):
+        return Args(dirs=[self.d], dry_run=False, stage_in_tmpdir=False,
+                    tmpdir=self.d, no_copy_file_range=True, threads=1)
+
+    def _three_links(self):
+        """One inode, three names, all in the same directory."""
+        a = os.path.join(self.d, "a")
+        with open(a, "wb") as f:
+            f.write(b"payload" * 100)
+        b, c = os.path.join(self.d, "b"), os.path.join(self.d, "c")
+        os.link(a, b)
+        os.link(a, c)
+        return [a, b, c]
+
+    def test_a_failed_link_renames_nothing(self):
+        paths = self._three_links()
+        st = os.lstat(paths[0])
+        ino_before = st.st_ino
+
+        real_link = os.link
+        calls = {"link": 0}
+
+        def flaky_link(src, dst, **kw):
+            calls["link"] += 1
+            if calls["link"] == 2:
+                raise OSError(28, "No space left on device")
+            return real_link(src, dst, **kw)
+
+        renames = []
+        real_rename = os.rename
+
+        def spy_rename(src, dst):
+            renames.append((src, dst))
+            return real_rename(src, dst)
+
+        os.link, os.rename = flaky_link, spy_rename
+        with self.assertRaises(OSError):
+            vct.process_file(self._args(), paths, st, self._Layout(), self._Layout())
+
+        self.assertEqual(renames, [],
+                         "a rename happened even though a link failed: "
+                         "the hardlinks are now split across two inodes")
+        inos = {os.lstat(p).st_ino for p in paths}
+        self.assertEqual(inos, {ino_before},
+                         "the three names no longer share one inode")
+        self.assertEqual(os.lstat(paths[0]).st_nlink, 3)
+        # And nothing hidden is left behind: the staged links are cleaned up
+        # by the failure path, not left for the orphan reclaimer to find
+        # TMP_ORPHAN_MIN_AGE_S later, as hidden objects on the pool.
+        leftovers = [n for n in os.listdir(self.d) if vct.TMP_RE.match(n)]
+        self.assertEqual(leftovers, [],
+                         "staged temp files survived a failed relink: %s" % leftovers)
+
+    def test_the_happy_path_still_relinks_all_three(self):
+        """Control: with no failure, every name ends on the NEW inode."""
+        paths = self._three_links()
+        st = os.lstat(paths[0])
+        ino_before = st.st_ino
+        vct.process_file(self._args(), paths, st, self._Layout(), self._Layout())
+        inos = {os.lstat(p).st_ino for p in paths}
+        self.assertEqual(len(inos), 1, "the names were split across inodes")
+        self.assertNotEqual(inos.pop(), ino_before, "nothing was replaced")
+        self.assertEqual(os.lstat(paths[0]).st_nlink, 3)
+        for p in paths:
+            with open(p, "rb") as f:
+                self.assertEqual(f.read(), b"payload" * 100)
 
 
 if __name__ == "__main__":
