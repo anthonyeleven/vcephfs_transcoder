@@ -176,7 +176,7 @@ CONFIG_DIR = os.path.expanduser("~")
 # --prune-dir-regex to replace the set, or --prune-dir-regex '' to disable
 # pruning entirely. The effective pattern is logged at startup either way.
 #
-# Measured in production: 86.5% of files under the two largest volumes sit inside
+# Measured in production: 86.5% of files under the two largest volumes sit
 # virtualenvs, and the largest of 585,309 of them is 503,423 bytes -- below the
 # 512,000 byte threshold, so nothing eligible is lost. csa spent 22 days at
 # 1.17% of its volume grinding a Bazel .runfiles tree carrying a pip
@@ -279,8 +279,13 @@ def config_example(volume="VOLUME"):
         "# Backslashes must be DOUBLED. PromQL string literals use Go escaping, so",
         "# a regex dot is \\\\. inside the quotes; a single backslash is a parse",
         "# error (HTTP 400: unknown escape sequence), not a wrong match. Example:",
-        "#   regulate_query = 1e3 * sum(increase(mds_lat_sum{n=~\"mds\\\\.{volume}\\\\..*\"}[1m]))",
-        "#                        / sum(increase(mds_lat_count{n=~\"mds\\\\.{volume}\\\\..*\"}[1m]))",
+        "#   A window SHORTER than this volume's request interval yields 0/0",
+        "#   = nan: a quiet filesystem has no requests in the window and there",
+        "#   is nothing to average. The regulator now starts anyway and retries,",
+        "#   but it cannot regulate until the query returns a number. 5m copes",
+        "#   with a volume served a few requests a minute; 1m does not.",
+        "#   regulate_query = 1e3 * sum(increase(mds_lat_sum{n=~\"mds\\\\.{volume}\\\\..*\"}[5m]))",
+        "#                        / sum(increase(mds_lat_count{n=~\"mds\\\\.{volume}\\\\..*\"}[5m]))",
         "regulate_prometheus_url =",
         "regulate_query  =",
         "",
@@ -1595,13 +1600,45 @@ def start_regulator(args):
     if not query:
         logging.warning("Self-regulation disabled: %s", why)
         return None
+    if args.regulate_slo_ms >= args.regulate_pause_ms:
+        logging.warning(
+            "Self-regulation disabled: regulate_slo_ms (%.0f) is not below "
+            "regulate_pause_ms (%.0f), so the soft band is empty or inverted "
+            "and the regulator would hit the pause line without ever easing "
+            "off first. Fix the config.",
+            args.regulate_slo_ms, args.regulate_pause_ms)
+        return None
     reg = Regulator(args, query)
     try:
         lat = reg.sample()
     except Exception as e:
-        logging.warning("Self-regulation disabled: the query did not return a "
-                        "usable value (%s). Query: %s", e, query)
-        return None
+        # START ANYWAY. A failed FIRST sample is not evidence the query is
+        # wrong, and this path used to disable self-regulation permanently
+        # for the life of the job with no way back -- strictly less tolerant
+        # than the poll loop it gates, which already holds settings and
+        # retries on exactly this error.
+        #
+        # Three real causes, none of them permanent:
+        #   * nan, because the query window is shorter than the volume's
+        #     request interval: 0 requests / 0 requests. The quietest
+        #     filesystems -- the safest ones to regulate -- were the ones
+        #     that ended up with no regulator at all. Measured: two volumes
+        #     sat at 1 thread and a 20ms delay for nearly seven hours,
+        #     35-80x slower than their siblings, because of this.
+        #   * Prometheus transiently down, 503, or slow at the moment this
+        #     job happens to start.
+        #   * a new volume with no MDS traffic yet.
+        logging.warning(
+            "Regulator: first sample failed (%s) -- starting anyway and will "
+            "retry every %ds. If that error is 'nan', the query window is "
+            "probably shorter than this volume's request interval; widen it. "
+            "Query: %s",
+            e, max(5, int(args.regulate_period_s)), query)
+        logging.info(
+            "Regulator: enabled, holding file_delay=%dms threads=%d until a "
+            "usable sample arrives.", file_delay_ms, thread_count.limit)
+        reg.start()
+        return reg
     # Units are the likeliest misconfiguration and the failure is silent in both
     # directions: seconds means it never triggers, microseconds means it never
     # stops. Say what came back so a factor of 1000 is obvious immediately.
@@ -1846,6 +1883,13 @@ def _reclaim_named(dirpath, names):
     now = time.time()
     count = 0
     for name in names:
+        # Check the name here, in the function that does the unlinking, even
+        # though the only caller already filters on TMP_RE. Without it the
+        # blast radius of one careless caller is "unlink every aged regular
+        # file in this directory", on a filesystem holding other people's
+        # data. Cheap insurance against a future refactor.
+        if not TMP_RE.match(name):
+            continue
         p = os.path.join(dirpath, name)
         try:
             st = os.lstat(p)
@@ -1949,8 +1993,15 @@ def process_file(args, filepaths, st, layout, file_layout):
                 with stats._lock:
                     stats.files_submitted += 1
 
-                # Take a shared (read) lock on the source file to prevent
-                # concurrent writers from modifying it while we copy.
+                # Take a shared (read) lock on the source file. This is
+                # ADVISORY and weaker than it looks: it conflicts only with a
+                # writer that voluntarily takes LOCK_EX, and an ordinary
+                # appender takes no lock at all, so this succeeds while the
+                # file is being written. What actually protects the data is
+                # the mtime/ctime/size re-check before the rename below --
+                # that is the guard to preserve, not this one. Still worth
+                # taking: it cheaply excludes well-behaved writers before a
+                # pointless copy.
                 try:
                     fcntl.flock(ifd, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 except OSError:
@@ -2051,18 +2102,50 @@ def process_file(args, filepaths, st, layout, file_layout):
             #     exclusive MDS auth cap (CEPH_CAP_AUTH_EXCL), which collides
             #     with directory walkers and with sibling workers in the same
             #     directory -- measured as utimensat stalls up to 4.94s.
-            for i, path in enumerate(filepaths):
-                if i == 0:
-                    logging.info(f"Renaming {tmp_file} -> {path}")
-                    os.rename(tmp_file, path)
-                else:
-                    # Hard links can live in different directories, so the staging
-                    # path is recomputed per target; reusing one would reintroduce
-                    # the cross-directory rename for every extra link.
+            # Stage EVERY extra hardlink before renaming anything.
+            #
+            # The previous order renamed the first path, then linked and
+            # renamed each remaining one in turn. A failure partway through
+            # that loop -- ENOSPC, an MDS hiccup, a quota -- left some names
+            # pointing at the new inode and the rest still at the old one:
+            # files that were hardlinks to one inode silently became two
+            # inodes with identical contents, with nothing detecting or
+            # reporting the split.
+            #
+            # Linking from tmp_file (the new inode, before its rename)
+            # rather than from filepaths[0] (the same inode, after) lets all
+            # the staging happen first. If any link fails, nothing has been
+            # renamed yet and the temp files are reclaimed as orphans. The
+            # renames that follow are metadata-only.
+            #
+            # Hard links can live in different directories, so the staging
+            # path is recomputed per target; reusing one would reintroduce
+            # the cross-directory rename for every extra link.
+            link_tmps = []
+            try:
+                for path in filepaths[1:]:
                     link_tmp = _tmp_path_for(args, path)
-                    logging.info(f"Linking {filepaths[0]} -> {path}")
-                    os.link(filepaths[0], link_tmp, follow_symlinks=False)
-                    os.rename(link_tmp, path)
+                    logging.info(f"Linking {tmp_file} -> {path}")
+                    os.link(tmp_file, link_tmp, follow_symlinks=False)
+                    link_tmps.append((link_tmp, path))
+            except Exception:
+                # Clean up the links already staged. Leaving them to the
+                # orphan reclaimer works, but only after
+                # TMP_ORPHAN_MIN_AGE_S, and until then they are hidden
+                # objects on exactly the pool this tool exists to keep
+                # object counts down on. The outer handler only knows
+                # about tmp_file.
+                for staged, _ in link_tmps:
+                    try:
+                        os.unlink(staged)
+                    except OSError:
+                        pass
+                raise
+
+            logging.info(f"Renaming {tmp_file} -> {filepaths[0]}")
+            os.rename(tmp_file, filepaths[0])
+            for link_tmp, path in link_tmps:
+                os.rename(link_tmp, path)
 
             if run_journal is not None:
                 # After the renames: this is the write rctime now reflects.
