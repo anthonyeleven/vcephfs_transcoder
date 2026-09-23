@@ -1297,7 +1297,7 @@ class Regulator(threading.Thread):
         # floor's own decay clears, so the ceiling cannot share it without the
         # two decays quietly resetting each other.
         self._last_ceiling_decay = 0.0
-        self._last_pause_at = 0.0
+        self._last_lowered_at = 0.0
         self._quiet = 0
         self._last_err = 0.0
         self._paused_threads = None
@@ -1397,6 +1397,13 @@ class Regulator(threading.Thread):
         cur = self._thread_ceiling()
         if new < cur:
             self._ceiling = new
+            # Restart the release clock HERE rather than in a caller. _pause()
+            # is not the only thing that lowers the ceiling -- _tighten() does
+            # too, when it sheds a thread in the soft band -- and a clock kept
+            # in _pause() alone leaves a _tighten-lowered ceiling released on
+            # the very next quiet tick, which is exactly the climb-straight-back
+            # behaviour _tighten exists to prevent.
+            self._last_lowered_at = time.time()
             logging.warning(
                 "Regulator: thread ceiling %d -> %d after pausing at %d threads",
                 cur, new, level)
@@ -1440,7 +1447,6 @@ class Regulator(threading.Thread):
     def _pause(self, lat):
         global file_delay_ms
         extra = self._note_pause()
-        self._last_pause_at = time.time()
         if thread_count.limit > 0:
             self._paused_threads = thread_count.limit
             self._lower_ceiling(thread_count.limit)
@@ -1571,14 +1577,14 @@ class Regulator(threading.Thread):
 
         One step per quiet interval, the same shape as the floor's decay, so a
         ceiling earned by several pauses is handed back no faster than it was
-        taken. A pause resets the clock, so this only acts on quiet that has
-        actually persisted.
+        taken. Any lowering resets the clock -- a pause or a soft-band shed --
+        so this only acts on quiet that has actually persisted.
         """
         mx = int(getattr(self.args, "regulate_max_threads", 0) or 0)
         if mx <= 0 or self._ceiling is None or self._ceiling >= mx:
             return
         now = time.time()
-        if now - max(self._last_ceiling_decay, self._last_pause_at) < REG_FLOOR_DECAY_S:
+        if now - max(self._last_ceiling_decay, self._last_lowered_at) < REG_FLOOR_DECAY_S:
             return
         old = self._ceiling
         self._ceiling = min(mx, old + 1)
