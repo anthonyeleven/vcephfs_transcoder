@@ -716,11 +716,89 @@ class ThreadAdaptivity(unittest.TestCase):
         self.assertLessEqual(vct.thread_count.limit, 4,
                              "climbed back to the count that caused the pause")
 
+    # -- release --------------------------------------------------------------
+    # The ratchet without these is a trap: one pause pins the job for the rest
+    # of the run. Each test here fails if _maybe_decay_ceiling() is removed.
+    def _stale(self, r):
+        """Push both clocks far enough back to count as sustained quiet."""
+        past = time.time() - vct.REG_FLOOR_DECAY_S - 1
+        r._last_pause_at = past
+        r._last_ceiling_decay = past
+
+    def test_a_pause_earned_ceiling_is_released_after_sustained_quiet(self):
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(6)
+        r._pause(200.0)
+        self.assertEqual(r._thread_ceiling(), 5)
+        self._stale(r)
+        r._maybe_decay_ceiling()
+        self.assertEqual(r._thread_ceiling(), 6,
+                         "quiet never gave back any of the learned ceiling")
+
+    def test_a_recent_pause_blocks_the_release(self):
+        """The negative control for the test above: identical state, except the
+        pause is recent. Without this the test above would also pass on an
+        implementation that ignores the clock entirely."""
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(6)
+        r._pause(200.0)
+        r._last_ceiling_decay = time.time() - vct.REG_FLOOR_DECAY_S - 1
+        r._maybe_decay_ceiling()
+        self.assertEqual(r._thread_ceiling(), 5,
+                         "released the ceiling while the pause was still recent")
+
+    def test_release_is_one_step_per_interval(self):
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(6)
+        r._pause(200.0)
+        self._stale(r)
+        r._maybe_decay_ceiling()
+        r._maybe_decay_ceiling()
+        r._maybe_decay_ceiling()
+        self.assertEqual(r._thread_ceiling(), 6,
+                         "gave back more than one step in a single interval")
+
+    def test_release_stops_at_the_configured_max(self):
+        r = self._reg(threads=1, maxt=6)
+        vct.thread_count.set_limit(6)
+        r._pause(200.0)
+        for _ in range(20):
+            self._stale(r)
+            r._maybe_decay_ceiling()
+        self.assertEqual(r._thread_ceiling(), 6, "climbed past regulate_max_threads")
+
+    def test_no_release_when_thread_adaptivity_is_off(self):
+        r = self._reg(threads=2, maxt=0)
+        vct.thread_count.set_limit(2)
+        r._pause(200.0)
+        self._stale(r)
+        r._maybe_decay_ceiling()
+        self.assertEqual(r._thread_ceiling(), 0,
+                         "touched the ceiling with adaptivity switched off")
+
+    def test_the_pin_that_motivated_this_clears_on_its_own(self):
+        """The observed failure, end to end. A job started --threads 1 pauses
+        once at 2, which sets the ceiling to max(2 - 1, 1) = 1, and can never
+        climb again however quiet the filesystem gets. With the release it
+        recovers without an operator touching regulate_max_threads."""
+        r = self._reg(threads=1, maxt=24)
+        vct.thread_count.set_limit(2)
+        r._pause(200.0)
+        r._resume()
+        for _ in range(20):
+            r._maybe_raise_threads(5.0)
+        self.assertEqual(vct.thread_count.limit, 1, "precondition: not pinned")
+        self._stale(r)
+        r._maybe_decay_ceiling()
+        r._maybe_raise_threads(5.0)
+        self.assertEqual(vct.thread_count.limit, 2,
+                         "still pinned after the filesystem went quiet")
+
     def test_ceiling_never_drops_below_what_the_operator_asked_for(self):
-        """--threads is a floor on ambition, not a starting suggestion. Unlike
-        the delay floor this ratchet has no release valve, so if it could fall
-        past the operator's own setting the job would be stuck slow for the
-        rest of the run."""
+        """--threads is a floor on ambition, not a starting suggestion. The
+        ratchet's release (see the decay tests below) only climbs back toward
+        regulate_max_threads a step at a time, so a ceiling that could fall
+        past the operator's own setting would cost hours to earn back."""
         r = self._reg(threads=4, maxt=8)
         for level in (8, 7, 6, 5, 4, 3, 2):
             vct.thread_count.set_limit(level)

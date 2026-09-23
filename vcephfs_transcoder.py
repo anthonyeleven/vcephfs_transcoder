@@ -1293,14 +1293,20 @@ class Regulator(threading.Thread):
         self._floor_base = self.floor_ms
         self._pauses = []
         self._last_decay = 0.0
+        # Separate clocks for the ceiling's release. _pauses is bookkeeping the
+        # floor's own decay clears, so the ceiling cannot share it without the
+        # two decays quietly resetting each other.
+        self._last_ceiling_decay = 0.0
+        self._last_pause_at = 0.0
         self._quiet = 0
         self._last_err = 0.0
         self._paused_threads = None
         # Learned ceiling for regulator-driven thread increases. A pause
         # lowers it and it never falls below the operator's own --threads
-        # value. It moves UP only when the operator raises
+        # value. It moves UP two ways: immediately when the operator raises
         # regulate_max_threads, which _thread_ceiling treats as an explicit
-        # instruction -- see there for why that matters.
+        # instruction -- see there for why that matters -- and one step at a
+        # time under sustained quiet, see _maybe_decay_ceiling().
         self._ceiling = None
         # The regulate_max_threads value this ceiling was last reconciled
         # against, so a live change to it can be told from a steady state.
@@ -1434,6 +1440,7 @@ class Regulator(threading.Thread):
     def _pause(self, lat):
         global file_delay_ms
         extra = self._note_pause()
+        self._last_pause_at = time.time()
         if thread_count.limit > 0:
             self._paused_threads = thread_count.limit
             self._lower_ceiling(thread_count.limit)
@@ -1547,6 +1554,39 @@ class Regulator(threading.Thread):
         logging.info("Regulator: quiet %dmin, floor %dms -> %dms (baseline %dms)",
                      REG_FLOOR_DECAY_S // 60, old, self.floor_ms, self._floor_base)
 
+    def _maybe_decay_ceiling(self):
+        """Give back one step of learned thread ceiling after sustained quiet.
+
+        REG_FLOOR_DECAY_S already carries the argument for why a ratchet needs
+        a release: one bad night walks the limit down step by step and it never
+        comes back, so the job stays throttled long after the cause has gone.
+        The delay floor got that release. The thread ceiling did not, and it is
+        the more expensive of the two to lose.
+
+        Observed 2026-09-23 on a drain that paused once at two threads -- which
+        set the ceiling to max(2 - 1, base) = 1 -- and then ran single-threaded
+        for three and a half hours while its MDS reported 5 ms against a 51 ms
+        target. Nothing short of an operator editing regulate_max_threads could
+        free it, and there was no line in the log saying why it was slow.
+
+        One step per quiet interval, the same shape as the floor's decay, so a
+        ceiling earned by several pauses is handed back no faster than it was
+        taken. A pause resets the clock, so this only acts on quiet that has
+        actually persisted.
+        """
+        mx = int(getattr(self.args, "regulate_max_threads", 0) or 0)
+        if mx <= 0 or self._ceiling is None or self._ceiling >= mx:
+            return
+        now = time.time()
+        if now - max(self._last_ceiling_decay, self._last_pause_at) < REG_FLOOR_DECAY_S:
+            return
+        old = self._ceiling
+        self._ceiling = min(mx, old + 1)
+        self._last_ceiling_decay = now
+        logging.info(
+            "Regulator: quiet %dmin, thread ceiling %d -> %d (configured max %d)",
+            REG_FLOOR_DECAY_S // 60, old, self._ceiling, mx)
+
     # -- loop -----------------------------------------------------------------
     def run(self):
         period = max(5, int(self.args.regulate_period_s))
@@ -1579,6 +1619,7 @@ class Regulator(threading.Thread):
             else:
                 self._resume()
                 self._maybe_decay_floor()
+                self._maybe_decay_ceiling()
                 self._quiet += 1
                 if self._quiet >= int(self.args.regulate_quiet_ticks):
                     self._quiet = 0
