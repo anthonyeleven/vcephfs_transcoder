@@ -784,6 +784,41 @@ class ThreadAdaptivity(unittest.TestCase):
         self.assertEqual(r._thread_ceiling(), 1,
                          "released one poll period after a pause at the operator floor")
 
+    def test_a_sustained_pause_keeps_blocking_the_release(self):
+        """A pause that lasts longer than the decay interval must not hand back
+        a step on the tick it ends.
+
+        _pause() reaches _lower_ceiling() only while thread_count.limit > 0, and
+        once paused the limit IS 0, so a clock kept there stops advancing for the
+        whole pause. Fails if the assignment sits in _lower_ceiling()."""
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(2)
+        r._pause(200.0)
+        self.assertEqual(r._thread_ceiling(), 1, "precondition: pinned at the floor")
+        self.assertEqual(vct.thread_count.limit, 0, "precondition: paused")
+        self._stale(r)
+        r._pause(200.0)
+        r._resume()
+        r._maybe_decay_ceiling()
+        self.assertEqual(r._thread_ceiling(), 1,
+                         "released a step on the tick a sustained pause ended")
+
+    def test_a_soft_band_tick_that_sheds_nothing_still_blocks_the_release(self):
+        """At --threads 1 every soft-band tick sheds nothing, because _tighten
+        returns early at cur <= base. Those ticks are still pressure. Fails if
+        the clock is only set where a knob actually moves."""
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(2)
+        r._pause(200.0)
+        r._resume()
+        self.assertEqual(vct.thread_count.limit, 1, "precondition: back at the floor")
+        self._stale(r)
+        vct.file_delay_ms = vct.REG_TIGHTEN_CAP_MS
+        r._tighten(80.0)
+        r._maybe_decay_ceiling()
+        self.assertEqual(r._thread_ceiling(), 1,
+                         "released after a soft-band tick that shed nothing")
+
     def test_release_is_one_step_per_interval(self):
         r = self._reg(threads=1, maxt=8)
         vct.thread_count.set_limit(6)

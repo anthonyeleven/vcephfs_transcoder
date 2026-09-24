@@ -1392,22 +1392,6 @@ class Regulator(threading.Thread):
         """
         if int(getattr(self.args, "regulate_max_threads", 0) or 0) <= 0:
             return
-        # Restart the release clock HERE, and before the test below, rather
-        # than in a caller. Two reasons, and they were found in that order.
-        #
-        # _pause() is not the only thing that lowers the ceiling -- _tighten()
-        # does too, when it sheds a thread in the soft band -- so a clock kept
-        # in _pause() alone leaves a _tighten-lowered ceiling released on the
-        # very next quiet tick, which is the climb-straight-back behaviour
-        # _tighten exists to prevent.
-        #
-        # And it goes ABOVE `if new < cur` because a lowering that changes
-        # nothing is still evidence. Once the ceiling is at the operator's
-        # --threads floor, new = max(level - 1, base) == cur for every pause,
-        # so gating the clock on the ceiling actually moving means repeated
-        # pauses at the floor never restart it -- and the ceiling is released
-        # a poll period after a pause. That is the useq shape exactly.
-        self._last_pressure_at = time.time()
         base = self._thread_base()
         new = max(level - 1, base)
         cur = self._thread_ceiling()
@@ -1455,6 +1439,14 @@ class Regulator(threading.Thread):
     # -- actions --------------------------------------------------------------
     def _pause(self, lat):
         global file_delay_ms
+        # Every pause tick is evidence, including the ones that change nothing.
+        # This is deliberately above the limit > 0 test: once the job is paused
+        # the limit IS 0, so a clock kept below it stops advancing for the whole
+        # duration of a sustained pause, and a pause lasting longer than
+        # REG_FLOOR_DECAY_S then hands back a ceiling step on the very tick it
+        # ends. _note_pause() gets this right for the floor's clock by recording
+        # every tick; this is the same property for the ceiling's.
+        self._last_pressure_at = time.time()
         extra = self._note_pause()
         if thread_count.limit > 0:
             self._paused_threads = thread_count.limit
@@ -1516,6 +1508,11 @@ class Regulator(threading.Thread):
         soft-band tick. Also intended: the delay is at its floor, the cheap
         knob really is exhausted, and concurrency is the only lever left.
         """
+        # Soft-band ticks are evidence too, including the ones that shed
+        # nothing -- _tighten returns early at cur <= base, which is every
+        # soft-band tick of a --threads 1 job, exactly the shape this whole
+        # change exists to protect.
+        self._last_pressure_at = time.time()
         global file_delay_ms
         want = max(int(getattr(self.args, "file_delay", 0) or 0), self.floor_ms)
         old = file_delay_ms
@@ -1586,9 +1583,9 @@ class Regulator(threading.Thread):
 
         One step per quiet interval, the same shape as the floor's decay, so a
         ceiling earned by several pauses is handed back no faster than it was
-        Any call to _lower_ceiling() resets the clock -- a pause or a soft-band
-        shed, and whether or not it moved the ceiling -- so this only acts on
-        quiet that has actually persisted.
+        taken. Every tick that observes pressure resets the clock, so this only
+        acts on quiet that has actually persisted -- see _pause() and
+        _tighten().
         """
         mx = int(getattr(self.args, "regulate_max_threads", 0) or 0)
         if mx <= 0 or self._ceiling is None or self._ceiling >= mx:
