@@ -1297,7 +1297,7 @@ class Regulator(threading.Thread):
         # floor's own decay clears, so the ceiling cannot share it without the
         # two decays quietly resetting each other.
         self._last_ceiling_decay = 0.0
-        self._last_lowered_at = 0.0
+        self._last_pressure_at = 0.0
         self._quiet = 0
         self._last_err = 0.0
         self._paused_threads = None
@@ -1397,13 +1397,6 @@ class Regulator(threading.Thread):
         cur = self._thread_ceiling()
         if new < cur:
             self._ceiling = new
-            # Restart the release clock HERE rather than in a caller. _pause()
-            # is not the only thing that lowers the ceiling -- _tighten() does
-            # too, when it sheds a thread in the soft band -- and a clock kept
-            # in _pause() alone leaves a _tighten-lowered ceiling released on
-            # the very next quiet tick, which is exactly the climb-straight-back
-            # behaviour _tighten exists to prevent.
-            self._last_lowered_at = time.time()
             logging.warning(
                 "Regulator: thread ceiling %d -> %d after pausing at %d threads",
                 cur, new, level)
@@ -1446,6 +1439,14 @@ class Regulator(threading.Thread):
     # -- actions --------------------------------------------------------------
     def _pause(self, lat):
         global file_delay_ms
+        # Every pause tick is evidence, including the ones that change nothing.
+        # This is deliberately above the limit > 0 test: once the job is paused
+        # the limit IS 0, so a clock kept below it stops advancing for the whole
+        # duration of a sustained pause, and a pause lasting longer than
+        # REG_FLOOR_DECAY_S then hands back a ceiling step on the very tick it
+        # ends. _note_pause() gets this right for the floor's clock by recording
+        # every tick; this is the same property for the ceiling's.
+        self._last_pressure_at = time.time()
         extra = self._note_pause()
         if thread_count.limit > 0:
             self._paused_threads = thread_count.limit
@@ -1508,6 +1509,11 @@ class Regulator(threading.Thread):
         knob really is exhausted, and concurrency is the only lever left.
         """
         global file_delay_ms
+        # Soft-band ticks are evidence too, including the ones that shed
+        # nothing -- _tighten returns early at cur <= base, which is every
+        # soft-band tick of a --threads 1 job, exactly the shape this whole
+        # change exists to protect.
+        self._last_pressure_at = time.time()
         want = max(int(getattr(self.args, "file_delay", 0) or 0), self.floor_ms)
         old = file_delay_ms
         if old < min(want, REG_TIGHTEN_CAP_MS):
@@ -1577,14 +1583,15 @@ class Regulator(threading.Thread):
 
         One step per quiet interval, the same shape as the floor's decay, so a
         ceiling earned by several pauses is handed back no faster than it was
-        taken. Any lowering resets the clock -- a pause or a soft-band shed --
-        so this only acts on quiet that has actually persisted.
+        taken. Every tick that observes pressure resets the clock, so this only
+        acts on quiet that has actually persisted -- see _pause() and
+        _tighten().
         """
         mx = int(getattr(self.args, "regulate_max_threads", 0) or 0)
         if mx <= 0 or self._ceiling is None or self._ceiling >= mx:
             return
         now = time.time()
-        if now - max(self._last_ceiling_decay, self._last_lowered_at) < REG_FLOOR_DECAY_S:
+        if now - max(self._last_ceiling_decay, self._last_pressure_at) < REG_FLOOR_DECAY_S:
             return
         old = self._ceiling
         self._ceiling = min(mx, old + 1)

@@ -718,11 +718,12 @@ class ThreadAdaptivity(unittest.TestCase):
 
     # -- release --------------------------------------------------------------
     # The ratchet without these is a trap: one pause pins the job for the rest
-    # of the run. Each test here fails if _maybe_decay_ceiling() is removed.
+    # of the run. The release tests fail without the release; the negative
+    # controls fail if the clock is ignored.
     def _stale(self, r):
         """Push both clocks far enough back to count as sustained quiet."""
         past = time.time() - vct.REG_FLOOR_DECAY_S - 1
-        r._last_lowered_at = past
+        r._last_pressure_at = past
         r._last_ceiling_decay = past
 
     def test_a_pause_earned_ceiling_is_released_after_sustained_quiet(self):
@@ -752,7 +753,7 @@ class ThreadAdaptivity(unittest.TestCase):
         wrong: a job that has never paused has both clocks at 0.0, so a ceiling
         shed in the soft band would be handed straight back on the next quiet
         tick -- the climb-straight-back behaviour _tighten exists to prevent.
-        This fails if the clock lives in _pause() instead of _lower_ceiling()."""
+        Fails if only _pause() sets the clock."""
         r = self._reg(threads=1, maxt=8)
         vct.thread_count.set_limit(5)
         vct.file_delay_ms = vct.REG_TIGHTEN_CAP_MS
@@ -762,6 +763,61 @@ class ThreadAdaptivity(unittest.TestCase):
         r._maybe_decay_ceiling()
         self.assertEqual(r._thread_ceiling(), 4,
                          "released a ceiling lowered by _tighten, with no quiet at all")
+
+    def test_a_pause_at_the_operator_floor_still_blocks_the_release(self):
+        """A pause that lowers nothing is still evidence.
+
+        Once the ceiling sits at the --threads floor, new = max(level - 1,
+        base) == cur for every pause, so a clock gated on the ceiling actually
+        moving would never restart -- and the ceiling would be released a poll
+        period after a pause. That is the configuration this release exists to
+        rescue, so it is the one that has to be held. Fails if the clock reset sits inside
+        `if new < cur:`."""
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(2)
+        r._pause(200.0)
+        self.assertEqual(r._thread_ceiling(), 1, "precondition: pinned at the floor")
+        self._stale(r)
+        vct.thread_count.set_limit(1)
+        r._pause(200.0)
+        r._maybe_decay_ceiling()
+        self.assertEqual(r._thread_ceiling(), 1,
+                         "released one poll period after a pause at the operator floor")
+
+    def test_a_sustained_pause_keeps_blocking_the_release(self):
+        """A pause that lasts longer than the decay interval must not hand back
+        a step on the tick it ends.
+
+        _pause() reaches _lower_ceiling() only while thread_count.limit > 0, and
+        once paused the limit IS 0, so a clock kept there stops advancing for the
+        whole pause. Fails if the assignment sits in _lower_ceiling()."""
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(2)
+        r._pause(200.0)
+        self.assertEqual(r._thread_ceiling(), 1, "precondition: pinned at the floor")
+        self.assertEqual(vct.thread_count.limit, 0, "precondition: paused")
+        self._stale(r)
+        r._pause(200.0)
+        r._resume()
+        r._maybe_decay_ceiling()
+        self.assertEqual(r._thread_ceiling(), 1,
+                         "released a step on the tick a sustained pause ended")
+
+    def test_a_soft_band_tick_that_sheds_nothing_still_blocks_the_release(self):
+        """At --threads 1 every soft-band tick sheds nothing, because _tighten
+        returns early at cur <= base. Those ticks are still pressure. Fails if
+        the clock is only set where a knob actually moves."""
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(2)
+        r._pause(200.0)
+        r._resume()
+        self.assertEqual(vct.thread_count.limit, 1, "precondition: back at the floor")
+        self._stale(r)
+        vct.file_delay_ms = vct.REG_TIGHTEN_CAP_MS
+        r._tighten(80.0)
+        r._maybe_decay_ceiling()
+        self.assertEqual(r._thread_ceiling(), 1,
+                         "released after a soft-band tick that shed nothing")
 
     def test_release_is_one_step_per_interval(self):
         r = self._reg(threads=1, maxt=8)
@@ -803,7 +859,7 @@ class ThreadAdaptivity(unittest.TestCase):
         r._resume()
         for _ in range(20):
             r._maybe_raise_threads(5.0)
-        self.assertEqual(vct.thread_count.limit, 1, "precondition: not pinned")
+        self.assertEqual(vct.thread_count.limit, 1, "precondition: pinned at 1")
         self._stale(r)
         r._maybe_decay_ceiling()
         r._maybe_raise_threads(5.0)
@@ -812,7 +868,7 @@ class ThreadAdaptivity(unittest.TestCase):
 
     def test_ceiling_never_drops_below_what_the_operator_asked_for(self):
         """--threads is a floor on ambition, not a starting suggestion. The
-        ratchet's release (see the decay tests below) only climbs back toward
+        ratchet's release (see the decay tests above) only climbs back toward
         regulate_max_threads a step at a time, so a ceiling that could fall
         past the operator's own setting would cost hours to earn back."""
         r = self._reg(threads=4, maxt=8)
