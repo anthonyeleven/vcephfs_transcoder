@@ -1297,7 +1297,7 @@ class Regulator(threading.Thread):
         # floor's own decay clears, so the ceiling cannot share it without the
         # two decays quietly resetting each other.
         self._last_ceiling_decay = 0.0
-        self._last_lowered_at = 0.0
+        self._last_pressure_at = 0.0
         self._quiet = 0
         self._last_err = 0.0
         self._paused_threads = None
@@ -1392,18 +1392,27 @@ class Regulator(threading.Thread):
         """
         if int(getattr(self.args, "regulate_max_threads", 0) or 0) <= 0:
             return
+        # Restart the release clock HERE, and before the test below, rather
+        # than in a caller. Two reasons, and they were found in that order.
+        #
+        # _pause() is not the only thing that lowers the ceiling -- _tighten()
+        # does too, when it sheds a thread in the soft band -- so a clock kept
+        # in _pause() alone leaves a _tighten-lowered ceiling released on the
+        # very next quiet tick, which is the climb-straight-back behaviour
+        # _tighten exists to prevent.
+        #
+        # And it goes ABOVE `if new < cur` because a lowering that changes
+        # nothing is still evidence. Once the ceiling is at the operator's
+        # --threads floor, new = max(level - 1, base) == cur for every pause,
+        # so gating the clock on the ceiling actually moving means repeated
+        # pauses at the floor never restart it -- and the ceiling is released
+        # a poll period after a pause. That is the useq shape exactly.
+        self._last_pressure_at = time.time()
         base = self._thread_base()
         new = max(level - 1, base)
         cur = self._thread_ceiling()
         if new < cur:
             self._ceiling = new
-            # Restart the release clock HERE rather than in a caller. _pause()
-            # is not the only thing that lowers the ceiling -- _tighten() does
-            # too, when it sheds a thread in the soft band -- and a clock kept
-            # in _pause() alone leaves a _tighten-lowered ceiling released on
-            # the very next quiet tick, which is exactly the climb-straight-back
-            # behaviour _tighten exists to prevent.
-            self._last_lowered_at = time.time()
             logging.warning(
                 "Regulator: thread ceiling %d -> %d after pausing at %d threads",
                 cur, new, level)
@@ -1577,14 +1586,15 @@ class Regulator(threading.Thread):
 
         One step per quiet interval, the same shape as the floor's decay, so a
         ceiling earned by several pauses is handed back no faster than it was
-        taken. Any lowering resets the clock -- a pause or a soft-band shed --
-        so this only acts on quiet that has actually persisted.
+        Any call to _lower_ceiling() resets the clock -- a pause or a soft-band
+        shed, and whether or not it moved the ceiling -- so this only acts on
+        quiet that has actually persisted.
         """
         mx = int(getattr(self.args, "regulate_max_threads", 0) or 0)
         if mx <= 0 or self._ceiling is None or self._ceiling >= mx:
             return
         now = time.time()
-        if now - max(self._last_ceiling_decay, self._last_lowered_at) < REG_FLOOR_DECAY_S:
+        if now - max(self._last_ceiling_decay, self._last_pressure_at) < REG_FLOOR_DECAY_S:
             return
         old = self._ceiling
         self._ceiling = min(mx, old + 1)
