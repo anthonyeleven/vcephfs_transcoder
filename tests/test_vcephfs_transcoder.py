@@ -753,7 +753,7 @@ class ThreadAdaptivity(unittest.TestCase):
         wrong: a job that has never paused has both clocks at 0.0, so a ceiling
         shed in the soft band would be handed straight back on the next quiet
         tick -- the climb-straight-back behaviour _tighten exists to prevent.
-        This fails if the clock lives in _pause() instead of _lower_ceiling()."""
+        Fails if only _pause() sets the clock."""
         r = self._reg(threads=1, maxt=8)
         vct.thread_count.set_limit(5)
         vct.file_delay_ms = vct.REG_TIGHTEN_CAP_MS
@@ -770,8 +770,8 @@ class ThreadAdaptivity(unittest.TestCase):
         Once the ceiling sits at the --threads floor, new = max(level - 1,
         base) == cur for every pause, so a clock gated on the ceiling actually
         moving would never restart -- and the ceiling would be released a poll
-        period after a pause. That is the useq configuration exactly, so it is
-        the one that has to be held. Fails if the clock reset sits inside
+        period after a pause. That is the configuration this release exists to
+        rescue, so it is the one that has to be held. Fails if the clock reset sits inside
         `if new < cur:`."""
         r = self._reg(threads=1, maxt=8)
         vct.thread_count.set_limit(2)
@@ -859,7 +859,7 @@ class ThreadAdaptivity(unittest.TestCase):
         r._resume()
         for _ in range(20):
             r._maybe_raise_threads(5.0)
-        self.assertEqual(vct.thread_count.limit, 1, "precondition: not pinned")
+        self.assertEqual(vct.thread_count.limit, 1, "precondition: pinned at 1")
         self._stale(r)
         r._maybe_decay_ceiling()
         r._maybe_raise_threads(5.0)

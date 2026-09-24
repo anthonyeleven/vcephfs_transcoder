@@ -1508,12 +1508,12 @@ class Regulator(threading.Thread):
         soft-band tick. Also intended: the delay is at its floor, the cheap
         knob really is exhausted, and concurrency is the only lever left.
         """
+        global file_delay_ms
         # Soft-band ticks are evidence too, including the ones that shed
         # nothing -- _tighten returns early at cur <= base, which is every
         # soft-band tick of a --threads 1 job, exactly the shape this whole
         # change exists to protect.
         self._last_pressure_at = time.time()
-        global file_delay_ms
         want = max(int(getattr(self.args, "file_delay", 0) or 0), self.floor_ms)
         old = file_delay_ms
         if old < min(want, REG_TIGHTEN_CAP_MS):
