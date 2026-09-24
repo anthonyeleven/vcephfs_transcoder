@@ -722,7 +722,7 @@ class ThreadAdaptivity(unittest.TestCase):
     def _stale(self, r):
         """Push both clocks far enough back to count as sustained quiet."""
         past = time.time() - vct.REG_FLOOR_DECAY_S - 1
-        r._last_pause_at = past
+        r._last_lowered_at = past
         r._last_ceiling_decay = past
 
     def test_a_pause_earned_ceiling_is_released_after_sustained_quiet(self):
@@ -746,6 +746,22 @@ class ThreadAdaptivity(unittest.TestCase):
         r._maybe_decay_ceiling()
         self.assertEqual(r._thread_ceiling(), 5,
                          "released the ceiling while the pause was still recent")
+
+    def test_a_soft_band_shed_also_blocks_the_release(self):
+        """_tighten() lowers the ceiling too, and it is the easier path to get
+        wrong: a job that has never paused has both clocks at 0.0, so a ceiling
+        shed in the soft band would be handed straight back on the next quiet
+        tick -- the climb-straight-back behaviour _tighten exists to prevent.
+        This fails if the clock lives in _pause() instead of _lower_ceiling()."""
+        r = self._reg(threads=1, maxt=8)
+        vct.thread_count.set_limit(5)
+        vct.file_delay_ms = vct.REG_TIGHTEN_CAP_MS
+        r._tighten(80.0)
+        self.assertEqual(r._thread_ceiling(), 4, "precondition: _tighten shed a thread")
+        r._last_ceiling_decay = time.time() - vct.REG_FLOOR_DECAY_S - 1
+        r._maybe_decay_ceiling()
+        self.assertEqual(r._thread_ceiling(), 4,
+                         "released a ceiling lowered by _tighten, with no quiet at all")
 
     def test_release_is_one_step_per_interval(self):
         r = self._reg(threads=1, maxt=8)
