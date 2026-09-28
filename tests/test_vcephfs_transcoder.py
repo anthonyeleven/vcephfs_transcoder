@@ -7,6 +7,7 @@ answer is expensive: a default that flips back, a lock that stops excluding, a
 prune that skips more data than intended, or a warning that stops being true.
 """
 import argparse
+import logging
 import importlib.util
 import os
 import sys
@@ -234,7 +235,7 @@ class HelpRenders(unittest.TestCase):
                            capture_output=True, text=True)
         for flag in ("--copy-file-range", "--source-pool",
                      "--prune-small-subtrees", "--prune-subtree-max-bytes",
-                     "--prune-budget-bytes"):
+                     "--prune-budget-bytes", "--no-regulate"):
             self.assertIn(flag, r.stdout, f"{flag} missing from --help")
 
 
@@ -507,6 +508,269 @@ class RegulateConfigRouting(unittest.TestCase):
             self.assertIn(k, ex, "%s missing from the example config" % k)
 
 
+class RegulatorDisableIsAudible(unittest.TestCase):
+    """An omitted --config must not be the quietest way to run unregulated.
+
+    start_regulator declines to start in four places. Three already log at
+    WARNING. The no-URL path -- the one an omitted --config lands on, and by
+    far the likeliest of the four -- logged at INFO, indistinguishable from a
+    normal start in a multi-gigabyte log. Three jobs ran unregulated for hours
+    on 2026-09-28 for exactly that reason. Reverting the level to INFO must
+    fail these tests, or they are not testing anything.
+
+    --no-regulate also has to DISABLE regulation, not merely silence the
+    message: a flag read only when no URL is configured would be ignored by
+    every job that has one, which is the same quiet surprise in a new place.
+    """
+
+    def setUp(self):
+        self._saved = (vct.thread_count, vct.file_delay_ms)
+        vct.thread_count = vct.DynamicSemaphore(4)
+        vct.file_delay_ms = 2
+
+    def tearDown(self):
+        vct.thread_count, vct.file_delay_ms = self._saved
+
+    def test_omitted_config_warns(self):
+        a = Args(regulate_prometheus_url=None, no_regulate=False, dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            self.assertIsNone(vct.start_regulator(a))
+        self.assertTrue(
+            any("no regulate_prometheus_url" in m for m in got.output),
+            "an omitted --config did not warn: %r" % (got.output,))
+
+    def test_explicit_opt_out_does_not_warn(self):
+        a = Args(regulate_prometheus_url=None, no_regulate=True, dirs=["/x"])
+        with self.assertLogs(level="INFO") as got:
+            self.assertIsNone(vct.start_regulator(a))
+        self.assertFalse(
+            [r for r in got.records if r.levelno >= logging.WARNING],
+            "--no-regulate is deliberate and must stay quiet: %r" % (got.output,))
+        self.assertTrue(any("--no-regulate" in m for m in got.output),
+                        "opt-out should name itself: %r" % (got.output,))
+
+    def test_missing_attr_behaves_as_not_opted_out(self):
+        """An older namespace with no no_regulate attribute must still warn."""
+        a = Args(regulate_prometheus_url=None, dirs=["/x"])
+        self.assertFalse(hasattr(a, "no_regulate"),
+                         "Args grew a no_regulate default; this test no longer "
+                         "covers the missing-attribute case")
+        with self.assertLogs(level="WARNING"):
+            self.assertIsNone(vct.start_regulator(a))
+
+    def test_opt_out_overrides_a_configured_url(self):
+        """--no-regulate must win over a URL, and say that it is doing so.
+
+        regulate_query is deliberately left unset: if the flag were ignored,
+        control would fall through to _resolve_query and warn about the missing
+        query instead, so asserting on the message -- not merely on the None
+        return -- is what makes this test fail if the ordering regresses. It
+        also keeps the fall-through off the network.
+        """
+        url = "http://prometheus.invalid/api/v1/query"
+        a = Args(regulate_prometheus_url=url, no_regulate=True, dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            self.assertIsNone(vct.start_regulator(a))
+        self.assertTrue(
+            any("--no-regulate" in m and url in m for m in got.output),
+            "the flag must override the URL and name it: %r" % (got.output,))
+
+    def test_missing_config_file_is_named_as_missing(self):
+        a = Args(regulate_prometheus_url=None, no_regulate=False, dirs=["/x"],
+                 config="/nonexistent/vcephfs-transcoder.conf")
+        with self.assertLogs(level="WARNING") as got:
+            self.assertIsNone(vct.start_regulator(a))
+        self.assertTrue(any("which does not exist" in m for m in got.output),
+                        "a missing --config file was not named: %r" % (got.output,))
+
+    def test_existing_config_without_url_says_so(self):
+        import tempfile
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        a = Args(regulate_prometheus_url=None, no_regulate=False, dirs=["/x"],
+                 config=path)
+        with self.assertLogs(level="WARNING") as got:
+            self.assertIsNone(vct.start_regulator(a))
+        self.assertTrue(
+            any("has no regulate_prometheus_url" in m and path in m
+                for m in got.output),
+            "an existing --config without the URL was not called out: %r"
+            % (got.output,))
+
+
+class _StubRegulator:
+    """Stands in for a live regulator. Non-None is the whole contract here;
+    set_floor_base exists so a stray regulate_floor_ms key cannot AttributeError."""
+
+    def set_floor_base(self, ms):
+        self.base = ms
+
+
+class RegulatorLateConfigChangeIsAudible(unittest.TestCase):
+    """A late config change has to be reported by what it actually does.
+
+    Adding the URL to a running job's --config after an unregulated start
+    changes nothing and used to log only an INFO line that read like success.
+    But the reverse error is just as bad: regulate_prometheus_url IS live on a
+    running regulator, because sample() rebuilds the URL from args every tick,
+    so advising a restart for it sends the operator to do something pointless.
+    Only regulate_query is frozen at construction. The startup read, before
+    start_regulator() has run, must stay quiet either way."""
+
+    URL = "http://prometheus.invalid/api/v1/query"
+
+    def setUp(self):
+        self._saved = (vct.regulator, vct.regulator_started)
+        vct.regulator = None
+
+    def tearDown(self):
+        vct.regulator, vct.regulator_started = self._saved
+
+    def test_url_added_after_unregulated_start_warns(self):
+        vct.regulator_started = True
+        a = Args(regulate_prometheus_url=None, dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            vct._apply_regulate_keys(a, {"regulate_prometheus_url": self.URL})
+        self.assertEqual(a.regulate_prometheus_url, self.URL)
+        self.assertTrue(
+            any("started unregulated" in m and "restart the job" in m
+                for m in got.output),
+            "a late URL after an unregulated start did not warn: %r"
+            % (got.output,))
+
+    def test_startup_read_does_not_warn(self):
+        vct.regulator_started = False
+        a = Args(regulate_prometheus_url=None, dirs=["/x"])
+        with self.assertLogs(level="INFO") as got:
+            vct._apply_regulate_keys(a, {"regulate_prometheus_url": self.URL})
+        self.assertFalse(
+            [r for r in got.records if r.levelno >= logging.WARNING],
+            "the startup config read must not warn: %r" % (got.output,))
+
+    def test_url_change_on_running_regulator_does_not_advise_restart(self):
+        """The URL is re-read every sample, so a restart would be pointless."""
+        vct.regulator_started = True
+        vct.regulator = _StubRegulator()
+        a = Args(regulate_prometheus_url="http://old.invalid/q", dirs=["/x"])
+        with self.assertLogs(level="INFO") as got:
+            vct._apply_regulate_keys(a, {"regulate_prometheus_url": self.URL})
+        self.assertEqual(a.regulate_prometheus_url, self.URL)
+        self.assertFalse(
+            [r for r in got.records if r.levelno >= logging.WARNING],
+            "a live URL change must not warn: %r" % (got.output,))
+        self.assertFalse(
+            any("restart the job" in m for m in got.output),
+            "must not advise a restart for a key read every sample: %r"
+            % (got.output,))
+        self.assertTrue(
+            any("no restart needed" in m for m in got.output),
+            "should say the running regulator picks it up: %r" % (got.output,))
+
+    def test_query_change_on_running_regulator_advises_restart(self):
+        """regulate_query is copied into Regulator.query and never re-read."""
+        vct.regulator_started = True
+        vct.regulator = _StubRegulator()
+        a = Args(regulate_query="old", dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            vct._apply_regulate_keys(a, {"regulate_query": "new"})
+        self.assertTrue(
+            any("fixed when the regulator starts" in m and "restart" in m
+                for m in got.output),
+            "a late query change must still advise a restart: %r"
+            % (got.output,))
+
+    def test_url_cleared_on_running_regulator_warns(self):
+        """Clearing it breaks every sample; that must not pass as routine."""
+        vct.regulator_started = True
+        vct.regulator = _StubRegulator()
+        a = Args(regulate_prometheus_url=self.URL, dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            vct._apply_regulate_keys(a, {"regulate_prometheus_url": ""})
+        self.assertTrue(
+            any("was cleared" in m and "every sample will now fail" in m
+                for m in got.output),
+            "clearing the URL under a running regulator did not warn: %r"
+            % (got.output,))
+
+    def test_unregulated_by_flag_says_drop_the_flag(self):
+        """A plain restart keeps --no-regulate and so changes nothing."""
+        vct.regulator_started = True
+        vct.regulator = None
+        a = Args(regulate_prometheus_url=None, no_regulate=True, dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            vct._apply_regulate_keys(a, {"regulate_prometheus_url": self.URL})
+        self.assertTrue(
+            any("--no-regulate" in m and "WITHOUT" in m for m in got.output),
+            "must say the restart has to drop the flag: %r" % (got.output,))
+
+    def test_cleared_url_sample_names_the_cause(self):
+        """sample() must name the cause, not surface a bare NoneType + str TypeError."""
+        a = Args(regulate_prometheus_url=self.URL, regulate_query="q",
+                 regulate_pause_ms=150.0, regulate_slo_ms=75.0,
+                 regulate_period_s=30, regulate_floor_ms=20,
+                 regulate_quiet_ticks=3, dirs=["/x"])
+        r = vct.Regulator(a, "q")
+        a.regulate_prometheus_url = None
+        with self.assertRaises(ValueError) as caught:
+            r.sample()
+        self.assertIn("is empty", str(caught.exception))
+
+    def test_url_cleared_on_unregulated_run_does_not_advise_restart(self):
+        """Clearing a key nothing is using leaves nothing to take effect."""
+        vct.regulator_started = True
+        vct.regulator = None
+        for flag in (False, True):
+            a = Args(regulate_prometheus_url=self.URL, no_regulate=flag,
+                     dirs=["/x"])
+            with self.assertLogs(level="INFO") as got:
+                vct._apply_regulate_keys(a, {"regulate_prometheus_url": ""})
+            self.assertFalse(
+                [r for r in got.records if r.levelno >= logging.WARNING],
+                "clearing a key on an unregulated run must not advise a "
+                "restart (no_regulate=%s): %r" % (flag, got.output))
+
+    def test_other_key_after_declined_start_warns(self):
+        """Fixing slo_ms/pause_ms after the regulator declined changes nothing."""
+        vct.regulator_started = True
+        vct.regulator = None
+        a = Args(regulate_slo_ms=150.0, regulate_pause_ms=150.0, dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            vct._apply_regulate_keys(a, {"regulate_slo_ms": 75.0})
+        self.assertTrue(
+            any("regulate soft target" in m and "started unregulated" in m
+                for m in got.output),
+            "a late slo_ms fix after a declined start did not warn: %r"
+            % (got.output,))
+
+    def test_period_change_reaches_a_running_loop(self):
+        """regulate_period_s used to be read once, before the loop."""
+        a = Args(regulate_prometheus_url=None, regulate_query="q",
+                 regulate_pause_ms=150.0, regulate_slo_ms=75.0,
+                 regulate_period_s=30, regulate_floor_ms=20,
+                 regulate_quiet_ticks=3, dirs=["/x"])
+        r = vct.Regulator(a, "q")
+        waits = []
+
+        class _Exit:
+            def is_set(self):
+                return len(waits) >= 2
+
+            def wait(self, t):
+                waits.append(t)
+                a.regulate_period_s = 60
+
+        saved = vct.do_exit
+        vct.do_exit = _Exit()
+        try:
+            with self.assertLogs(level="WARNING"):
+                r.run()
+        finally:
+            vct.do_exit = saved
+        self.assertEqual(waits, [30, 60],
+                         "a mid-run period change was not picked up")
+
+
 class PathsFromList(unittest.TestCase):
     """--paths-from replaces the walk, so its reader and its containment check
     are the only things standing between a stale or wrong list and the data."""
@@ -770,8 +1034,8 @@ class ThreadAdaptivity(unittest.TestCase):
         Once the ceiling sits at the --threads floor, new = max(level - 1,
         base) == cur for every pause, so a clock gated on the ceiling actually
         moving would never restart -- and the ceiling would be released a poll
-        period after a pause. That is the configuration this release exists to
-        rescue, so it is the one that has to be held. Fails if the clock reset sits inside
+        period after a pause. That is the `--threads 1` configuration exactly, so it is
+        the one that has to be held. Fails if the clock reset sits inside
         `if new < cur:`."""
         r = self._reg(threads=1, maxt=8)
         vct.thread_count.set_limit(2)
