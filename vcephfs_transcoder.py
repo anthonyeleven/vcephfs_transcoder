@@ -12,7 +12,7 @@ import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
 import threading, uuid, argparse
 
-_VERSION = "2061"
+_VERSION = "2112"
 
 # Replacing a file must be serialized against another worker replacing the
 # SAME file -- that is the only invariant here. A single global lock also
@@ -176,7 +176,7 @@ CONFIG_DIR = os.path.expanduser("~")
 # --prune-dir-regex to replace the set, or --prune-dir-regex '' to disable
 # pruning entirely. The effective pattern is logged at startup either way.
 #
-# Measured in production: 86.5% of files under the two largest volumes sit
+# Measured in production: 86.5% of files under the two largest volumes sit inside
 # virtualenvs, and the largest of 585,309 of them is 503,423 bytes -- below the
 # 512,000 byte threshold, so nothing eligible is lost. csa spent 22 days at
 # 1.17% of its volume grinding a Bazel .runfiles tree carrying a pip
@@ -202,6 +202,11 @@ DEFAULT_PRUNE_REGEX = "^(%s)$" % "|".join(re.escape(d) for d in DEFAULT_PRUNE_DI
 runtime_config = None
 apply_config = None
 regulator = None
+# True once start_regulator() has run, whether or not it started a regulator.
+# The regulator is decided once, so a later change to its URL or query is only
+# meaningful to warn about after that point -- and it matters most when the run
+# came up unregulated, where regulator stays None.
+regulator_started = False
 
 
 def config_example(volume="VOLUME"):
@@ -266,7 +271,8 @@ def config_example(volume="VOLUME"):
         "# --- self-regulation ----------------------------------------------------",
         "# Throttle against what the filesystem's OTHER clients experience, which",
         "# this job cannot observe from its own copy latency. Entirely optional:",
-        "# leave the URL empty and the regulator never starts.",
+        "# leave the URL empty and the regulator never starts, though the job",
+        "# then logs that at WARNING unless it was run with --no-regulate.",
         "#",
         "# The query is a complete PromQL expression and must evaluate to exactly",
         "# one series whose value is MILLISECONDS. Nothing here assumes Ceph, or",
@@ -1325,7 +1331,19 @@ class Regulator(threading.Thread):
     # -- data -----------------------------------------------------------------
     def sample(self):
         """Latency in ms, or None when there is no usable answer."""
-        url = self.args.regulate_prometheus_url + "?" + urllib.parse.urlencode(
+        base = self.args.regulate_prometheus_url
+        if not base:
+            # regulate_prometheus_url is a live tunable, so it can be cleared
+            # under a running regulator. Concatenating it raised TypeError,
+            # which run()'s hold path did log, but only as a bare
+            # "unsupported operand type(s) for +: 'NoneType' and 'str'" --
+            # nothing pointing at a config the operator had just emptied.
+            # Raise the specific reason and let the same rate-limited hold
+            # path report it.
+            raise ValueError(
+                "regulate_prometheus_url is empty -- it was cleared in "
+                "--config after this regulator started")
+        url = base + "?" + urllib.parse.urlencode(
             {"query": self.query})
         with urllib.request.urlopen(url, timeout=45) as r:
             d = json.load(r)
@@ -1575,11 +1593,12 @@ class Regulator(threading.Thread):
         The delay floor got that release. The thread ceiling did not, and it is
         the more expensive of the two to lose.
 
-        Observed 2026-09-23 on a drain that paused once at two threads -- which
-        set the ceiling to max(2 - 1, base) = 1 -- and then ran single-threaded
-        for three and a half hours while its MDS reported 5 ms against a 51 ms
-        target. Nothing short of an operator editing regulate_max_threads could
-        free it, and there was no line in the log saying why it was slow.
+        Observed 2026-09-23 on a drain, started --threads 1. It paused
+        once at two threads, which set the ceiling to max(2 - 1, base) = 1, and
+        then ran single-threaded for three and a half hours while its MDS
+        reported 5.2 ms against a 51 ms target. Nothing short of an operator
+        editing regulate_max_threads could free it, and there was no line in
+        the log saying why it was slow.
 
         One step per quiet interval, the same shape as the floor's decay, so a
         ceiling earned by several pauses is handed back no faster than it was
@@ -1602,8 +1621,11 @@ class Regulator(threading.Thread):
 
     # -- loop -----------------------------------------------------------------
     def run(self):
-        period = max(5, int(self.args.regulate_period_s))
         while not do_exit.is_set():
+            # Re-read every tick: regulate_period_s is a --config tunable, and
+            # reading it once before the loop froze it while the INFO line for
+            # a change still read like success.
+            period = max(5, int(self.args.regulate_period_s))
             try:
                 lat = self.sample()
             except Exception as e:
@@ -1643,12 +1665,128 @@ class Regulator(threading.Thread):
             do_exit.wait(period)
 
 
+def _apply_regulate_keys(args, cfg):
+    """Apply the REGULATE_APPLY keys from a parsed config dict to args.
+
+    Split out of main()'s _apply_config so the late-change warning is testable.
+
+    What a late change does depends on the key and on whether a regulator is
+    actually running:
+
+      - regulate_prometheus_url on a RUNNING regulator is live. sample()
+        rebuilds the URL from args every tick and this function mutates that
+        same namespace, so the next poll uses it. Advising a restart here
+        would be wrong. Clearing it is the exception worth warning about.
+      - regulate_query is frozen into Regulator.query at construction, so a
+        change to it really does need a restart.
+      - With no regulator running, no REGULATE_APPLY key takes effect,
+        because the regulator is only ever started at startup -- whether it
+        was never configured, was declined (e.g. slo_ms >= pause_ms), or was
+        suppressed by --no-regulate, in which case the restart has to drop
+        that flag too. Clearing a key there is the exception: nothing is
+        waiting to take effect, so the plain INFO line is accurate.
+      - The other tunables are read from args on every tick (or, for
+        regulate_floor_ms, pushed through set_floor_base), so the INFO line
+        is accurate for them on a running regulator.
+
+    The bare setattr logs an INFO line that reads like success either way, so
+    the cases that change nothing have to warn.
+    """
+    for _k, _label in REGULATE_APPLY:
+        if _k in cfg and cfg[_k] != getattr(args, _k, None):
+            _old = getattr(args, _k, None)
+            setattr(args, _k, cfg[_k])
+            logging.info("Config: %s %s -> %s", _label, _old, cfg[_k])
+            _cleared = cfg[_k] is None or cfg[_k] == ""
+            if not regulator_started:
+                pass
+            elif regulator is None:
+                if _cleared:
+                    pass
+                elif getattr(args, "no_regulate", False):
+                    logging.warning(
+                        "Config: %s changed, but this run is unregulated "
+                        "because of --no-regulate and the regulator is only "
+                        "started at startup -- restart the job WITHOUT "
+                        "--no-regulate for this to take effect", _label)
+                else:
+                    logging.warning(
+                        "Config: %s changed, but this run started unregulated "
+                        "and the regulator is only started at startup -- "
+                        "restart the job for this to take effect", _label)
+            elif _k == 'regulate_query':
+                logging.warning(
+                    "Config: %s changed, but the query is fixed when the "
+                    "regulator starts -- restart the job for this to take "
+                    "effect", _label)
+            elif _k == 'regulate_prometheus_url':
+                if _cleared:
+                    logging.warning(
+                        "Config: %s was cleared while the regulator is "
+                        "running -- every sample will now fail and it will "
+                        "hold its current settings. Set a URL, or restart "
+                        "with --no-regulate if the run should be "
+                        "unregulated.", _label)
+                else:
+                    logging.info(
+                        "Config: %s is re-read on every sample -- the running "
+                        "regulator picks it up at its next poll, no restart "
+                        "needed", _label)
+            if _k == 'regulate_floor_ms' and regulator is not None:
+                regulator.set_floor_base(cfg[_k])
+
+
 def start_regulator(args):
     """Start the regulator, or explain once why it is not running."""
-    if not getattr(args, "regulate_prometheus_url", None):
-        logging.info("Self-regulation disabled (no regulate_prometheus_url); "
-                     "running at file_delay=%dms threads=%d",
-                     file_delay_ms, thread_count.limit)
+    url = getattr(args, "regulate_prometheus_url", None)
+    # --no-regulate is tested FIRST, and before the URL, because it has to mean
+    # what its name says: regulation is off. Reading it only when no URL was
+    # configured would leave the flag silently ignored by any job that has one,
+    # which is the same class of quiet surprise this whole function was changed
+    # to stop. A configured-URL-plus-flag conflict therefore warns; the plain
+    # deliberate case stays quiet.
+    if getattr(args, "no_regulate", False):
+        if url:
+            logging.warning(
+                "Self-regulation disabled by --no-regulate, which overrides the "
+                "configured regulate_prometheus_url (%s) and regulate_query -- "
+                "both ignored for this run. Running at file_delay=%dms "
+                "threads=%d.",
+                url, file_delay_ms, thread_count.limit)
+        else:
+            logging.info("Self-regulation disabled by --no-regulate; "
+                         "running at file_delay=%dms threads=%d",
+                         file_delay_ms, thread_count.limit)
+        return None
+    if not url:
+        # Of the ways this function declines to start, an omitted --config is
+        # the likeliest, and it was the only one logged below WARNING while the
+        # three below it warn. That made the common accident the quietest, and
+        # indistinguishable from a normal start in a multi-gigabyte log. A run
+        # that means to go unregulated says so with --no-regulate and stays
+        # quiet; an omission is now greppable.
+        #
+        # Name the --config path when there is one: RuntimeConfig.poll() is
+        # silent on FileNotFoundError for its first read (_mtime is None), so a
+        # --config pointing at a file that does not exist arrives here having
+        # logged nothing at all, and "set the keys in --config" would otherwise
+        # be advice about a file the operator thinks they already wrote. The
+        # file is on local disk, so check which of the two it is and say so.
+        cfg = getattr(args, "config", None)
+        if cfg and not os.path.exists(cfg):
+            where = ("in --config %s, which does not exist, or with "
+                     "--regulate-prometheus-url and --regulate-query" % cfg)
+        elif cfg:
+            where = ("in --config %s, which has no regulate_prometheus_url, or "
+                     "with --regulate-prometheus-url and --regulate-query" % cfg)
+        else:
+            where = ("with --regulate-prometheus-url and --regulate-query, or "
+                     "in a --config file")
+        logging.warning(
+            "Self-regulation disabled (no regulate_prometheus_url); running at "
+            "file_delay=%dms threads=%d. Set the URL and query %s, or pass "
+            "--no-regulate to declare that this run is meant to be unregulated.",
+            file_delay_ms, thread_count.limit, where)
         return None
     query, why = _resolve_query(args)
     if not query:
@@ -3153,8 +3291,9 @@ def process_files(args):
         for line in f:
             mountpoints.add(line.split()[1])
 
-    global regulator
+    global regulator, regulator_started
     regulator = start_regulator(args)
+    regulator_started = True
 
     global run_journal
     run_journal = RunJournal(
@@ -3440,6 +3579,14 @@ def main():
              "hatch only.",
     )
     parser.add_argument(
+        "--no-regulate",
+        action="store_true",
+        help="run unregulated, deliberately. Without this, starting with no "
+             "regulate_prometheus_url logs at WARNING rather than INFO, because "
+             "an omitted --config is otherwise indistinguishable from an "
+             "intended unregulated run.",
+    )
+    parser.add_argument(
         "--force-tmpdir-pool",
         action="store_true",
         help="proceed even if the tmpdir is in a target pool. Disables the only "
@@ -3490,7 +3637,9 @@ def main():
         metavar="URL",
         help="Prometheus /api/v1/query endpoint for self-regulation. Unset "
              "(the default) disables regulation entirely and the job simply "
-             "runs at --file-delay and --threads.",
+             "runs at --file-delay and --threads -- and says so at WARNING, "
+             "since an accidental omission looks exactly like a deliberate "
+             "one. Pass --no-regulate to declare it deliberate and quiet.",
     )
     parser.add_argument(
         "--regulate-query",
@@ -3948,20 +4097,7 @@ def main():
                         args.min_size // 8,
                         args.prune_budget_bytes,
                     )
-        for _k, _label in REGULATE_APPLY:
-            if _k in cfg and cfg[_k] != getattr(args, _k, None):
-                _old = getattr(args, _k, None)
-                setattr(args, _k, cfg[_k])
-                logging.info("Config: %s %s -> %s", _label, _old, cfg[_k])
-                # The regulator is started once, so these two decide only whether
-                # it came up at all. Changing them later looks like it worked.
-                if _k in ('regulate_prometheus_url', 'regulate_query') \
-                        and regulator is not None:
-                    logging.warning(
-                        "Config: %s changed, but the regulator is started once at "
-                        "startup -- restart the job for this to take effect", _label)
-                if _k == 'regulate_floor_ms' and regulator is not None:
-                    regulator.set_floor_base(cfg[_k])
+        _apply_regulate_keys(args, cfg)
         for _k, _label in (('prune_subtree_max_bytes', 'prune subtree ceiling'),
                            ('prune_budget_bytes', 'prune budget')):
             if _k in cfg and cfg[_k] != getattr(args, _k):
