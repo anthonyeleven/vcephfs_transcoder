@@ -8,9 +8,11 @@ prune that skips more data than intended, or a warning that stops being true.
 """
 import argparse
 import logging
+import signal
 import importlib.util
 import os
 import sys
+import shlex
 import shutil
 import threading
 import time
@@ -575,6 +577,16 @@ class RegulatorDisableIsAudible(unittest.TestCase):
             any("--no-regulate" in m and url in m for m in got.output),
             "the flag must override the URL and name it: %r" % (got.output,))
 
+    def test_opt_out_override_does_not_log_url_credentials(self):
+        url = "http://bob:hunter2@prometheus.invalid/api/v1/query"
+        a = Args(regulate_prometheus_url=url, no_regulate=True, dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            self.assertIsNone(vct.start_regulator(a))
+        self.assertFalse(any("hunter2" in m for m in got.output),
+                         "credentials logged: %r" % (got.output,))
+        self.assertTrue(any("prometheus.invalid" in m for m in got.output),
+                        "host should still be named: %r" % (got.output,))
+
     def test_missing_config_file_is_named_as_missing(self):
         a = Args(regulate_prometheus_url=None, no_regulate=False, dirs=["/x"],
                  config="/nonexistent/vcephfs-transcoder.conf")
@@ -621,15 +633,20 @@ class RegulatorLateConfigChangeIsAudible(unittest.TestCase):
     URL = "http://prometheus.invalid/api/v1/query"
 
     def setUp(self):
-        self._saved = (vct.regulator, vct.regulator_started)
+        self._saved = (vct.regulator, vct.regulator_started,
+                       vct.thread_count, vct.file_delay_ms)
         vct.regulator = None
+        # start_regulator() reports these in its decline messages.
+        vct.thread_count = vct.DynamicSemaphore(4)
+        vct.file_delay_ms = 2
 
     def tearDown(self):
-        vct.regulator, vct.regulator_started = self._saved
+        (vct.regulator, vct.regulator_started,
+         vct.thread_count, vct.file_delay_ms) = self._saved
 
     def test_url_added_after_unregulated_start_warns(self):
         vct.regulator_started = True
-        a = Args(regulate_prometheus_url=None, dirs=["/x"])
+        a = Args(regulate_prometheus_url=None, regulate_query="q", dirs=["/x"])
         with self.assertLogs(level="WARNING") as got:
             vct._apply_regulate_keys(a, {"regulate_prometheus_url": self.URL})
         self.assertEqual(a.regulate_prometheus_url, self.URL)
@@ -638,6 +655,25 @@ class RegulatorLateConfigChangeIsAudible(unittest.TestCase):
                 for m in got.output),
             "a late URL after an unregulated start did not warn: %r"
             % (got.output,))
+
+    def test_late_change_names_every_missing_precondition(self):
+        """Both missing preconditions, not just the first one found.
+
+        _regulator_decline_reason() stopped at the first reason, so an
+        unregulated run missing BOTH the URL and the query reported only the
+        URL. The operator set it, reloaded, and only then heard about the
+        query -- one round trip per missing precondition.
+        """
+        vct.regulator_started = True
+        a = Args(regulate_prometheus_url=None, regulate_query=None,
+                 dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            vct._apply_regulate_keys(a, {"regulate_period_s": 45})
+        blob = " ".join(got.output)
+        self.assertIn("regulate_prometheus_url", blob,
+                      "the missing URL was not named: %r" % (got.output,))
+        self.assertIn("regulate_query", blob,
+                      "the missing query was not named too: %r" % (got.output,))
 
     def test_startup_read_does_not_warn(self):
         vct.regulator_started = False
@@ -731,17 +767,172 @@ class RegulatorLateConfigChangeIsAudible(unittest.TestCase):
                 "restart (no_regulate=%s): %r" % (flag, got.output))
 
     def test_other_key_after_declined_start_warns(self):
-        """Fixing slo_ms/pause_ms after the regulator declined changes nothing."""
+        """Fixing slo_ms/pause_ms after the regulator declined changes nothing.
+
+        URL and query are both set, so the regulator declined on slo_ms >=
+        pause_ms and a restart with the fix really would start it."""
         vct.regulator_started = True
         vct.regulator = None
-        a = Args(regulate_slo_ms=150.0, regulate_pause_ms=150.0, dirs=["/x"])
+        a = Args(regulate_prometheus_url=self.URL, regulate_query="q",
+                 regulate_slo_ms=150.0, regulate_pause_ms=150.0, dirs=["/x"])
         with self.assertLogs(level="WARNING") as got:
             vct._apply_regulate_keys(a, {"regulate_slo_ms": 75.0})
         self.assertTrue(
             any("regulate soft target" in m and "started unregulated" in m
+                and "restart the job for this to take effect" in m
                 for m in got.output),
             "a late slo_ms fix after a declined start did not warn: %r"
             % (got.output,))
+
+    def test_other_key_with_no_url_says_restart_is_not_enough(self):
+        """With no URL, a restart comes back unregulated: advise none."""
+        vct.regulator_started = True
+        vct.regulator = None
+        a = Args(regulate_prometheus_url=None, regulate_query="q", dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            vct._apply_regulate_keys(a, {"regulate_slo_ms": 50.0})
+        self.assertFalse(
+            any("restart the job for this to take effect" in m
+                for m in got.output),
+            "advised a restart that cannot help: %r" % (got.output,))
+        self.assertTrue(
+            any("would still decline" in m
+                and "no regulate_prometheus_url is set" in m
+                for m in got.output),
+            "should name the missing URL: %r" % (got.output,))
+
+    def test_url_added_without_query_names_the_query(self):
+        """A URL alone is not enough; the query is still missing."""
+        vct.regulator_started = True
+        vct.regulator = None
+        a = Args(regulate_prometheus_url=None, regulate_query=None, dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            vct._apply_regulate_keys(a, {"regulate_prometheus_url": self.URL})
+        self.assertTrue(
+            any("would still decline" in m and "regulate_query" in m
+                for m in got.output),
+            "should name the missing query: %r" % (got.output,))
+        self.assertFalse(
+            any("restart the job for this to take effect" in m
+                for m in got.output),
+            "advised a restart that cannot help: %r" % (got.output,))
+
+    def test_url_credentials_are_not_logged(self):
+        """Basic-auth userinfo must never reach the log, stored or not.
+
+        At STARTUP the URL is deliberately stored and start_regulator() does
+        the refusing (see test_config_credentialed_url_is_refused_by_startup):
+        refusing here as well left args.regulate_prometheus_url None, so
+        start_regulator() fell through to its "no regulate_prometheus_url"
+        branch and told the operator a --config file that plainly has one does
+        not. Either way the credential must not be logged."""
+        vct.regulator_started = False
+        a = Args(regulate_prometheus_url=None, dirs=["/x"])
+        secret = "http://bob:hunter2@prom.invalid:9090/api/v1/query"
+        with self.assertLogs(level="INFO") as got:
+            vct._apply_regulate_keys(a, {"regulate_prometheus_url": secret})
+        self.assertFalse(any("hunter2" in m for m in got.output),
+                         "password logged: %r" % (got.output,))
+        self.assertTrue(any("prom.invalid:9090" in m for m in got.output),
+                        "host should still be logged: %r" % (got.output,))
+
+    def test_late_credentialed_url_is_refused(self):
+        """Once a regulator is running, a credentialed URL is not stored."""
+        vct.regulator_started = True
+        vct.regulator = _StubRegulator()
+        a = Args(regulate_prometheus_url="http://old.invalid/q", dirs=["/x"])
+        secret = "http://bob:hunter2@prom.invalid:9090/api/v1/query"
+        with self.assertLogs(level="WARNING") as got:
+            vct._apply_regulate_keys(a, {"regulate_prometheus_url": secret})
+        self.assertEqual(a.regulate_prometheus_url, "http://old.invalid/q",
+                         "a credentialed URL replaced a working one")
+        self.assertFalse(any("hunter2" in m for m in got.output),
+                         "password logged: %r" % (got.output,))
+
+    def test_config_credentialed_url_is_refused_by_startup(self):
+        """A --config URL must reach start_regulator()'s refusal, not its
+        "no regulate_prometheus_url" branch.
+
+        poll() runs before process_files(), so refusing at apply time left the
+        value None and start_regulator() then reported a file with a URL in it
+        as having none -- and the HTTPBasicAuthHandler advice only ever fired
+        for a URL given on the command line."""
+        vct.regulator_started = False
+        vct.regulator = None
+        secret = "http://bob:hunter2@prom.invalid:9090/api/v1/query"
+        a = Args(regulate_prometheus_url=None, regulate_query="q",
+                 dirs=["/x"], config="/nonexistent/tc.conf")
+        with self.assertLogs(level="INFO") as got:
+            vct._apply_regulate_keys(a, {"regulate_prometheus_url": secret})
+            self.assertIsNone(vct.start_regulator(a))
+        self.assertFalse(
+            any("has no regulate_prometheus_url" in m for m in got.output),
+            "claimed the config has no URL when it has a credentialed one: %r"
+            % (got.output,))
+        self.assertTrue(
+            any("embedded credentials" in m and "HTTPBasicAuthHandler" in m
+                for m in got.output),
+            "startup should explain the credential refusal: %r" % (got.output,))
+        self.assertFalse(any("hunter2" in m for m in got.output),
+                         "password logged: %r" % (got.output,))
+
+    def test_unparseable_credentialed_url_fails_closed(self):
+        """urlsplit() raises on some URLs urllib still sends (item A).
+
+        "http://bob:hunter2@[prom/..." -- an unbalanced bracket. urlsplit()
+        raises, so deriving credentials from it returned nothing: both
+        rejection layers admitted the URL and redaction had nothing to scrub,
+        and urllib's InvalidURL("nonnumeric port: 'hunter2@[prom'") put the
+        password in the log at WARNING."""
+        bad = "http://bob:hunter2@[prom/api/v1/query"
+        self.assertTrue(vct._url_has_userinfo(bad),
+                        "unparseable credentialed URL not detected")
+        self.assertIn("hunter2", vct._url_credentials(bad))
+        self.assertNotIn(
+            "hunter2",
+            vct._redact_text("nonnumeric port: 'hunter2@[prom'", bad),
+            "password survived redaction for an unparseable URL")
+        self.assertNotIn("hunter2", str(vct._loggable_url(bad)))
+
+    def test_percent_encoded_password_is_redacted(self):
+        """Request._parse() unquotes the host, so the DECODED form appears."""
+        url = "http://bob:p%40ss@prom.invalid/api/v1/query"
+        out = vct._redact_text("nonnumeric port: 'p@ss@prom.invalid'", url)
+        self.assertNotIn("p@ss", out, "decoded password survived: %r" % out)
+
+    def test_redaction_is_longest_first(self):
+        """A username that is a prefix of the password must not half-redact."""
+        url = "http://bob:bobSecret@prom.invalid/api/v1/query"
+        out = vct._redact_text("nonnumeric port: 'bobSecret@prom.invalid'", url)
+        self.assertNotIn("bobSecret", out, "password survived: %r" % out)
+        self.assertNotIn("Secret", out,
+                         "password was only partly redacted: %r" % out)
+
+    def test_one_reload_adding_url_and_query_is_not_contradictory(self):
+        """Deciding per key mid-loop read a half-applied namespace.
+
+        The URL is handled first, while args.regulate_query is still None, so
+        the operator got "set regulate_query, then restart" for the URL and
+        "restart the job for this to take effect" for the query -- in the same
+        reload, for the one edit the startup warning had asked them to make."""
+        vct.regulator_started = True
+        vct.regulator = None
+        a = Args(regulate_prometheus_url=None, regulate_query=None, dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            vct._apply_regulate_keys(
+                a, {"regulate_prometheus_url": self.URL, "regulate_query": "q"})
+        self.assertFalse(any("still has no" in m for m in got.output),
+                         "half-applied advice survived: %r" % (got.output,))
+        self.assertFalse(any("would still decline" in m for m in got.output),
+                         "both keys were set, nothing should decline: %r"
+                         % (got.output,))
+        self.assertEqual(
+            len([r for r in got.records if r.levelno >= logging.WARNING]), 1,
+            "should warn once for the whole reload: %r" % (got.output,))
+
+    def test_loggable_url_leaves_plain_urls_alone(self):
+        self.assertEqual(vct._loggable_url(self.URL), self.URL)
+        self.assertIsNone(vct._loggable_url(None))
 
     def test_period_change_reaches_a_running_loop(self):
         """regulate_period_s used to be read once, before the loop."""
@@ -769,6 +960,551 @@ class RegulatorLateConfigChangeIsAudible(unittest.TestCase):
             vct.do_exit = saved
         self.assertEqual(waits, [30, 60],
                          "a mid-run period change was not picked up")
+
+
+
+class RegulatorUrlCredentialsNeverLogged(unittest.TestCase):
+    """A password in regulate_prometheus_url must never reach the log.
+
+    urllib.request.urlopen() does not use URL userinfo for authentication: it
+    passes "user:pw@host" to http.client as the HOSTNAME. With no explicit
+    port that dies in _get_hostport() as
+    InvalidURL("nonnumeric port: 'pw@host'"); with one it fails DNS on the
+    same string. Either way the exception text carries the PASSWORD -- not a
+    "user:pw@" pair that a shape-matching regex would catch -- and both
+    "first sample failed (%s)" and "no usable sample (%s)" logged it verbatim
+    at WARNING.
+
+    Two layers, tested separately: such a URL is refused where it is applied,
+    and any error text is still scrubbed against the URL's known credentials.
+    Removing either must fail a test here.
+    """
+
+    PW = "hunter2"
+    URL = "http://bob:hunter2@prom/api/v1/query"
+
+    def setUp(self):
+        self._saved = (vct.thread_count, vct.file_delay_ms,
+                       vct.regulator, vct.regulator_started)
+        vct.thread_count = vct.DynamicSemaphore(4)
+        vct.file_delay_ms = 2
+        vct.regulator = None
+
+    def tearDown(self):
+        (vct.thread_count, vct.file_delay_ms,
+         vct.regulator, vct.regulator_started) = self._saved
+
+    def _no_secret(self, records, where):
+        leaked = [m for m in records if self.PW in m]
+        self.assertFalse(leaked, "password reached the log via %s: %r"
+                         % (where, leaked))
+
+    def test_credentialed_url_is_rejected_at_startup(self):
+        a = Args(regulate_prometheus_url=self.URL, regulate_query="q",
+                 no_regulate=False, dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            self.assertIsNone(vct.start_regulator(a),
+                              "a credentialed URL started a regulator")
+        self.assertTrue(any("credentials" in m for m in got.output),
+                        "rejection was not explained: %r" % (got.output,))
+        self._no_secret(got.output, "start_regulator")
+
+    def test_credentialed_url_is_not_applied_late(self):
+        vct.regulator_started = True
+        vct.regulator = _StubRegulator()
+        keep = "http://prom.invalid/api/v1/query"
+        a = Args(regulate_prometheus_url=keep, regulate_query="q", dirs=["/x"])
+        with self.assertLogs(level="WARNING") as got:
+            vct._apply_regulate_keys(a, {"regulate_prometheus_url": self.URL})
+        self.assertEqual(a.regulate_prometheus_url, keep,
+                         "a credentialed URL was stored on args")
+        self.assertTrue(any("NOT" in m and "credentials" in m
+                            for m in got.output),
+                        "silent refusal: %r" % (got.output,))
+        self._no_secret(got.output, "_apply_regulate_keys")
+
+    def test_malformed_port_with_userinfo_does_not_raise(self):
+        """.port raises ValueError here; urlsplit() does not, so it escaped."""
+        bad = "http://u:%s@prom:90x0/api/v1/query" % self.PW
+        got = vct._loggable_url(bad)          # must not raise
+        self.assertNotIn(self.PW, str(got))
+        vct.regulator_started = True
+        a = Args(regulate_prometheus_url="http://prom.invalid/", dirs=["/x"])
+        with self.assertLogs(level="INFO") as logs:
+            vct._apply_regulate_keys(a, {"regulate_prometheus_url": bad})
+        self._no_secret(logs.output, "_loggable_url via _apply_regulate_keys")
+
+    def test_redact_text_scrubs_the_password_not_a_shape(self):
+        """The real CPython message holds "pw@host", not "user:pw@"."""
+        msg = "nonnumeric port: '%s@prom'" % self.PW
+        out = vct._redact_text(msg, self.URL)
+        self.assertNotIn(self.PW, out)
+        self.assertIn("<redacted>", out)
+
+    def test_run_loop_redacts_credentials_in_error_text(self):
+        """The hold path logs the exception; scrub it against the URL."""
+        a = Args(regulate_prometheus_url=self.URL, regulate_query="q",
+                 regulate_pause_ms=150.0, regulate_slo_ms=51.0,
+                 regulate_period_s=5, regulate_floor_ms=0,
+                 regulate_quiet_ticks=3, dirs=["/x"],
+                 regulate_max_threads=6)
+        reg = vct.Regulator(a, "q")
+        was_set = vct.do_exit.is_set()
+        vct.do_exit.clear()
+
+        def boom():
+            # Stop the loop after this one iteration, then fail the way
+            # http.client does for a credentialed URL.
+            vct.do_exit.set()
+            raise Exception("nonnumeric port: '%s@prom'" % self.PW)
+
+        reg.sample = boom
+        try:
+            with self.assertLogs(level="WARNING") as got:
+                reg.run()
+        finally:
+            if was_set:
+                vct.do_exit.set()
+            else:
+                vct.do_exit.clear()
+        self.assertTrue(any("no usable sample" in m for m in got.output),
+                        "the hold path did not log: %r" % (got.output,))
+        self._no_secret(got.output, "Regulator.run")
+
+
+class CommandLineCredentialsRedacted(unittest.TestCase):
+    """A credential on the command line must not reach the log or `ps`.
+
+    main() logs the whole command line in its Starting:/Finished: lines, and
+    _report_state() logs _amended_cmdline() on every signal and every "Config
+    reloaded" -- which also feeds setproctitle(). The first attempt at this
+    scrubbed the JOINED string against the value found under the full
+    "--regulate-prometheus-url" spelling, and was wrong three ways, one per
+    test below:
+
+      - main()'s parser is NOT built with allow_abbrev=False, so argparse
+        accepts any unique prefix. "--regulate-prom URL" set the value while
+        the scrubber matched nothing.
+      - Replacing the credential substrings across the whole joined line hit
+        every other occurrence, so username "data" rewrote an unrelated
+        "--tmpdir /data/tmp".
+      - shlex.join() quotes first, so a password containing an apostrophe was
+        re-quoted and the raw-substring replace missed it.
+
+    Redaction is per-token now, before the join, so the flag spelling and the
+    password's contents are both irrelevant.
+    """
+
+    PW = "hunter2"
+
+    def setUp(self):
+        self._saved = (list(sys.argv), vct.thread_count, vct.min_age_days,
+                       vct.file_delay_ms)
+        vct.thread_count = vct.DynamicSemaphore(4)
+        vct.min_age_days = 1
+        vct.file_delay_ms = 2
+
+    def tearDown(self):
+        (argv, vct.thread_count, vct.min_age_days,
+         vct.file_delay_ms) = self._saved
+        sys.argv = argv
+
+    def _cmdline(self, argv):
+        sys.argv = list(argv)
+        return vct._amended_cmdline()
+
+    def test_abbreviated_flag_is_redacted(self):
+        out = self._cmdline(["tc.py", "--regulate-prom",
+                             "http://bob:%s@prom/api/v1/query" % self.PW,
+                             "/vol"])
+        self.assertNotIn(self.PW, out,
+                         "an abbreviated flag leaked the password: %r" % out)
+        self.assertIn("<redacted>@prom", out,
+                      "the URL was not redacted at all: %r" % out)
+
+    def test_joined_flag_form_is_redacted(self):
+        out = self._cmdline(
+            ["tc.py",
+             "--regulate-prometheus-url=http://bob:%s@prom/q" % self.PW,
+             "/vol"])
+        self.assertNotIn(self.PW, out,
+                         "the --flag=URL form leaked the password: %r" % out)
+
+    def test_password_with_a_quote_is_redacted(self):
+        pw = "hun'ter"
+        out = self._cmdline(["tc.py", "--regulate-prometheus-url",
+                             "http://bob:%s@prom/q" % pw, "/vol"])
+        self.assertNotIn(pw, out,
+                         "a quoted password survived the join: %r" % out)
+        self.assertNotIn("hun", out,
+                         "part of the password survived: %r" % out)
+
+    def test_unrelated_argument_is_not_mangled(self):
+        """Username "data" must not rewrite --tmpdir /data/tmp."""
+        out = self._cmdline(["tc.py", "--regulate-prometheus-url",
+                             "http://data:%s@prom/q" % self.PW,
+                             "--tmpdir", "/data/tmp", "/vol"])
+        self.assertNotIn(self.PW, out,
+                         "the password leaked: %r" % out)
+        self.assertIn("/data/tmp", out,
+                      "an unrelated argument was rewritten: %r" % out)
+
+
+class UserinfoBoundaryFailsClosed(unittest.TestCase):
+    """A password containing "/", "?" or "#" must not hide its own "@".
+
+    _url_userinfo() used to cut the netloc at the first of "/?#" BEFORE
+    looking for "@", agreeing with urllib about where the host ends. That
+    failed OPEN: in "http://bob:pa/ss@prom/api/v1/query" the "@" falls past
+    the cut, so the URL read as credential-free. Neither refusal layer fired,
+    _loggable_url() returned it untouched, and the FULL password reached the
+    startup "Config: regulate Prometheus URL None -> ..." INFO line, the
+    Starting:/Finished: lines, every _report_state() line and the process
+    title. urllib's own _splithost() stops at the same "/", so sample() then
+    raised InvalidURL("nonnumeric port: 'pa'") and leaked the password's
+    prefix too.
+
+    The boundary is now the LAST "@" anywhere after "://" -- deliberately not
+    urllib's host boundary, because the secret to protect is what the operator
+    typed, not what urllib would transmit. Generated and base64 passwords
+    carry these characters routinely.
+    """
+
+    BAD = ("http://bob:pa/ss@prom/api/v1/query",
+           "http://bob:pa?ss@prom/api/v1/query",
+           "http://bob:pa#ss@prom/api/v1/query")
+
+    def setUp(self):
+        self._saved = (vct.thread_count, vct.file_delay_ms,
+                       vct.regulator, vct.regulator_started)
+        vct.thread_count = vct.DynamicSemaphore(4)
+        vct.file_delay_ms = 2
+        vct.regulator = None
+        vct.regulator_started = False
+
+    def tearDown(self):
+        (vct.thread_count, vct.file_delay_ms,
+         vct.regulator, vct.regulator_started) = self._saved
+
+    def test_detected_as_credentialed(self):
+        for url in self.BAD:
+            with self.subTest(url=url):
+                self.assertTrue(vct._url_has_userinfo(url),
+                                "userinfo hidden by a separator in the password")
+
+    def test_not_logged_by_loggable_url(self):
+        for url in self.BAD:
+            with self.subTest(url=url):
+                self.assertNotIn("ss", str(vct._loggable_url(url)).split("@")[0],
+                                 "password survived _loggable_url()")
+                self.assertNotIn("pa", str(vct._loggable_url(url)).split("@")[0],
+                                 "password survived _loggable_url()")
+
+    def test_not_logged_on_the_command_line(self):
+        for url in self.BAD:
+            with self.subTest(url=url):
+                out = " ".join(vct._redact_argv(
+                    ["tc", "--regulate-prom", url, "--tmpdir", "/data/tmp"]))
+                self.assertNotIn("pa/ss", out)
+                self.assertNotIn("pa?ss", out)
+                self.assertNotIn("pa#ss", out)
+                self.assertIn("/data/tmp", out,
+                              "an unrelated argument was mangled")
+
+    def test_not_logged_by_the_startup_config_line(self):
+        """This INFO line carried the whole password before the fix."""
+        for url in self.BAD:
+            with self.subTest(url=url):
+                pw = url.split(":", 2)[2].split("@")[0]
+                a = Args(regulate_prometheus_url=None, regulate_query="q",
+                         dirs=["/x"], config="/nonexistent/tc.conf")
+                with self.assertLogs(level="INFO") as got:
+                    vct._apply_regulate_keys(
+                        a, {"regulate_prometheus_url": url})
+                leaked = [m for m in got.output if pw in m]
+                self.assertFalse(leaked,
+                                 "password reached the log: %r" % (leaked,))
+
+    def test_clean_url_with_a_path_is_still_clean(self):
+        """The fix must not make every URL look credentialed."""
+        for url in ("http://prom/api/v1/query",
+                    "https://prom.example:9090/api/v1/query?x=1"):
+            with self.subTest(url=url):
+                self.assertFalse(vct._url_has_userinfo(url))
+                self.assertEqual(vct._loggable_url(url), url)
+                self.assertEqual(vct._url_credentials(url), ())
+
+
+class PercentEncodedAtFailsClosed(unittest.TestCase):
+    """A percent-encoded "@" must not hide userinfo either.
+
+    _url_userinfo() matched only a LITERAL "@". But Request._parse() runs
+    unquote() on the host, so "http://bob:pw%40prom/api/v1/query" reaches
+    http.client as "bob:pw@prom" and dies in _get_hostport() with
+    InvalidURL("nonnumeric port: 'pw@prom'"). Before the fix that URL read as
+    credential-free: neither refusal layer fired, _loggable_url() returned it
+    whole, the startup "Config:" INFO line and Starting:/Finished: logged it
+    unchanged, and "pw" was not scrubbed from that exception text.
+
+    The encoded form is consulted ONLY when no literal "@" is present, so a
+    URL that already has one keeps its old boundary and a later "%40" in the
+    path cannot move it.
+    """
+
+    BAD = ("http://bob:pw%40prom/api/v1/query",
+           "http://bob:pw%40prom:9090/api/v1/query")
+
+    def setUp(self):
+        self._saved = (vct.thread_count, vct.file_delay_ms,
+                       vct.regulator, vct.regulator_started)
+        vct.thread_count = vct.DynamicSemaphore(4)
+        vct.file_delay_ms = 2
+        vct.regulator = None
+        vct.regulator_started = False
+
+    def tearDown(self):
+        (vct.thread_count, vct.file_delay_ms,
+         vct.regulator, vct.regulator_started) = self._saved
+
+    def test_detected_as_credentialed(self):
+        for url in self.BAD:
+            with self.subTest(url=url):
+                self.assertTrue(vct._url_has_userinfo(url),
+                                "a percent-encoded @ hid the userinfo")
+
+    def test_detection_and_logging_share_a_boundary(self):
+        """The two must never disagree, in EITHER direction.
+
+        A URL detected as credentialed but emitted intact is worse than one
+        never detected, so this asserts the invariant rather than checking the
+        two functions apart.
+        """
+        for url in self.BAD + ("http://bob:pa/ss@prom/api/v1/query",
+                               "http://prom/api/v1/query"):
+            with self.subTest(url=url):
+                detected = vct._url_has_userinfo(url)
+                logged = str(vct._loggable_url(url))
+                if detected:
+                    self.assertNotEqual(logged, url,
+                                        "detected as credentialed but logged intact")
+                    self.assertIn("<redacted>@", logged)
+                else:
+                    self.assertEqual(logged, url,
+                                     "rewrote a URL it did not consider credentialed")
+
+    def test_not_logged_by_loggable_url(self):
+        for url in self.BAD:
+            with self.subTest(url=url):
+                before = str(vct._loggable_url(url)).split("@")[0]
+                self.assertNotIn("pw", before, "password survived _loggable_url()")
+                self.assertNotIn("bob", before, "username survived _loggable_url()")
+
+    def test_loggable_url_keeps_the_operators_remainder(self):
+        """It must redact their URL, not emit a decoded rewrite of it."""
+        out = str(vct._loggable_url("http://bob:pw%40prom/api/v1/query"))
+        self.assertEqual(out, "http://<redacted>@prom/api/v1/query")
+
+    def test_error_text_is_scrubbed(self):
+        """The urllib exception that actually carries the credential."""
+        url = "http://bob:pw%40prom/api/v1/query"
+        out = vct._redact_text("nonnumeric port: 'pw@prom'", url)
+        self.assertNotIn("'pw@", out, "password survived the error-text scrub")
+
+    def test_not_logged_on_the_command_line(self):
+        for url in self.BAD:
+            with self.subTest(url=url):
+                out = " ".join(vct._redact_argv(
+                    ["tc", "--regulate-prom", url, "--tmpdir", "/data/tmp"]))
+                self.assertNotIn("pw%40", out)
+                self.assertIn("/data/tmp", out, "an unrelated argument was mangled")
+
+    def test_not_logged_by_the_startup_config_line(self):
+        for url in self.BAD:
+            with self.subTest(url=url):
+                a = Args(regulate_prometheus_url=None, regulate_query="q",
+                         dirs=["/x"], config="/nonexistent/tc.conf")
+                with self.assertLogs(level="INFO") as got:
+                    vct._apply_regulate_keys(a, {"regulate_prometheus_url": url})
+                leaked = [m for m in got.output if "pw%40" in m]
+                self.assertFalse(leaked, "URL reached the log: %r" % (leaked,))
+
+    def test_a_literal_at_keeps_its_boundary(self):
+        """%40 later in the path must not move the split."""
+        url = "http://bob:pw@prom/api/v1/query%40x"
+        self.assertEqual(str(vct._loggable_url(url)),
+                         "http://<redacted>@prom/api/v1/query%40x")
+
+
+class SchemelessCredentialsRedactedInArgv(unittest.TestCase):
+    """_redact_argv() accepts what detection accepts, for URL-shaped tokens.
+
+    NOT exact parity, and the gap is deliberate: a scheme-less value whose
+    userinfo is a username only ("tok@prom:9090/api") is refused by
+    start_regulator() and NOT redacted here, because a bare "user@host"
+    carries no secret and redacting every "@" would mangle ordinary
+    arguments. Scheme-less tokens also have to look like an authority at all,
+    so PromQL is not rewritten. See _redact_argv().
+
+    It gated on "://", which is NARROWER than _url_has_userinfo(): a value
+    with no scheme is still detected, so
+    "--regulate-prometheus-url bob:pw@prom:9090/api" was refused by
+    start_regulator() while the token went unredacted into Starting:,
+    Finished:, every _report_state() line and the process title.
+
+    The ":" inside the userinfo is what keeps ordinary arguments intact --
+    "user@host" alone carries no secret. A path holding both a ":" and an "@"
+    is over-redacted, which is the side to err on.
+    """
+
+    def test_scheme_less_credentialed_token_is_redacted(self):
+        out = vct._redact_argv(
+            ["tc", "--regulate-prometheus-url", "bob:pw@prom:9090/api"])
+        self.assertNotIn("pw", " ".join(out).split("@")[0],
+                         "a scheme-less credential reached the command line")
+        self.assertIn("<redacted>@prom:9090/api", out)
+
+    def test_ordinary_arguments_are_not_mangled(self):
+        for tok in ("/data/tmp", "/data/x@y", "user@host", "bob@example.com",
+                    "--tmpdir", "/shared/ceph/vol", "600"):
+            with self.subTest(tok=tok):
+                self.assertEqual(vct._redact_argv([tok]), [tok],
+                                 "an ordinary argument was rewritten")
+
+    def test_detection_and_redaction_accept_the_same_inputs(self):
+        """Anything refused for userinfo must also be redacted in argv.
+
+        The first three inputs all contain a literal ":" in the userinfo, so
+        on their own they never exercised the case where redaction was
+        narrower than detection. The last two are the ones that did: a
+        username-only token and an encoded ":". Both were detected and
+        refused, then logged in full.
+        """
+        for tok in ("bob:pw@prom:9090/api", "http://u:pw@h/api",
+                    "--regulate-prometheus-url=http://u:pw@h/api",
+                    "http://TOKEN@prom/api/v1/query",
+                    "http://bob%3Apw@prom/api/v1/query"):
+            with self.subTest(tok=tok):
+                self.assertTrue(vct._url_has_userinfo(tok))
+                self.assertNotEqual(vct._redact_argv([tok]), [tok],
+                                    "detected as credentialed but left in argv")
+
+    def test_promql_is_not_redacted(self):
+        """--regulate-query goes through the same argv redaction.
+
+        A query carrying an "@" modifier with any ":" before it matched the
+        ":"-in-userinfo guard: recording-rule names ("job:metric:p99") and
+        subqueries ("[1h:5m]") both hold a ":", so
+        "max_over_time(x[1h:5m] @ end())" was logged as "<redacted>@ end())".
+        Not a leak, but it destroys output the operator reads.
+        """
+        for q in ("max_over_time(x[1h:5m] @ end())",
+                  "job:metric:p99 @ end()",
+                  "job:metric:p99@end()",
+                  "sum(rate(http_requests_total[5m])) @ end()"):
+            with self.subTest(q=q):
+                self.assertEqual(vct._redact_argv([q]), [q],
+                                 "PromQL was rewritten as a credential")
+
+    def test_promql_with_a_clean_user_and_host_is_over_redacted(self):
+        """Pinned: the guard tests the username and host, not the password.
+
+        "job:mds_lat:p99[5m]@1700000000" has user "job" and host
+        "1700000000", so it is redacted. Testing the whole userinfo again
+        would spare it, and would let "bob:p(w@prom:9090/api" through whole.
+        """
+        q = "--regulate-query=job:mds_lat:p99[5m]@1700000000"
+        self.assertEqual(vct._redact_argv([q]),
+                         ["--regulate-query=<redacted>@1700000000"])
+
+    def test_scheme_less_joined_flag_keeps_its_name(self):
+        """_loggable_url() takes its head from "://", which this has none of.
+
+        So "--regulate-prometheus-url=bob:pw@prom:9090/api" was logged as
+        "<redacted>@prom:9090/api" -- the credential gone, but the flag name
+        gone with it, leaving an unreadable command line.
+        """
+        tok = "--regulate-prometheus-url=bob:pw@prom:9090/api"
+        out = vct._redact_argv([tok])[0]
+        self.assertEqual(out,
+                         "--regulate-prometheus-url=<redacted>@prom:9090/api")
+        self.assertNotIn("pw@", out, "credential survived")
+
+    def test_ipv6_scheme_less_credential_is_still_redacted(self):
+        """Brackets stay legal in the host, or IPv6 stops being redacted.
+
+        The authority test that keeps PromQL intact rejects brackets in the
+        USERINFO only; an IPv6 literal needs them in the host.
+        """
+        out = vct._redact_argv(["bob:pw@[::1]:9090/api"])[0]
+        self.assertEqual(out, "<redacted>@[::1]:9090/api")
+
+    def test_url_with_a_parenthesised_query_is_still_redacted(self):
+        """The authority test must not apply to tokens holding "://".
+
+        A real URL's query string may contain anything, so rejecting on those
+        characters would stop redacting a genuine credential.
+        """
+        out = vct._redact_argv(["http://u:pw@prom/api?q=(x)"])[0]
+        self.assertEqual(out, "http://<redacted>@prom/api?q=(x)")
+
+    def test_username_only_scheme_less_value_is_the_documented_gap(self):
+        """Detected and refused, but not redacted -- on purpose.
+
+        Pinned so the trade-off is a decision rather than an accident: a bare
+        "user@host" has no secret, and redacting it would mangle ordinary
+        arguments.
+        """
+        tok = "tok@prom:9090/api"
+        self.assertTrue(vct._url_has_userinfo(tok))
+        self.assertEqual(vct._redact_argv([tok]), [tok])
+
+    def test_username_only_token_is_redacted(self):
+        """A bare token as the username is a credential with no ":" in it.
+
+        start_regulator() refuses this and prints
+        "http://<redacted>@prom/..." in its own warning, while the Starting:
+        line a few lines earlier printed the token itself.
+        """
+        tok = "http://TOKEN@prom/api/v1/query"
+        out = vct._redact_argv([tok])[0]
+        self.assertNotIn("TOKEN", out, "username-only credential left in argv")
+        self.assertEqual(out, "http://<redacted>@prom/api/v1/query")
+
+    def test_encoded_colon_in_userinfo_is_redacted(self):
+        """Request._parse() unquotes the host, so "bob%3Apw" is "bob:pw"."""
+        tok = "http://bob%3Apw@prom/api/v1/query"
+        out = vct._redact_argv([tok])[0]
+        self.assertNotIn("pw", out, "encoded-separator credential left in argv")
+        self.assertEqual(out, "http://<redacted>@prom/api/v1/query")
+
+    def test_scheme_less_encoded_colon_is_redacted(self):
+        """The scheme-less guard tests the decoded userinfo, not the raw one."""
+        out = vct._redact_argv(["bob%3Apw@prom:9090/api"])[0]
+        self.assertNotIn("pw", out)
+
+    def test_password_holding_promql_characters_is_redacted(self):
+        """The authority test used to look at the password too.
+
+        So "bob:p(w@prom:9090/api" read as PromQL: refused by
+        start_regulator() for its userinfo, then logged whole in
+        Starting:/Finished:, every _report_state() line and ps.
+        """
+        for pw in ("p(w", "p{w", "p w", "p[w]", 'p"w', "p,w"):
+            tok = "bob:%s@prom:9090/api" % pw
+            with self.subTest(tok=tok):
+                self.assertTrue(vct._url_has_userinfo(tok))
+                self.assertEqual(vct._redact_argv([tok]),
+                                 ["<redacted>@prom:9090/api"],
+                                 "refused for its userinfo, but left in argv")
+        line = shlex.join(vct._redact_argv(
+            ["tc", "--regulate-prometheus-url=bob:p(w@prom:9090/api"]))
+        self.assertNotIn("p(w", line, "the Starting: line carries the password")
+        self.assertIn("--regulate-prometheus-url=<redacted>@prom:9090/api", line)
+
+    def test_the_path_is_not_part_of_the_host_test(self):
+        """A scheme-less URL's path or query may hold anything, as with "://"."""
+        self.assertEqual(vct._redact_argv(["bob:pw@prom:9090/api?x=(y)"]),
+                         ["<redacted>@prom:9090/api?x=(y)"])
 
 
 class PathsFromList(unittest.TestCase):
@@ -1741,6 +2477,447 @@ class HardlinkStagingOrder(unittest.TestCase):
         for p in paths:
             with open(p, "rb") as f:
                 self.assertEqual(f.read(), b"payload" * 100)
+
+
+class ConfigReadWhilePaused(unittest.TestCase):
+    """A threads=0 pause must be undoable from --config, as its log line says.
+
+    The walker is the only reader of --config, and a pause parks it inside
+    thread_count.acquire(). So "set threads > 0 to resume" did nothing, and no
+    other edit was read either, for as long as any pause lasted.
+    """
+
+    def setUp(self):
+        self._saved = (vct.thread_count, vct.runtime_config, vct.apply_config)
+        fd, self.path = tempfile.mkstemp()
+        os.close(fd)
+        self.addCleanup(os.unlink, self.path)
+        self._write("threads = 0\n", 1000)
+        vct.thread_count = vct.DynamicSemaphore(2)
+        vct.runtime_config = vct.RuntimeConfig(self.path, poll_seconds=0)
+        vct.apply_config = self._apply
+        vct._poll_config()                  # the startup read: paused
+
+    def tearDown(self):
+        vct.thread_count, vct.runtime_config, vct.apply_config = self._saved
+
+    def _apply(self, cfg):
+        if "threads" in cfg:
+            vct.thread_count.set_limit(cfg["threads"])
+
+    def _write(self, text, mtime):
+        with open(self.path, "w") as fh:
+            fh.write(text)
+        os.utime(self.path, (mtime, mtime))
+
+    def _acquire_then_edit(self, **kw):
+        """Block in acquire() as the walker does, then raise threads in the file."""
+        deadline = time.monotonic() + 1.5
+        got = []
+        t = threading.Thread(target=lambda: got.append(vct.thread_count.acquire(
+            cancel=lambda: time.monotonic() > deadline, **kw)))
+        t.start()
+        time.sleep(0.2)
+        self._write("threads = 2\n", 2000)
+        t.join(5)
+        return got
+
+    def test_raising_threads_in_config_ends_the_pause(self):
+        self.assertEqual(vct.thread_count.limit, 0)
+        self.assertEqual(self._acquire_then_edit(tick=vct._poll_config), [True],
+                         "a paused walker never read the edit that resumes it")
+        self.assertEqual(vct.thread_count.limit, 2)
+
+    def test_without_the_poll_the_edit_is_never_seen(self):
+        """Control: the old walker -- the same edit, never read."""
+        self.assertEqual(self._acquire_then_edit(), [False])
+        self.assertEqual(vct.thread_count.limit, 0)
+
+    def test_every_acquire_in_the_walk_polls_config(self):
+        with open(os.path.abspath(TARGET)) as fh:
+            src = fh.read()
+        n = src.count("thread_count.acquire(")
+        self.assertGreaterEqual(n, 2)
+        self.assertEqual(src.count("tick=_poll_config"), n,
+                         "a walker acquire() blocks without reading --config")
+
+
+class RegulatorPauseAlwaysEnds(unittest.TestCase):
+    """A regulator pause must not outlive the evidence for it.
+
+    Only a usable sample resumes a regulator pause, and two things stop one
+    arriving: the pause itself, which on a quiet volume removes the only
+    requests there were, so the latency ratio goes 0/0 = nan; and a
+    Prometheus outage. Either held threads at 0 for good.
+    """
+
+    def setUp(self):
+        self._saved = (vct.thread_count, vct.file_delay_ms, vct._setproctitle,
+                       vct.do_exit)
+        vct._setproctitle = None
+        vct.thread_count = vct.DynamicSemaphore(4)
+        vct.file_delay_ms = 20
+
+    def tearDown(self):
+        (vct.thread_count, vct.file_delay_ms, vct._setproctitle,
+         vct.do_exit) = self._saved
+
+    def _reg(self, blind_s=600):
+        a = Args(regulate_prometheus_url="http://x", regulate_query="q",
+                 regulate_pause_ms=150.0, regulate_slo_ms=51.0,
+                 regulate_period_s=30, regulate_floor_ms=0,
+                 regulate_quiet_ticks=3, dirs=["/x"], threads=4,
+                 regulate_max_threads=0, regulate_blind_resume_s=blind_s)
+        return vct.Regulator(a, "q")
+
+    def _tick(self, r, sample):
+        """Exactly one pass of Regulator.run()."""
+        r.sample = sample
+
+        class OneShot:
+            def __init__(self):
+                self.n = 0
+
+            def is_set(self):
+                self.n += 1
+                return self.n > 1
+
+            def wait(self, _):
+                return None
+
+        vct.do_exit = OneShot()
+        r.run()
+
+    @staticmethod
+    def _nan():
+        raise vct.NanSample("query returned nan")
+
+    @staticmethod
+    def _down():
+        raise OSError("HTTP 503")
+
+    def _paused(self, r):
+        r._pause(200.0)
+        self.assertEqual(vct.thread_count.limit, 0)
+
+    def _nan_probe(self, r):
+        """Pause, then nan for regulate_quiet_ticks (3) samples."""
+        self._paused(r)
+        for _ in range(3):
+            self._tick(r, self._nan)
+
+    def test_nan_after_our_own_pause_resumes(self):
+        """At 1 thread: a stalled MDS completes nothing and reads nan too."""
+        r = self._reg()
+        self._nan_probe(r)
+        self.assertEqual(vct.thread_count.limit, 1,
+                         "nan resumed the full count, or held the pause")
+        self._tick(r, self._nan)
+        self.assertEqual(vct.thread_count.limit, 1, "nan drove a climb")
+
+    def test_one_nan_does_not_resume(self):
+        r = self._reg()
+        self._paused(r)
+        self._tick(r, self._nan)
+        self._tick(r, self._nan)
+        self.assertEqual(vct.thread_count.limit, 0,
+                         "nan that had not persisted ended the pause")
+
+    def test_a_sample_breaks_the_nan_streak(self):
+        r = self._reg()
+        self._paused(r)
+        self._tick(r, self._nan)
+        self._tick(r, self._nan)
+        self._tick(r, lambda: 200.0)        # usable, still over the pause line
+        self._tick(r, self._nan)
+        self._tick(r, self._nan)
+        self.assertEqual(vct.thread_count.limit, 0,
+                         "nan from before a usable sample counted")
+
+    def test_a_usable_sample_restores_what_the_pause_took(self):
+        """With thread adaptivity off nothing climbs, so without this the job
+        stayed at 1 thread for good."""
+        r = self._reg()
+        self._nan_probe(r)
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 4)
+
+    def test_a_blind_resume_is_restored_the_same_way(self):
+        r = self._reg(blind_s=600)
+        self._paused(r)
+        self._tick(r, self._down)
+        r._blind_since -= 601
+        self._tick(r, self._down)
+        self.assertEqual(vct.thread_count.limit, 1)
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 4,
+                         "a blind resume stayed at 1 thread for good")
+
+    def test_a_pause_during_the_probe_keeps_what_is_owed(self):
+        r = self._reg()
+        self._nan_probe(r)
+        self._tick(r, lambda: 200.0)        # pauses again, at 1 thread
+        self.assertEqual(vct.thread_count.limit, 0)
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 4,
+                         "a pause at 1 thread shrank what the first one took")
+
+    def test_an_operator_change_forgets_the_probe(self):
+        r = self._reg()
+        self._nan_probe(r)
+        vct.thread_count.set_limit(2)       # SIGUSR1, or a threads edit
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 2,
+                         "the regulator overrode an operator thread change")
+
+    def test_nan_while_running_still_holds(self):
+        """Control: not paused, nan is still no evidence either way."""
+        r = self._reg()
+        self._tick(r, self._nan)
+        self.assertEqual(vct.thread_count.limit, 4)
+        self.assertEqual(vct.file_delay_ms, 20)
+
+    def test_nan_does_not_end_an_operator_pause(self):
+        r = self._reg()
+        vct.thread_count.set_limit(0)
+        self._tick(r, self._nan)
+        self.assertEqual(vct.thread_count.limit, 0)
+
+    def test_sample_reports_nan_as_its_own_error(self):
+        """Only nan means "no requests"; a negative reading is still bad data."""
+        import io
+        import json
+
+        def fake(value):
+            body = json.dumps({"status": "success", "data": {"result": [
+                {"value": [0, value]}]}}).encode()
+
+            class Resp(io.BytesIO):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            return lambda url, timeout=None: Resp(body)
+
+        r = self._reg()
+        saved = vct.urllib.request.urlopen
+        self.addCleanup(setattr, vct.urllib.request, "urlopen", saved)
+        vct.urllib.request.urlopen = fake("NaN")
+        self.assertRaises(vct.NanSample, r.sample)
+        vct.urllib.request.urlopen = fake("-1")
+        with self.assertRaises(ValueError) as cm:
+            r.sample()
+        self.assertNotIsInstance(cm.exception, vct.NanSample)
+
+    def test_an_outage_during_a_pause_resumes_at_one_thread(self):
+        r = self._reg(blind_s=600)
+        self._paused(r)
+        with self.assertLogs(level="WARNING") as cm:
+            self._tick(r, self._down)
+        self.assertEqual(vct.thread_count.limit, 0, "resumed before the bound")
+        self.assertTrue(any("PAUSED" in m for m in cm.output), cm.output)
+        r._blind_since -= 601
+        with self.assertLogs(level="ERROR") as cm:
+            self._tick(r, self._down)
+        self.assertEqual(vct.thread_count.limit, 1,
+                         "an outage held the regulator's own pause forever")
+        self.assertIn("HTTP 503", "\n".join(cm.output), "the cause was not logged")
+
+    def test_zero_keeps_the_old_hold(self):
+        r = self._reg(blind_s=0)
+        self._paused(r)
+        self._tick(r, self._down)
+        r._blind_since -= 10 ** 6
+        self._tick(r, self._down)
+        self.assertEqual(vct.thread_count.limit, 0)
+
+    def test_an_outage_while_running_changes_nothing(self):
+        """Control: holding is still right when the regulator is not the pause."""
+        r = self._reg()
+        self._tick(r, self._down)
+        self.assertEqual(vct.thread_count.limit, 4)
+        self.assertIsNone(r._blind_since)
+
+    def test_a_usable_sample_restarts_the_blind_clock(self):
+        r = self._reg(blind_s=600)
+        self._paused(r)
+        self._tick(r, self._down)
+        r._blind_since -= 500
+        self._tick(r, lambda: 200.0)        # usable, still over the pause line
+        self.assertIsNone(r._blind_since)
+        self._tick(r, self._down)
+        r._blind_since -= 500
+        self._tick(r, self._down)
+        self.assertEqual(vct.thread_count.limit, 0,
+                         "blindness from before a usable sample counted")
+
+    def test_an_operator_resume_forgets_the_regulator_pause(self):
+        """Otherwise a later operator pause reads as ours and gets resumed."""
+        r = self._reg()
+        self._paused(r)
+        vct.thread_count.set_limit(3)       # SIGUSR1, or a threads edit
+        self._tick(r, lambda: 1.0)
+        vct.thread_count.set_limit(0)       # the operator pauses
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 0,
+                         "the regulator resumed an operator pause as its own")
+
+    def test_the_bound_is_a_live_config_key(self):
+        self.assertIn("regulate_blind_resume_s", vct.RuntimeConfig.KEYS)
+        out, errs = vct.RuntimeConfig._parse("regulate_blind_resume_s = 0\n")
+        self.assertEqual((out, errs), ({"regulate_blind_resume_s": 0}, []))
+        _, errs = vct.RuntimeConfig._parse("regulate_blind_resume_s = -1\n")
+        self.assertTrue(errs)
+
+    def test_the_cli_rejects_a_negative_bound(self):
+        """As --config does. Negative is truthy, so it resumed blind on the
+        second blind tick."""
+        import contextlib
+        import io
+        saved = list(sys.argv)
+        self.addCleanup(setattr, sys, "argv", saved)
+        sys.argv = ["tc", "--print-config-example", "v",
+                    "--regulate-blind-resume-s", "0"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(vct.main(), 0)
+        sys.argv[-1] = "-1"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as cm:
+            vct.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--regulate-blind-resume-s", err.getvalue())
+
+
+class ExitSignalsUnwindCleanly(unittest.TestCase):
+    """SIGTERM and SIGHUP must take the same clean exit as SIGINT.
+
+    Only SIGINT had a handler, so systemd stop, kill(1), a shutdown or a
+    closed terminal killed the job outright, and the run journal -- written
+    on the way out -- never was.
+    """
+
+    SIGS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+    def setUp(self):
+        self._saved = {s: signal.getsignal(s) for s in self.SIGS}
+        self._saved_exit = vct.do_exit
+        vct.do_exit = threading.Event()
+        for s in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(s, signal.SIG_DFL)
+
+    def tearDown(self):
+        for s, h in self._saved.items():
+            signal.signal(s, h)
+        vct.do_exit = self._saved_exit
+
+    def test_each_signal_sets_do_exit(self):
+        vct._install_exit_handlers()
+        for s in self.SIGS:
+            with self.subTest(sig=s.name):
+                self.assertIs(signal.getsignal(s), vct._exit_signal_handler,
+                              "%s would kill the job without unwinding" % s.name)
+                vct.do_exit.clear()
+                with self.assertLogs(level="ERROR"):
+                    os.kill(os.getpid(), s)
+                    for _ in range(200):
+                        if vct.do_exit.is_set():
+                            break
+                        time.sleep(0.01)
+                self.assertTrue(vct.do_exit.is_set())
+
+    def test_a_second_signal_escalates(self):
+        """A plain kill stopped the job before SIGTERM had a handler.
+
+        Only the signal delivered escalates: a terminal closing during a
+        SIGTERM drain still takes the clean exit.
+        """
+        vct._install_exit_handlers()
+        with self.assertLogs(level="ERROR"):
+            os.kill(os.getpid(), signal.SIGTERM)
+            for _ in range(200):
+                if vct.do_exit.is_set():
+                    break
+                time.sleep(0.01)
+        self.assertTrue(vct.do_exit.is_set())
+        self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL,
+                         "a second SIGTERM would still wait for the drain")
+        self.assertIs(signal.getsignal(signal.SIGHUP), vct._exit_signal_handler)
+
+    def test_nohup_is_kept(self):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        vct._install_exit_handlers()
+        self.assertEqual(signal.getsignal(signal.SIGHUP), signal.SIG_IGN,
+                         "a job started under nohup would die with its terminal")
+
+
+class ProcessFilesStartup(unittest.TestCase):
+    """What process_files() sets up before the walk. Driven, not read.
+
+    regulator_started must be set, and only AFTER start_regulator():
+    _apply_regulate_keys() stays quiet while it is False, which keeps the
+    startup config read from warning. Drop the assignment and no late change
+    ever warns; move it up and the startup read does.
+    """
+
+    def setUp(self):
+        import io
+        self._saved = (vct.start_regulator, vct.regulator,
+                       vct.regulator_started, vct.run_journal, vct.RunJournal)
+        vct.regulator_started = False
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        real_open = open
+
+        # Off Linux there is no /proc/self/mounts; an empty walk needs none.
+        def fake_open(path, *a, **kw):
+            if path == "/proc/self/mounts":
+                return io.StringIO("")
+            return real_open(path, *a, **kw)
+
+        vct.open = fake_open
+        self.addCleanup(vars(vct).pop, "open", None)
+        self.seen = []
+
+        def fake_start(args):
+            self.seen.append(vct.regulator_started)
+            return None
+
+        vct.start_regulator = fake_start
+
+    def tearDown(self):
+        (vct.start_regulator, vct.regulator, vct.regulator_started,
+         vct.run_journal, vct.RunJournal) = self._saved
+
+    def _run(self, journal=False):
+        vct.process_files(Args(
+            tmpdir=os.path.join(self.tmp, "t"), dirs=[], run_journal=journal,
+            paths_from=None, paths_from_pool=None, stage_in_tmpdir=False))
+
+    def test_regulator_started_is_set(self):
+        self._run()
+        self.assertTrue(vct.regulator_started,
+                        "process_files() never set regulator_started")
+
+    def test_regulator_started_is_set_after_start_regulator(self):
+        self._run()
+        self.assertEqual(self.seen, [False],
+                         "regulator_started was True inside start_regulator()")
+
+    def test_the_journal_checkpoints_from_the_start(self):
+        started = []
+        real = self._saved[4]
+
+        class Recording(real):
+            def start_checkpoints(self, roots, args, **kw):
+                started.append(roots)
+
+        vct.RunJournal = Recording
+        self._run(journal=True)
+        self.assertEqual(len(started), 1,
+                         "process_files() never started journal checkpoints")
 
 
 if __name__ == "__main__":

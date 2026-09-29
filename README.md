@@ -88,12 +88,16 @@ Options:
 
 
 ```
-usage: vcephfs_transcoder.py [-h] [--version] [--tmpdir TMPDIR]
+usage: vcephfs_transcoder.py [-h] [--version] [--paths-from-pool POOL]
+                             [--rados-conffile PATH] [--rados-mon-host ADDRS]
+                             [--rados-keyring PATH] [--rados-name NAME]
+                             [--paths-from FILE] [--tmpdir TMPDIR]
                              [--process-hardlinks] [--debug]
                              [--min-age MIN_AGE] [--min-size SIZE]
                              [--max-size SIZE] [--threads THREADS] [--dry-run]
                              [--config PATH] [--print-config-example [VOLUME]]
-                             [--config-poll-seconds SEC] [--force-tmpdir-pool]
+                             [--config-poll-seconds SEC] [--stage-in-tmpdir]
+                             [--no-regulate] [--force-tmpdir-pool]
                              [--log-file LOG_FILE]
                              [--log-rotate-lines LOG_ROTATE_LINES]
                              [--log-rotate-time LOG_ROTATE_TIME]
@@ -104,12 +108,14 @@ usage: vcephfs_transcoder.py [-h] [--version] [--tmpdir TMPDIR]
                              [--regulate-pause-ms MS] [--regulate-slo-ms MS]
                              [--regulate-period-s SEC]
                              [--regulate-floor-ms MS]
-                             [--regulate-quiet-ticks N] [--source-pool POOL]
-                             [--prune-small-subtrees]
+                             [--regulate-quiet-ticks N]
+                             [--regulate-max-threads N]
+                             [--regulate-blind-resume-s SEC]
+                             [--source-pool POOL] [--prune-small-subtrees]
                              [--prune-subtree-max-bytes BYTES]
                              [--prune-budget-bytes BYTES]
                              [--max-files MAX_FILES] [--file-delay MS]
-                             [--prune-dir-regex REGEX]
+                             [--prune-dir-regex REGEX] [--no-run-journal]
                              [dirs ...]
 
 Transcode cephfs files to their directory layout
@@ -120,6 +126,51 @@ positional arguments:
 optional arguments:
   -h, --help            show this help message and exit
   --version             show program's version number and exit
+  --paths-from-pool POOL
+                        Transcode exactly the files that are currently in
+                        POOL, discovered by reading the pool itself instead of
+                        walking the tree. Costs no MDS walk and is
+                        proportional to what is left in the pool rather than
+                        to the size of the filesystem. POOL must no longer be
+                        the default write target of the directories given, or
+                        the set keeps growing and the drain cannot converge;
+                        that is checked and refused. Needs the RADOS Python
+                        bindings. Mutually exclusive with --paths-from. NOTE:
+                        a file renamed after the listing keeps its old
+                        backtrace until the MDS trims the log segment holding
+                        the rename, so it is read at a stale path and counted
+                        vanished while still occupying the pool. One pass is
+                        therefore not final: re-run to converge, and 'ceph
+                        tell mds.<daemon> flush journal' forces the backtrace
+                        writes instead of waiting for them.
+  --rados-conffile PATH
+                        ceph.conf for --paths-from-pool. Default: $CEPH_CONF,
+                        then /etc/ceph/ceph.conf, then a single
+                        /etc/ceph/*.conf, then monitor addresses recovered
+                        from the mount. Containerized hosts often have no
+                        ceph.conf at all, hence the fallbacks.
+  --rados-mon-host ADDRS
+                        Comma-separated monitor addresses for --paths-from-
+                        pool, used instead of a conffile.
+  --rados-keyring PATH  Keyring for --paths-from-pool. Default: whatever the
+                        conffile says.
+  --rados-name NAME     RADOS client name for --paths-from-pool (default
+                        client.admin). Needs read access to the pool and to
+                        its objects' xattrs.
+  --paths-from FILE     Transcode exactly the files listed in FILE ('-' for
+                        stdin) instead of walking the directories. NUL- or
+                        newline-delimited, detected from the content. The
+                        directories still have to be given: they bound what
+                        the list is allowed to touch, and a listed path
+                        outside them is refused. Every path is re-stat'ed and
+                        re-checked, so a list that has gone stale is safe --
+                        vanished files are counted and logged, not treated as
+                        errors. Multiply-linked files are declined in this
+                        mode because a list cannot promise it holds every
+                        link. Intended for a second pass whose candidates are
+                        already known from an earlier run's log, where walking
+                        the whole tree again to rediscover them is the
+                        expensive part.
   --tmpdir TMPDIR       Temporary directory to which to copy files. Important:
                         This directory should have its layout set to the
                         *default* data pool for the FS, to avoid excess
@@ -145,6 +196,16 @@ optional arguments:
                         exit
   --config-poll-seconds SEC
                         how often to stat --config for changes (default: 10)
+  --stage-in-tmpdir     Stage temp copies in --tmpdir instead of beside their
+                        target. This is the pre-2026-09 behavior and it is
+                        slow: staging elsewhere makes every replace a cross-
+                        rank distributed rename (mean 1266 ms, tail to 14.9 s)
+                        instead of an intra-directory one (mean 0.26 ms).
+                        Escape hatch only.
+  --no-regulate         run unregulated, deliberately. Without this, starting
+                        with no regulate_prometheus_url logs at WARNING rather
+                        than INFO, because an omitted --config is otherwise
+                        indistinguishable from an intended unregulated run.
   --force-tmpdir-pool   proceed even if the tmpdir is in a target pool.
                         Disables the only check that makes a failed layout
                         application visible; do not use routinely.
@@ -160,17 +221,31 @@ optional arguments:
                         (requires --log-file)
   --no-copy-file-range  Disable use of copy_file_range and always use
                         userspace copy. DEFAULT since 2026-09-05: a 15-thread
-                        A/B on a production volume measured copy_file_range no
-                        faster overall (154.0 vs 170.1 MiB/s) and 1.3-2.1x
-                        SLOWER for files under 1 MiB, which is the size range
-                        these jobs now work in.
+                        A/B measured copy_file_range no faster overall (154.0
+                        vs 170.1 MiB/s) and 1.3-2.1x SLOWER for files under 1
+                        MiB, which is the size range these jobs now work in.
   --copy-file-range     Opt back in to copy_file_range (server-side copy when
                         CephFS supports it). Off by default; see --no-copy-
                         file-range.
   --regulate-prometheus-url URL
                         Prometheus /api/v1/query endpoint for self-regulation.
                         Unset (the default) disables regulation entirely and
-                        the job simply runs at --file-delay and --threads.
+                        the job simply runs at --file-delay and --threads --
+                        and says so at WARNING, since an accidental omission
+                        looks exactly like a deliberate one. Pass --no-
+                        regulate to declare it deliberate and quiet.
+                        Credentials in the URL are NOT supported: urllib does
+                        not use URL userinfo for authentication, so a
+                        user:password@ URL is refused rather than failing on
+                        every sample -- use an HTTPBasicAuthHandler if the
+                        endpoint needs basic auth. A credential passed here is
+                        ALSO exposed in `ps`, which log scrubbing cannot undo:
+                        the title is only rewritten from the first retitle
+                        onward, so the original argv is visible until then --
+                        and if python3-setproctitle is not installed the title
+                        is never rewritten at all and the credential stays
+                        visible for the whole run. Do not put a credential on
+                        the command line.
   --regulate-query PROMQL
                         A complete PromQL expression returning ONE value in
                         MILLISECONDS for the latency to protect. {volume} is
@@ -192,6 +267,17 @@ optional arguments:
   --regulate-quiet-ticks N
                         Consecutive clean samples before easing the delay
                         (default 10).
+  --regulate-max-threads N
+                        Ceiling for regulator-driven thread increases (default
+                        0 = never change the thread count). The regulator adds
+                        at most one thread per quiet interval, and only after
+                        the file delay has already decayed to its floor.
+  --regulate-blind-resume-s SEC
+                        If the regulator has paused the job and no usable
+                        sample arrives for this long (Prometheus down, empty
+                        result), resume at 1 thread rather than stay paused;
+                        the first usable sample restores the rest (default
+                        1800; 0 = stay paused until a sample arrives).
   --source-pool POOL    Only transcode files whose CURRENT data pool is POOL.
                         Without it, every file not already on the target pool
                         is eligible. Use this to drain one pool into another
@@ -230,6 +316,20 @@ optional arguments:
                         Overrides the built-in default set (see
                         DEFAULT_PRUNE_DIRS); pass an empty string to disable
                         pruning entirely.
+  --no-run-journal      Do not write .vcephfs-transcode-runs.jsonl at each
+                        volume root. The journal records, per artifact, the
+                        ceph.dir.rctime and newest file mtime seen BEFORE this
+                        run modified anything, because transcoding pins rctime
+                        at the time we ran and a directory that is never
+                        written again stays pinned forever -- so retention
+                        reads transcoded data as fresh and stops expiring it.
+                        rctime cannot be restored (it is monotonic and not
+                        settable), so preserving the answer is the only
+                        option. Costs one getxattr per artifact root. A run
+                        that does not exit cleanly leaves its last checkpoint,
+                        at most 5 minutes old, in .vcephfs-transcode-
+                        runs.jsonl.<run>.partial. Disable only if nothing
+                        consumes rctime.
 
 runtime signals:
   SIGUSR1  (10)  increase thread count by 1 (resumes from pause)
@@ -292,6 +392,59 @@ example --config file (every key at its default):
     # descended into or statted. Cost is one regex match per directory, not
     # per file. Set empty to disable pruning entirely.
     prune_dir_regex = ^(\.runfiles|site\-packages|node_modules|__pycache__|\.venv|venv|penv|renv|packrat|\.git|\.tox|\.mypy_cache|\.pytest_cache|\.cargo|\.gradle)$
+    
+    # --- self-regulation ----------------------------------------------------
+    # Throttle against what the filesystem's OTHER clients experience, which
+    # this job cannot observe from its own copy latency. Entirely optional:
+    # leave the URL empty and the regulator never starts, though the job
+    # then logs that at WARNING unless it was run with --no-regulate.
+    #
+    # The query is a complete PromQL expression and must evaluate to exactly
+    # one series whose value is MILLISECONDS. Nothing here assumes Ceph, or
+    # any particular exporter. {volume} is substituted with this filesystem's
+    # name (regex-escaped); omit it and the query is used verbatim.
+    #
+    # Units are checked once at startup and called out, because seconds means
+    # it never triggers and microseconds means it never stops -- both silent.
+    #
+    # Backslashes must be DOUBLED. PromQL string literals use Go escaping, so
+    # a regex dot is \\. inside the quotes; a single backslash is a parse
+    # error (HTTP 400: unknown escape sequence), not a wrong match. Example:
+    #   A window SHORTER than this volume's request interval yields 0/0
+    #   = nan: a quiet filesystem has no requests in the window and there
+    #   is nothing to average. The regulator now starts anyway and retries,
+    #   but it cannot regulate until the query returns a number. 5m copes
+    #   with a volume served a few requests a minute; 1m does not.
+    #   regulate_query = 1e3 * sum(increase(mds_lat_sum{n=~"mds\\.{volume}\\..*"}[5m]))
+    #                        / sum(increase(mds_lat_count{n=~"mds\\.{volume}\\..*"}[5m]))
+    regulate_prometheus_url =
+    regulate_query  =
+    
+    # Pause above this. The soft target is what it eases back toward; it does
+    # not gate the pause.
+    regulate_pause_ms   = 150.0
+    regulate_slo_ms     = 75.0
+    
+    # Poll period, and the delay floor the regulator decays back down to
+    # after a quiet spell. Repeated pauses ratchet the floor UP; quiet time
+    # releases it, but never below this baseline.
+    regulate_period_s   = 30
+    regulate_floor_ms   = 0
+    regulate_quiet_ticks = 10
+    
+    # Thread adaptivity, opt-in. 0 leaves the thread count exactly where
+    # --threads put it. Set it to a ceiling and the regulator adds one
+    # thread per quiet interval, but only once the delay has already
+    # decayed to its floor -- delay is the cheaper knob, so it is spent
+    # first. A pause lowers an internal ceiling below the level that
+    # caused it, so the climb does not simply repeat.
+    regulate_max_threads = 0
+    
+    # A regulator pause with no usable sample (Prometheus down, empty
+    # result) for this long resumes at 1 thread instead of holding 0
+    # forever; the first usable sample restores the rest. 0 holds until
+    # a sample arrives.
+    regulate_blind_resume_s = 1800
 
     redirect it to disk with:  vcephfs_transcoder.py --print-config-example > /home/USER/tc_VOLUME.conf
 ```
