@@ -369,5 +369,197 @@ print(_line.rstrip("\n").replace(_art, "@ARTIFACT@"))
 check("artifact key matches the directory as walked",
       _row["artifact"] == _art)
 
+# ---------------------------------------------------------------------------
+# Durability. write() needs Python to unwind, so SIGKILL, the OOM killer or a
+# power loss used to lose the whole run's records. The checkpoint survives.
+print("\ncheckpoint survives a kill:")
+
+
+def _wait_for(pred, timeout=5.0):
+    deadline = time.time() + timeout
+    while not pred() and time.time() < deadline:
+        time.sleep(0.02)
+    return pred()
+
+
+_ck = tempfile.mkdtemp()
+_ca = os.path.join(_ck, "art")
+touch(os.path.join(_ca, tc.RETENTION_MARKER))
+_cf = os.path.join(_ca, "f.parquet")
+_cst = touch(_cf, OLD)
+tc.read_rctime = lambda p: 1757000000.5
+_cj = tc.RunJournal(enabled=True, stop_at=[_ck])
+_cj.note_file(_cf, _cst)
+_cj.note_write(_cf)
+_partial = _cj._partial_path(_ck)
+_cjournal = os.path.join(_ck, tc.RUN_JOURNAL_NAME)
+_cj.start_checkpoints([_ck], _CArgs(), every_s=0.2, poll_s=0.05)
+
+check("a checkpoint is written with write() never called",
+      _wait_for(lambda: os.path.exists(_partial)))
+_prow = json.loads(open(_partial).readline())
+check("checkpoint rows carry every contract key",
+      {"artifact", "start", "end", "pre_rctime", "max_file_mtime",
+       "pinned_at"} <= set(_prow))
+check("checkpoint rows are marked partial", _prow.get("partial") is True)
+check("checkpoint keeps the pre-transcode rctime",
+      _prow["pre_rctime"] == 1757000000.5)
+check("checkpoint keeps the pin", isinstance(_prow["pinned_at"], float))
+check("no temp file is left beside it", not os.path.exists(_partial + ".tmp"))
+check("the shared journal is untouched until write()",
+      not os.path.exists(_cjournal))
+
+_m = os.stat(_partial).st_mtime_ns
+time.sleep(0.5)
+check("an unchanged run is not rewritten", os.stat(_partial).st_mtime_ns == _m)
+
+_cj.write([_ck], _CArgs())
+_frows = [json.loads(x) for x in open(_cjournal)]
+check("write() appends the real rows",
+      len(_frows) == 1 and "partial" not in _frows[0])
+check("write() removes the checkpoint", not os.path.exists(_partial))
+_cj.note_write(_cf)
+time.sleep(0.4)
+check("no checkpoint lands after write()", not os.path.exists(_partial))
+
+# Record changes trigger too, well before a long interval.
+_ck2 = tempfile.mkdtemp()
+touch(os.path.join(_ck2, "art", tc.RETENTION_MARKER))
+_cf2 = os.path.join(_ck2, "art", "f.parquet")
+_cst2 = touch(_cf2, OLD)
+_cj2 = tc.RunJournal(enabled=True, stop_at=[_ck2])
+_cj2.start_checkpoints([_ck2], _CArgs(), every_s=3600, every_changes=2,
+                       poll_s=0.05)
+time.sleep(0.3)
+check("nothing to record, nothing written",
+      not os.path.exists(_cj2._partial_path(_ck2)))
+_cj2.note_file(_cf2, _cst2)
+_cj2.note_write(_cf2)
+check("enough record changes checkpoint before the interval",
+      _wait_for(lambda: os.path.exists(_cj2._partial_path(_ck2))))
+
+# A final write that fails leaves the checkpoint as the only record.
+os.makedirs(os.path.join(_ck2, tc.RUN_JOURNAL_NAME))
+_cj2.write([_ck2], _CArgs())
+check("a failed final write keeps the checkpoint",
+      os.path.exists(_cj2._partial_path(_ck2)))
+
+# A checkpoint that fails is retried, not forgotten until the next change.
+_ck3 = tempfile.mkdtemp()
+touch(os.path.join(_ck3, "art", tc.RETENTION_MARKER))
+_cf3 = os.path.join(_ck3, "art", "f.parquet")
+_cj3 = tc.RunJournal(enabled=True, stop_at=[_ck3])
+_cj3.note_file(_cf3, touch(_cf3, OLD))
+os.makedirs(_cj3._partial_path(_ck3) + ".tmp")        # open(tmp, "w") fails
+_cj3.checkpoint([_ck3], _CArgs())
+check("a failed checkpoint stays due", _cj3._changes > 0)
+
+
+def _art_journal():
+    vroot = tempfile.mkdtemp()
+    arts = []
+    for name in ("a1", "a2"):
+        touch(os.path.join(vroot, name, tc.RETENTION_MARKER))
+        f = os.path.join(vroot, name, "f.parquet")
+        arts.append((f, touch(f, OLD)))
+    return vroot, arts, tc.RunJournal(enabled=True, stop_at=[vroot])
+
+
+# A checkpoint cut short (ENOSPC after open) drops its temp.
+_ck4, _a4, _cj4 = _art_journal()
+_cj4.note_file(*_a4[0])
+_real_fsync = tc.os.fsync
+
+
+def _enospc(fd):
+    raise OSError(28, "No space left on device")
+
+
+tc.os.fsync = _enospc
+try:
+    _cj4.checkpoint([_ck4], _CArgs())
+finally:
+    tc.os.fsync = _real_fsync
+check("a checkpoint cut short leaves no temp",
+      not os.path.exists(_cj4._partial_path(_ck4) + ".tmp"))
+check("... and stays due", _cj4._changes > 0)
+
+# An artifact's first pin checkpoints in seconds, not at the next interval:
+# until then its pre_rctime is in memory only.
+print("\nfirst pin checkpoints promptly:")
+_ck5, _a5, _cj5 = _art_journal()
+_p5 = _cj5._partial_path(_ck5)
+_cj5.start_checkpoints([_ck5], _CArgs(), every_s=3600, every_changes=10 ** 6,
+                       poll_s=3600, pin_debounce_s=0.1)
+_cj5.note_file(*_a5[0])
+time.sleep(0.4)
+check("a first sighting alone waits for the interval", not os.path.exists(_p5))
+_cj5.note_write(_a5[0][0])
+check("a first pin checkpoints within the debounce",
+      _wait_for(lambda: os.path.exists(_p5), timeout=3.0))
+_m5 = os.stat(_p5).st_mtime_ns
+_cj5.note_write(_a5[0][0])
+time.sleep(0.4)
+check("a later pin of the same artifact waits for the interval",
+      os.stat(_p5).st_mtime_ns == _m5)
+_cj5.write([_ck5], _CArgs())
+
+# ... but not back to back when a checkpoint is expensive.
+_ck6, _a6, _cj6 = _art_journal()
+_cj6._ckpt_cost = 100.0
+_cj6.start_checkpoints([_ck6], _CArgs(), every_s=3600, every_changes=10 ** 6,
+                       poll_s=3600, pin_debounce_s=0.05)
+_cj6.note_file(*_a6[0])
+_cj6.note_write(_a6[0][0])
+time.sleep(0.5)
+check("pin checkpoints are spaced by the last one's cost",
+      not os.path.exists(_cj6._partial_path(_ck6)))
+_cj6._stop.set()
+_cj6._wake.set()
+
+print("\nfinal write durability:")
+# The append is fsynced before the checkpoint is unlinked.
+_ck7, _a7, _cj7 = _art_journal()
+_cj7.note_file(*_a7[0])
+_cj7.note_write(_a7[0][0])
+_cj7.checkpoint([_ck7], _CArgs())
+_events = []
+_real_unlink = tc.os.unlink
+tc.os.fsync = lambda fd: (_events.append("fsync"), _real_fsync(fd))[1]
+tc.os.unlink = lambda p: (_events.append("unlink " + p), _real_unlink(p))[1]
+try:
+    _cj7.write([_ck7], _CArgs())
+finally:
+    tc.os.fsync, tc.os.unlink = _real_fsync, _real_unlink
+check("the journal is fsynced before its checkpoint is removed",
+      _events == ["fsync", "unlink " + _cj7._partial_path(_ck7)])
+
+# A failed append brings the checkpoint up to date: the periodic one misses
+# every artifact since, and a short run never wrote one at all.
+_ck8, _a8, _cj8 = _art_journal()
+_cj8.note_file(*_a8[0])
+_cj8.note_write(_a8[0][0])
+_cj8.checkpoint([_ck8], _CArgs())
+_cj8.note_file(*_a8[1])
+_cj8.note_write(_a8[1][0])
+os.makedirs(os.path.join(_ck8, tc.RUN_JOURNAL_NAME))
+_cj8.write([_ck8], _CArgs())
+_rows8 = [json.loads(x) for x in open(_cj8._partial_path(_ck8))]
+check("a failed final write leaves the CURRENT rows in the checkpoint",
+      len(_rows8) == 2 and all(r.get("partial") is True for r in _rows8))
+_ck9, _a9, _cj9 = _art_journal()
+_cj9.note_file(*_a9[0])
+os.makedirs(os.path.join(_ck9, tc.RUN_JOURNAL_NAME))
+_cj9.write([_ck9], _CArgs())
+check("... including a run that never checkpointed",
+      os.path.exists(_cj9._partial_path(_ck9)))
+
+check("the walker skips the journal, every checkpoint and their temps",
+      all(tc._is_journal_file(n) for n in (
+          tc.RUN_JOURNAL_NAME, os.path.basename(_partial),
+          os.path.basename(_partial) + ".tmp"))
+      and not tc._is_journal_file("f.parquet"))
+
+
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}"))
 sys.exit(1 if fails else 0)

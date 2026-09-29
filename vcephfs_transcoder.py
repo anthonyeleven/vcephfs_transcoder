@@ -12,7 +12,7 @@ import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
 import threading, uuid, argparse
 
-_VERSION = "2112"
+_VERSION = "1984"
 
 # Replacing a file must be serialized against another worker replacing the
 # SAME file -- that is the only invariant here. A single global lock also
@@ -159,6 +159,10 @@ REG_QUIET_TICKS_DEFAULT = 10
 # count except for the existing pause/resume. Set it to the most threads the
 # volume may use and the regulator will climb toward it one step at a time.
 REG_MAX_THREADS_DEFAULT = 0
+# How long a REGULATOR pause may go without a usable sample before it resumes
+# blind at one thread. 0 holds the pause until a sample arrives, which on a
+# Prometheus outage is forever.
+REG_BLIND_RESUME_S_DEFAULT = 1800
 # Floor for the DOWN direction. 0 keeps the historical behavior of allowing a
 # step to unthrottled; set it in the config to guarantee the signal path can
 # never produce an unbounded stat rate on a live filesystem.
@@ -203,9 +207,9 @@ runtime_config = None
 apply_config = None
 regulator = None
 # True once start_regulator() has run, whether or not it started a regulator.
-# The regulator is decided once, so a later change to its URL or query is only
-# meaningful to warn about after that point -- and it matters most when the run
-# came up unregulated, where regulator stays None.
+# The regulator is decided once, so a later change to any regulate_* key is
+# only meaningful to warn about after that point -- and it matters most when the
+# run came up unregulated, where regulator stays None.
 regulator_started = False
 
 
@@ -315,6 +319,12 @@ def config_example(volume="VOLUME"):
         "# caused it, so the climb does not simply repeat.",
         "regulate_max_threads = %d" % REG_MAX_THREADS_DEFAULT,
         "",
+        "# A regulator pause with no usable sample (Prometheus down, empty",
+        "# result) for this long resumes at 1 thread instead of holding 0",
+        "# forever; the first usable sample restores the rest. 0 holds until",
+        "# a sample arrives.",
+        "regulate_blind_resume_s = %d" % REG_BLIND_RESUME_S_DEFAULT,
+        "",
     ))
 
 
@@ -378,7 +388,8 @@ class RuntimeConfig:
             'delay_min_ms', 'prune_subtree_max_bytes', 'prune_budget_bytes',
             'regulate_prometheus_url', 'regulate_query', 'regulate_pause_ms',
             'regulate_slo_ms', 'regulate_period_s', 'regulate_quiet_ticks',
-            'regulate_floor_ms', 'regulate_max_threads')
+            'regulate_floor_ms', 'regulate_max_threads',
+            'regulate_blind_resume_s')
 
     def __init__(self, path, poll_seconds=10.0):
         self.path = path
@@ -503,7 +514,7 @@ class RuntimeConfig:
                     if iv < 1:
                         raise ValueError("must be >= 1")
                     out[k] = iv
-                elif k == 'regulate_max_threads':
+                elif k in ('regulate_max_threads', 'regulate_blind_resume_s'):
                     iv = int(v)
                     if iv < 0:
                         raise ValueError("must be >= 0 (0 disables)")
@@ -559,7 +570,7 @@ class DynamicSemaphore:
         self._limit = value
         self._value = value  # available permits
 
-    def acquire(self, cancel=None):
+    def acquire(self, cancel=None, tick=None):
         """Acquire a permit, blocking until one is available.
 
         If *cancel* is a callable, it is checked each iteration; when it
@@ -567,14 +578,26 @@ class DynamicSemaphore:
         A bounded wait (0.5 s) guarantees that signals (SIGINT, etc.) and the
         cancel callback are always serviced promptly, even when no other
         thread calls release() or set_limit().
+
+        If *tick* is a callable, it runs between waits with the lock released.
+        The walker passes its config poll here. It is the only thread that
+        reads --config, and a threads=0 pause parks it right here, so without
+        this the edit that would undo the pause was never read -- nor was any
+        other edit, for as long as any pause lasted.
         """
-        with self._cond:
-            while self._value <= 0:
+        while True:
+            with self._cond:
+                if self._value > 0:
+                    self._value -= 1
+                    return True
                 self._cond.wait(timeout=0.5)
                 if cancel is not None and cancel():
                     return False
-            self._value -= 1
-            return True
+                if self._value > 0:
+                    self._value -= 1
+                    return True
+            if tick is not None:
+                tick()
 
     def release(self):
         with self._cond:
@@ -752,6 +775,21 @@ def positive_int(value):
         raise argparse.ArgumentTypeError(f"invalid positive integer: {value!r}")
     if n <= 0:
         raise argparse.ArgumentTypeError(f"must be a positive integer, got {n}")
+    return n
+
+
+def non_negative_int(value):
+    """Argparse type for an integer >= 0, matching the --config parser.
+
+    A plain int let --regulate-blind-resume-s -1 through: negative is truthy,
+    so "blind >= limit" held and a pause resumed blind on its second blind tick.
+    """
+    try:
+        n = int(value)
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError(f"invalid non-negative integer: {value!r}")
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {n}")
     return n
 
 
@@ -1184,6 +1222,7 @@ REGULATE_APPLY = (
     ('regulate_quiet_ticks', 'regulate quiet ticks'),
     ('regulate_floor_ms', 'regulate delay floor'),
     ('regulate_max_threads', 'regulate max threads'),
+    ('regulate_blind_resume_s', 'regulate blind resume'),
 )
 
 REG_DEFAULTS = {
@@ -1195,6 +1234,7 @@ REG_DEFAULTS = {
     'regulate_floor_ms': REG_FLOOR_MS_DEFAULT,
     'regulate_quiet_ticks': REG_QUIET_TICKS_DEFAULT,
     'regulate_max_threads': REG_MAX_THREADS_DEFAULT,
+    'regulate_blind_resume_s': REG_BLIND_RESUME_S_DEFAULT,
 }
 # Raise the delay floor after repeated pauses: pausing repeatedly means the delay
 # is set lower than this filesystem will sustain, and recovering within a tick is
@@ -1286,6 +1326,10 @@ def _resolve_query(args):
     return q.replace("{volume}", _promql_regex_literal(names.pop())), None
 
 
+class NanSample(ValueError):
+    """The query returned NaN: a latency ratio over zero requests, 0/0."""
+
+
 class Regulator(threading.Thread):
     """Poll a latency query and throttle this job to keep it under a threshold."""
 
@@ -1307,6 +1351,12 @@ class Regulator(threading.Thread):
         self._quiet = 0
         self._last_err = 0.0
         self._paused_threads = None
+        # When a regulator pause started going without a usable sample.
+        self._blind_since = None
+        # nan samples in a row during a regulator pause; see _nan_while_paused().
+        self._nan_ticks = 0
+        # What a 1-thread resume on no real evidence still owes; see _probing().
+        self._probe_owed = None
         # Learned ceiling for regulator-driven thread increases. A pause
         # lowers it and it never falls below the operator's own --threads
         # value. It moves UP two ways: immediately when the operator raises
@@ -1353,7 +1403,9 @@ class Regulator(threading.Thread):
         if len(res) != 1:
             raise ValueError("query returned %d series, need exactly 1" % len(res))
         v = float(res[0]["value"][1])
-        if v != v or v in (float("inf"), float("-inf")) or v < 0:
+        if v != v:
+            raise NanSample("query returned nan")
+        if v in (float("inf"), float("-inf")) or v < 0:
             raise ValueError("query returned %r" % v)
         return v
 
@@ -1466,29 +1518,72 @@ class Regulator(threading.Thread):
         # every tick; this is the same property for the ceiling's.
         self._last_pressure_at = time.time()
         extra = self._note_pause()
-        if thread_count.limit > 0:
-            self._paused_threads = thread_count.limit
-            self._lower_ceiling(thread_count.limit)
+        cur = thread_count.limit
+        if cur > 0:
+            # Pausing a 1-thread probe must not shrink what it still owes.
+            owed = self._probe_owed if self._probing() else None
+            self._probe_owed = None
+            self._paused_threads = max(cur, owed or 0)
+            self._lower_ceiling(cur)
             thread_count.set_limit(0)
             logging.warning(
                 "Regulator: PAUSE at %.1f ms (%.0f%% of the %.0f ms target) -- "
                 "threads %d -> 0, in-flight copies will finish%s",
                 lat, 100.0 * lat / self.args.regulate_slo_ms,
-                self.args.regulate_slo_ms, self._paused_threads, extra)
+                self.args.regulate_slo_ms, cur, extra)
+
+    def _paused_by_me(self):
+        """True while threads sit at 0 because THIS regulator paused them.
+
+        The operator can resume in the meantime (SIGUSR1, or a threads edit in
+        --config). Forget the pause then, or a later operator pause reads as
+        ours and gets "resumed" on the next quiet sample.
+        """
+        if self._paused_threads and thread_count.limit != 0:
+            self._paused_threads = None
+        return bool(self._paused_threads)
+
+    def _probing(self):
+        """True while threads sit at the 1 that a no-evidence resume set.
+
+        nan and a Prometheus outage both resume a regulator pause without any
+        evidence the filesystem has recovered, so they bring back 1 thread,
+        not the pause's full count. The rest is owed, and the first usable
+        sample under the pause line pays it through _resume(). Without the
+        debt, a job with thread adaptivity off (the default) stayed at 1
+        thread for good. As with _paused_by_me(), an operator change to the
+        thread count forgets it.
+        """
+        if self._probe_owed and thread_count.limit != 1:
+            self._probe_owed = None
+        return bool(self._probe_owed)
+
+    def _resume_one(self):
+        """Take a regulator pause to 1 thread, owing the rest. Returns its count."""
+        was = self._paused_threads
+        self._paused_threads = None
+        thread_count.set_limit(1)
+        self._probe_owed = was if was > 1 else None
+        _update_proctitle()
+        return was
 
     def _resume(self):
-        if thread_count.limit == 0 and self._paused_threads:
-            want = self._paused_threads
-            ceil = self._thread_ceiling()
-            if ceil and want > ceil:
-                thread_count.set_limit(ceil)
-                logging.info(
-                    "Regulator: resumed, threads 0 -> %d (held under the %d it "
-                    "paused at by the learned ceiling)", ceil, want)
-            else:
-                thread_count.set_limit(want)
-                logging.info("Regulator: resumed, threads 0 -> %d", want)
-            self._paused_threads = None
+        if self._paused_by_me():
+            want, cur = self._paused_threads, 0
+        elif self._probing():
+            want, cur = self._probe_owed, 1
+        else:
+            return
+        self._paused_threads = self._probe_owed = None
+        ceil = self._thread_ceiling()
+        if ceil and want > ceil:
+            thread_count.set_limit(ceil)
+            logging.info(
+                "Regulator: resumed, threads %d -> %d (held under the %d it "
+                "paused at by the learned ceiling)", cur, ceil, want)
+        else:
+            thread_count.set_limit(want)
+            logging.info("Regulator: resumed, threads %d -> %d", cur, want)
 
     def _ease(self):
         global file_delay_ms
@@ -1620,6 +1715,78 @@ class Regulator(threading.Thread):
             REG_FLOOR_DECAY_S // 60, old, self._ceiling, mx)
 
     # -- loop -----------------------------------------------------------------
+    def _hold(self, why):
+        """No usable sample: hold, unless holding means paused forever.
+
+        A monitoring outage is not evidence about the filesystem, and acting on
+        absent data is worse than not acting -- EXCEPT when this regulator is
+        the one holding threads at 0. Then "hold" is a pause with no exit: only
+        a usable sample resumes it, and a Prometheus outage never sends one.
+        So a regulator pause gets regulate_blind_resume_s of blindness, then
+        resumes at 1 thread. The rest waits for a usable sample (_probing()),
+        so that is as far as it goes blind.
+        """
+        now = time.time()
+        if not self._paused_by_me():
+            self._blind_since = None
+            if now - self._last_err > REG_ERR_QUIET_S:
+                logging.warning(
+                    "Regulator: no usable sample (%s) -- holding current "
+                    "settings, not adjusting", why)
+                self._last_err = now
+            return
+        limit = int(getattr(self.args, "regulate_blind_resume_s", 0) or 0)
+        if self._blind_since is None:
+            self._blind_since = now
+            self._last_err = now
+            logging.warning(
+                "Regulator: no usable sample (%s) while PAUSED by the "
+                "regulator -- %s", why,
+                "resuming at 1 thread in %ds if it persists" % limit if limit
+                else "regulate_blind_resume_s is 0, staying paused until a "
+                     "sample arrives")
+            return
+        blind = now - self._blind_since
+        if limit and blind >= limit:
+            self._blind_since = None
+            was = self._resume_one()
+            logging.error(
+                "Regulator: no usable sample for %ds while paused (%s) -- "
+                "resuming BLIND, threads 0 -> 1 (paused at %d); the rest waits "
+                "for a usable sample", blind, why, was)
+        elif now - self._last_err > REG_ERR_QUIET_S:
+            logging.warning("Regulator: still no usable sample (%s), paused "
+                            "blind for %ds", why, blind)
+            self._last_err = now
+
+    def _nan_while_paused(self):
+        """nan during our own pause: quiet, once it has lasted.
+
+        A latency ratio goes 0/0 when no MDS request completed in the query
+        window, which our own pause makes likely on a quiet volume, and
+        holding on it was a pause that never ended. But an MDS that is
+        stalled, or in replay/rejoin after a failover, completes nothing
+        either, and that is what the pause is for. So it takes
+        regulate_quiet_ticks nan samples in a row, the same evidence a quiet
+        volume needs before easing, and then only 1 thread comes back.
+        """
+        self._blind_since = None
+        self._nan_ticks += 1
+        need = max(1, int(self.args.regulate_quiet_ticks))
+        if self._nan_ticks == 1:
+            logging.info(
+                "Regulator: query returned nan while paused -- no MDS request "
+                "completed in the query window; resuming at 1 thread if that "
+                "lasts %d samples", need)
+        if self._nan_ticks < need:
+            return
+        self._nan_ticks = 0
+        was = self._resume_one()
+        logging.warning(
+            "Regulator: nan for %d samples while paused -- threads 0 -> 1 "
+            "(paused at %d); the rest waits for a usable sample, since a "
+            "stalled MDS reads nan too", need, was)
+
     def run(self):
         while not do_exit.is_set():
             # Re-read every tick: regulate_period_s is a --config tunable, and
@@ -1628,17 +1795,21 @@ class Regulator(threading.Thread):
             period = max(5, int(self.args.regulate_period_s))
             try:
                 lat = self.sample()
-            except Exception as e:
-                # Hold. A monitoring outage is not evidence about the filesystem,
-                # and acting on absent data is worse than not acting.
-                now = time.time()
-                if now - self._last_err > REG_ERR_QUIET_S:
-                    logging.warning(
-                        "Regulator: no usable sample (%s) -- holding current "
-                        "settings, not adjusting", e)
-                    self._last_err = now
+            except NanSample:
+                if self._paused_by_me():
+                    self._nan_while_paused()
+                else:
+                    self._nan_ticks = 0
+                    self._hold("query returned nan")
                 do_exit.wait(period)
                 continue
+            except Exception as e:
+                self._nan_ticks = 0
+                self._hold(_redact_text(e, self.args.regulate_prometheus_url))
+                do_exit.wait(period)
+                continue
+            self._blind_since = None
+            self._nan_ticks = 0
             if lat >= self.args.regulate_pause_ms:
                 self._quiet = 0
                 self._pause(lat)
@@ -1663,6 +1834,355 @@ class Regulator(threading.Thread):
                     # is exactly when this can act; they never both fire.
                     self._maybe_raise_threads(lat)
             do_exit.wait(period)
+
+
+def _url_userinfo(url):
+    """The raw "user:password" substring of url, or "" -- WITHOUT urlsplit().
+
+    Scheme-less values ARE covered: with no "://" the whole string is searched,
+    so "bob:pw@host" counts as credentialed. A percent-encoded "@" counts too
+    when no literal one is present.
+
+    urlsplit() RAISES on an unbalanced "[" in the netloc (and, on recent
+    CPython, on a bracketed host that is not an IP literal), while
+    urllib.request does NOT validate the host at all: Request._parse() splits
+    it with _splithost() and the request goes out regardless. Deriving the
+    credentials from urlsplit() therefore failed OPEN -- on
+    "http://bob:pw@[prom/api/v1/query" it returned nothing, so both rejection
+    layers admitted the URL and _redact_text() had nothing to scrub, and the
+    password reached the "first sample failed" / "no usable sample" WARNINGs.
+    Parse it by hand instead: any non-empty userinfo counts as credentialed,
+    so an unparseable URL fails CLOSED. The boundary matters as much as the
+    parser -- see the comment below on why it is the last "@", not urllib's
+    host boundary.
+    """
+    return _url_userinfo_split(url)[1]
+
+
+def _url_userinfo_split(url):
+    """(scheme_sep, userinfo, remainder) from the ORIGINAL string.
+
+    ONE boundary, shared by _url_userinfo() and _loggable_url(). They used to
+    compute it separately and a disagreement is the worst outcome available: a
+    URL detected as credentialed by one and emitted intact by the other.
+    Deriving both from this function makes drift impossible rather than
+    merely unlikely.
+
+    Everything is measured on the string the operator supplied, never on a
+    decoded copy, so _loggable_url() can rebuild their URL minus the secret
+    instead of logging a rewritten one.
+    """
+    s = str(url or "")
+    _, sep, rest = s.partition("://")
+    if not sep:
+        rest = s
+    # Deliberately NOT urllib's host boundary. Cutting at the first of "/?#"
+    # BEFORE looking for "@" failed OPEN: in "http://bob:pa/ss@prom/api/v1/query"
+    # the "@" falls past the cut, so the URL read as credential-free, neither
+    # refusal layer fired, and the full password reached the startup "Config:"
+    # line, the --no-regulate warning, Starting:/Finished:, every
+    # _report_state() line and the process title. The secret to protect is what
+    # the operator typed, not what urllib would transmit, so take the userinfo
+    # from the LAST "@" anywhere after "://". A Prometheus base URL has no
+    # legitimate reason to carry an "@", so over-refusing one costs nothing and
+    # this fails CLOSED.
+    idx = rest.rfind("@")
+    width = 1
+    if idx < 0:
+        # No literal "@" -- fall back to a percent-ENCODED one. Request._parse()
+        # runs unquote() on the host, so "http://bob:pw%40prom/api/v1/query"
+        # reaches http.client as "bob:pw@prom" and dies with
+        # InvalidURL("nonnumeric port: 'pw@prom'"). Matching only a literal "@"
+        # meant neither refusal fired, the URL was logged whole, and "pw" was
+        # not scrubbed from that exception. Only consulted when there is no
+        # literal "@", so a URL that already has one keeps its old boundary and
+        # a later "%40" in the path cannot move it.
+        idx = rest.lower().rfind("%40")
+        width = 3
+    if idx < 0:
+        return sep, "", rest
+    return sep, rest[:idx], rest[idx + width:]
+
+
+def _url_credentials(url):
+    """Every substring of url's userinfo worth scrubbing from error text.
+
+    Both the raw and the percent-DECODED form of each part. Request._parse()
+    runs unquote() on the host, so a password written "p%40ss" surfaces as
+    "p@ss" in the exception text while the URL holds the escaped form --
+    scrubbing only one of the two misses the other. Longest first, so a
+    password that merely contains the username is not left half-redacted.
+    """
+    ui = _url_userinfo(url)
+    if not ui:
+        return ()
+    user, _, pw = ui.partition(":")
+    out = set()
+    for v in (user, pw):
+        if not v:
+            continue
+        out.add(v)
+        try:
+            dec = urllib.parse.unquote(v)
+        except Exception:
+            dec = v
+        if dec:
+            out.add(dec)
+    return tuple(sorted(out, key=len, reverse=True))
+
+
+def _loggable_url(url):
+    """url with any user:password@ userinfo replaced, for logging.
+
+    All string work, no urlsplit(): this function must never be the thing
+    that raises. It used to call .port, which raises ValueError on a
+    non-numeric port while urlsplit() does not -- the raise landed outside
+    the try, propagated through _apply_regulate_keys -> _apply_config ->
+    RuntimeConfig.poll(), and killed the job at startup or mid-walk. Keeping
+    it purely textual also preserves IPv6 brackets and the original host case.
+    """
+    if not url:
+        return url
+    s = str(url)
+    # The SAME split as _url_userinfo(), from the SAME helper -- not a second
+    # implementation of the same rule. Had they disagreed, a password containing
+    # "/", "?", "#" or a percent-encoded "@" would be detected as a credential
+    # and then logged intact. "after" comes from the operator's own string, so
+    # this redacts their URL rather than emitting a decoded rewrite of it.
+    sep, userinfo, after = _url_userinfo_split(s)
+    if not userinfo:
+        return url
+    head = s.partition("://")[0] if sep else ""
+    return (head + "://" if sep else "") + "<redacted>@" + after
+
+
+def _redact_text(text, url):
+    """text with every credential substring from url replaced.
+
+    urllib.request.urlopen() does not use URL userinfo for authentication: it
+    hands "user:pw@host" to http.client as the HOSTNAME. A credentialed URL
+    with no explicit port therefore dies in _get_hostport() with
+    InvalidURL("nonnumeric port: 'pw@host'"), and with a port it fails DNS on
+    the same string -- so the exception text carries the PASSWORD, not a
+    "user:pw@" pair a shape-matching regex would find. Scrub against the
+    credentials the URL is known to hold instead of trusting the error's
+    shape. Basic auth, if it is ever wanted, belongs in an
+    HTTPBasicAuthHandler.
+    """
+    # LONGEST FIRST. Replacing the username before the password leaves part
+    # of the password behind when one contains the other: user "bob" with
+    # password "bobSecret" would log "<redacted>Secret". _url_credentials()
+    # already sorts, but this loop is where the ordering actually matters, so
+    # it does not rely on that contract holding.
+    s = str(text)
+    for v in sorted(_url_credentials(url), key=len, reverse=True):
+        s = s.replace(v, "<redacted>")
+    return s
+
+
+def _url_has_userinfo(url):
+    """True if url carries userinfo, which can never work here (see above).
+
+    Accepts scheme-less values and a percent-encoded "@", so it is wider than
+    a "://" test. _redact_argv() has to accept the same inputs or a value this
+    refuses still reaches the log. It matches this exactly for tokens holding
+    "://". For scheme-less tokens it is deliberately NARROWER: it also
+    requires the token to look like a URL authority (so PromQL is not
+    rewritten) and to carry a ":" in the decoded userinfo (so ordinary
+    arguments are not mangled). A scheme-less username-only value such as
+    "tok@prom:9090/api" is therefore refused here but NOT redacted in argv.
+    """
+    return bool(_url_userinfo(url))
+
+
+def _redact_argv(argv):
+    """argv with any credentialed URL token replaced, BEFORE shlex.join().
+
+    Refusing a credentialed URL does not keep it out of the log: main() logs
+    the whole command line in its Starting:/Finished: lines, and
+    _report_state() logs _amended_cmdline() on every signal and every "Config
+    reloaded", which also feeds setproctitle().
+
+    Redacting TOKENS rather than the joined string, because the joined-string
+    version this replaces was wrong three separate ways:
+      - It matched only the full "--regulate-prometheus-url" spelling, but
+        main()'s parser is built WITHOUT allow_abbrev=False, so argparse takes
+        any unique prefix. "--regulate-prom http://u:pw@host" set the value
+        while the scrubber saw nothing, and the password went to the log and
+        the process title. Per-token redaction cannot care how a flag was
+        spelled.
+      - Scrubbing the credential substrings across the whole joined line hit
+        every OTHER occurrence too: username "data" rewrote an unrelated
+        "--tmpdir /data/tmp" as "/<redacted>/tmp".
+      - shlex.join() quotes first, so a password containing an apostrophe
+        came back as '"'"' and the raw-substring replace no longer matched.
+
+    _loggable_url() handles the --flag=URL form unchanged, because the "://"
+    split leaves "--flag=http" in its head.
+
+    SCHEME-LESS values are covered too. Gating on "://" was NARROWER than
+    _url_has_userinfo(), which matches a value with no scheme at all: so
+    "--regulate-prometheus-url bob:pw@prom:9090/api" was refused by
+    start_regulator() while the token still went unredacted into
+    Starting:/Finished:, every _report_state() line and the process title.
+    Detection and redaction accept the same inputs for tokens holding "://";
+    for scheme-less tokens redaction stays narrower on purpose, and a
+    username-only value like "tok@prom:9090/api" is refused but not redacted.
+
+    A token containing "://" is unambiguously a URL, so it is redacted
+    whenever it carries userinfo at all -- the same inputs _url_has_userinfo()
+    refuses. That covers a username-only credential ("http://TOKEN@prom/...",
+    a common way to pass a token) and an encoded separator
+    ("http://bob%3Apw@prom/..."), both of which a ":" test misses.
+
+    The ":" test survives only for SCHEME-LESS tokens, where it is what keeps
+    ordinary arguments intact, and it is a deliberate trade-off rather than a
+    shape anyone should tighten casually. Userinfo worth hiding is
+    "user:password"; a lone "user@host" has no secret in it. So "/data/tmp"
+    (no "@"), "/data/x@y" and an address like "bob@example.com" (an "@", but
+    no ":" before it) are all returned untouched, while "bob:pw@host" is
+    redacted. It tests the DECODED userinfo, so "bob%3Apw@host" is caught too.
+    A path that genuinely contains both -- "/a:b@c" -- is over-redacted; that
+    is the side the trade-off errs on.
+    """
+    def _split_flag(tok):
+        """("--flag=", value) for a joined flag assignment, else ("", tok).
+
+        A scheme-less value loses its flag name otherwise: _loggable_url()
+        keeps the text before "://" as its head, so
+        "--regulate-prometheus-url=http://u:pw@h" survives intact, but
+        "--regulate-prometheus-url=bob:pw@prom:9090/api" has no "://" for the
+        head to come from and was logged as "<redacted>@prom:9090/api" --
+        the flag name simply gone from the amended command line.
+        """
+        if tok.startswith("-") and "=" in tok:
+            name, _, value = tok.partition("=")
+            return name + "=", value
+        return "", tok
+
+    def _authority_like(user, host):
+        """Whether a SCHEME-LESS token looks like a real URL authority.
+
+        PromQL reaches here: --regulate-query goes through the same argv
+        redaction, and a query carrying an "@" modifier with any ":" before it
+        matched the ":"-in-userinfo guard. Recording-rule names
+        ("job:metric:p99") and subqueries ("[1h:5m]") both hold a ":", so
+        "max_over_time(x[1h:5m] @ end())" was logged as "<redacted>@ end())".
+        That is not a leak, but it destroys output the operator reads, and
+        start_regulator() logs the query in full elsewhere regardless.
+
+        None of these characters is legal in an RFC 3986 userinfo or host, so
+        their presence means the token is not an authority at all. Brackets
+        stay legal in the HOST, because an IPv6 literal needs them: without
+        that exemption "bob:pw@[::1]:9090/api" would stop being redacted,
+        which is the failure direction that actually matters.
+
+        Tested on the USERNAME and the host only, never the password: a
+        password is opaque and may hold anything. Testing the whole userinfo
+        let "bob:p(w@prom:9090/api" through -- refused by start_regulator(),
+        then logged whole in Starting:/Finished: and ps. Most PromQL still
+        fails here, on the part before its first ":" or on what follows the
+        "@". Not all: "job:m:p99[5m]@1700000000" has a clean user and host,
+        and is logged as "<redacted>@1700000000". That errs the safe way,
+        costs only readability, and is pinned by a test.
+        """
+        bad_user = set(' \t\n()[]{}"\',<>')
+        bad_host = set(' \t\n(){}"\',<>')
+        return not (set(user) & bad_user or set(host) & bad_host)
+
+    def _credentialed(tok):
+        _, value = _split_flag(tok)
+        sep, ui, after = _url_userinfo_split(value)
+        if not ui:
+            return False
+        if sep:
+            # Unambiguously a URL, so match _url_has_userinfo() exactly. The
+            # ":" test below was never needed here, and being narrower than
+            # detection is how a refused credential still reached the log.
+            # Deliberately NO _authority_like() test on this branch: a real
+            # URL's query string may hold anything ("?q=(x)"), and rejecting
+            # on that would stop redacting a genuine credential.
+            return True
+        # Scheme-less: keep the guard that protects ordinary arguments, but
+        # test the DECODED userinfo, since Request._parse() unquotes the host
+        # and "bob%3Apw" is a credential just as much as "bob:pw".
+        dec = urllib.parse.unquote(ui)
+        if ":" not in dec:
+            return False
+        host = re.split(r"[/?#]", after, maxsplit=1)[0]
+        return _authority_like(dec.partition(":")[0], host)
+
+    def _redact(tok):
+        prefix, value = _split_flag(tok)
+        return prefix + _loggable_url(value)
+
+    return [_redact(a) if _credentialed(a) else a for a in argv]
+
+
+def _regulator_decline_reasons(args, first_only=False):
+    """Every precondition start_regulator() would decline for, in its order.
+
+    A list of (code, reason); empty means it would start. first_only=True
+    returns as soon as one is found, which is what the single-reason wrapper
+    below wants and, more importantly, preserves the original SHORT-CIRCUIT:
+    with no URL configured the query is never resolved, so a job that never
+    asked for a regulator still pays no scandir at startup.
+
+    The late-change caller wants them ALL. Returning only the first meant that
+    on an unregulated run missing both the URL and the query, a late change
+    named just the URL -- the operator set it, reloaded, and only then heard
+    about the query.
+
+    ONE copy of the preconditions, shared by start_regulator() and the
+    late-change warning in _apply_regulate_keys(). That warning used to
+    promise a restart would help whenever a URL and a query were both
+    present, which is wrong when slo >= pause or {volume} cannot resolve:
+    the restart comes back unregulated with the same complaint. Callers map
+    the code to their own wording, so the CONDITIONS live here only once.
+
+    --no-regulate is deliberately not checked: it is not a misconfiguration,
+    and both callers word that case differently.
+
+    This calls _resolve_query(), which scandirs the volume root and reads
+    /proc/self/mounts when the query uses {volume}. That cost is accepted on
+    purpose -- it is only paid when a config reload actually changed a
+    regulate_* key, which is rare, and advice a restart cannot satisfy is
+    worse than one scandir.
+    """
+    out = []
+    url = getattr(args, "regulate_prometheus_url", None)
+    if not url:
+        out.append(("no_url", "no regulate_prometheus_url is set"))
+        if first_only:
+            return out
+    elif _url_has_userinfo(url):
+        out.append(("userinfo",
+                    "regulate_prometheus_url carries embedded credentials, "
+                    "which urllib does not use for authentication"))
+        if first_only:
+            return out
+    query, why = _resolve_query(args)
+    if not query:
+        out.append(("query", why))
+        if first_only:
+            return out
+    if args.regulate_slo_ms >= args.regulate_pause_ms:
+        out.append(("band",
+                    "regulate_slo_ms (%.0f) is not below regulate_pause_ms "
+                    "(%.0f), so the soft band is empty or inverted"
+                    % (args.regulate_slo_ms, args.regulate_pause_ms)))
+        if first_only:
+            return out
+    return out
+
+
+def _regulator_decline_reason(args):
+    """The FIRST reason start_regulator() would decline, or None.
+
+    Short-circuiting wrapper for callers that report one reason and stop.
+    """
+    found = _regulator_decline_reasons(args, first_only=True)
+    return found[0] if found else None
 
 
 def _apply_regulate_keys(args, cfg):
@@ -1692,48 +2212,104 @@ def _apply_regulate_keys(args, cfg):
     The bare setattr logs an INFO line that reads like success either way, so
     the cases that change nothing have to warn.
     """
+    _changed = []                      # [(key, label, cleared)] actually applied
     for _k, _label in REGULATE_APPLY:
-        if _k in cfg and cfg[_k] != getattr(args, _k, None):
-            _old = getattr(args, _k, None)
-            setattr(args, _k, cfg[_k])
+        if _k not in cfg or cfg[_k] == getattr(args, _k, None):
+            continue
+        _old = getattr(args, _k, None)
+        if (_k == 'regulate_prometheus_url' and regulator_started
+                and _url_has_userinfo(cfg[_k])):
+            # Refuse a LATE credentialed URL only. A running regulator
+            # rebuilds the URL from args every tick, so storing this would
+            # break every subsequent sample and keep the credential in play.
+            #
+            # At STARTUP (regulator_started False) it is stored and
+            # start_regulator() does the refusing, via
+            # _regulator_decline_reason(). Refusing here too would take the
+            # decision away from the one function that owns it, and -- worse
+            # -- leave args.regulate_prometheus_url None, so start_regulator()
+            # fell through to its "no regulate_prometheus_url" branch and
+            # announced that a --config file which plainly HAS one does not.
+            # The secret never reaches the network either way: that function
+            # returns before sample().
+            logging.warning(
+                "Config: %s carries embedded credentials (%s) and was NOT "
+                "applied -- urllib does not use URL userinfo for auth, so it "
+                "would fail on every sample. Keeping the previous value.",
+                _label, _loggable_url(cfg[_k]))
+            continue
+        setattr(args, _k, cfg[_k])
+        if _k == 'regulate_prometheus_url':
+            logging.info("Config: %s %s -> %s", _label, _loggable_url(_old),
+                         _loggable_url(cfg[_k]))
+        else:
             logging.info("Config: %s %s -> %s", _label, _old, cfg[_k])
-            _cleared = cfg[_k] is None or cfg[_k] == ""
-            if not regulator_started:
-                pass
-            elif regulator is None:
-                if _cleared:
-                    pass
-                elif getattr(args, "no_regulate", False):
-                    logging.warning(
-                        "Config: %s changed, but this run is unregulated "
-                        "because of --no-regulate and the regulator is only "
-                        "started at startup -- restart the job WITHOUT "
-                        "--no-regulate for this to take effect", _label)
-                else:
-                    logging.warning(
-                        "Config: %s changed, but this run started unregulated "
-                        "and the regulator is only started at startup -- "
-                        "restart the job for this to take effect", _label)
-            elif _k == 'regulate_query':
-                logging.warning(
-                    "Config: %s changed, but the query is fixed when the "
-                    "regulator starts -- restart the job for this to take "
-                    "effect", _label)
-            elif _k == 'regulate_prometheus_url':
-                if _cleared:
-                    logging.warning(
-                        "Config: %s was cleared while the regulator is "
-                        "running -- every sample will now fail and it will "
-                        "hold its current settings. Set a URL, or restart "
-                        "with --no-regulate if the run should be "
-                        "unregulated.", _label)
-                else:
-                    logging.info(
-                        "Config: %s is re-read on every sample -- the running "
-                        "regulator picks it up at its next poll, no restart "
-                        "needed", _label)
-            if _k == 'regulate_floor_ms' and regulator is not None:
-                regulator.set_floor_base(cfg[_k])
+        if _k == 'regulate_floor_ms' and regulator is not None:
+            regulator.set_floor_base(cfg[_k])
+        _changed.append((_k, _label, cfg[_k] is None or cfg[_k] == ""))
+
+    # DECIDE ONCE, AFTER THE LOOP, FROM THE FINAL args. Deciding per key
+    # mid-loop read a half-applied namespace: one reload adding both the URL
+    # and the query hit regulate_prometheus_url first, while args.regulate_query
+    # was still None, and advised "set regulate_query, then restart" -- then the
+    # query in that same reload advised "restart the job for this to take
+    # effect". Contradictory advice for the most common fix there is. This also
+    # replaces N near-identical WARNINGs per reload with one naming every key.
+    if not regulator_started or not _changed:
+        return
+
+    if regulator is None:
+        # Clearing a key on an unregulated run has nothing waiting to take
+        # effect, so the INFO lines above are the whole story for those.
+        _pending = [_l for _k, _l, _cleared in _changed if not _cleared]
+        if not _pending:
+            return
+        _labels = ", ".join(_pending)
+        if getattr(args, "no_regulate", False):
+            logging.warning(
+                "Config: %s changed, but this run is unregulated because of "
+                "--no-regulate and the regulator is only started at startup "
+                "-- restart the job WITHOUT --no-regulate for this to take "
+                "effect", _labels)
+            return
+        _whys = _regulator_decline_reasons(args)
+        if _whys:
+            # ALL of them: naming only the first sent the operator round the
+            # loop once per missing precondition.
+            logging.warning(
+                "Config: %s changed, but this run started unregulated and a "
+                "restart would still decline: %s. Fix that first, then "
+                "restart the job.", _labels,
+                "; ".join(_r for _c, _r in _whys))
+        else:
+            logging.warning(
+                "Config: %s changed, but this run started unregulated and the "
+                "regulator is only started at startup -- restart the job for "
+                "this to take effect", _labels)
+        return
+
+    # A regulator IS running: what takes effect depends on the key.
+    _restart = [_l for _k, _l, _c in _changed if _k == 'regulate_query']
+    _clearedurl = [_l for _k, _l, _c in _changed
+                   if _k == 'regulate_prometheus_url' and _c]
+    _liveurl = [_l for _k, _l, _c in _changed
+                if _k == 'regulate_prometheus_url' and not _c]
+    if _restart:
+        logging.warning(
+            "Config: %s changed, but the query is fixed when the regulator "
+            "starts -- restart the job for this to take effect",
+            ", ".join(_restart))
+    if _clearedurl:
+        logging.warning(
+            "Config: %s was cleared while the regulator is running -- every "
+            "sample will now fail and it will hold its current settings. Set "
+            "a URL, or restart with --no-regulate if the run should be "
+            "unregulated.", ", ".join(_clearedurl))
+    if _liveurl:
+        logging.info(
+            "Config: %s is re-read on every sample -- the running regulator "
+            "picks it up at its next poll, no restart needed",
+            ", ".join(_liveurl))
 
 
 def start_regulator(args):
@@ -1752,54 +2328,76 @@ def start_regulator(args):
                 "configured regulate_prometheus_url (%s) and regulate_query -- "
                 "both ignored for this run. Running at file_delay=%dms "
                 "threads=%d.",
-                url, file_delay_ms, thread_count.limit)
+                _loggable_url(url), file_delay_ms, thread_count.limit)
         else:
             logging.info("Self-regulation disabled by --no-regulate; "
                          "running at file_delay=%dms threads=%d",
                          file_delay_ms, thread_count.limit)
         return None
-    if not url:
-        # Of the ways this function declines to start, an omitted --config is
-        # the likeliest, and it was the only one logged below WARNING while the
-        # three below it warn. That made the common accident the quietest, and
-        # indistinguishable from a normal start in a multi-gigabyte log. A run
-        # that means to go unregulated says so with --no-regulate and stays
-        # quiet; an omission is now greppable.
-        #
-        # Name the --config path when there is one: RuntimeConfig.poll() is
-        # silent on FileNotFoundError for its first read (_mtime is None), so a
-        # --config pointing at a file that does not exist arrives here having
-        # logged nothing at all, and "set the keys in --config" would otherwise
-        # be advice about a file the operator thinks they already wrote. The
-        # file is on local disk, so check which of the two it is and say so.
-        cfg = getattr(args, "config", None)
-        if cfg and not os.path.exists(cfg):
-            where = ("in --config %s, which does not exist, or with "
-                     "--regulate-prometheus-url and --regulate-query" % cfg)
-        elif cfg:
-            where = ("in --config %s, which has no regulate_prometheus_url, or "
-                     "with --regulate-prometheus-url and --regulate-query" % cfg)
+    # ONE evaluation of the preconditions, shared with the late-change warning
+    # in _apply_regulate_keys() via _regulator_decline_reason(). Only the
+    # WORDING lives here; the conditions do not, so the two callers cannot
+    # drift apart the way they had (that warning promised a restart would help
+    # whenever a URL and query were both set, which is false for an inverted
+    # soft band or an unresolvable {volume}).
+    _decline = _regulator_decline_reason(args)
+    if _decline:
+        _code, _reason = _decline
+        if _code == "no_url":
+            # Of the ways this function declines to start, an omitted --config
+            # is the likeliest, and it was the only one logged below WARNING
+            # while the others warn. That made the common accident the
+            # quietest, and indistinguishable from a normal start in a
+            # multi-gigabyte log. A run that means to go unregulated says so
+            # with --no-regulate and stays quiet; an omission is greppable.
+            #
+            # Name the --config path when there is one: RuntimeConfig.poll() is
+            # silent on FileNotFoundError for its first read (_mtime is None),
+            # so a --config pointing at a file that does not exist arrives here
+            # having logged nothing at all, and "set the keys in --config"
+            # would otherwise be advice about a file the operator thinks they
+            # already wrote. The file is on local disk, so say which it is.
+            cfg = getattr(args, "config", None)
+            if cfg and not os.path.exists(cfg):
+                where = ("in --config %s, which does not exist, or with "
+                         "--regulate-prometheus-url and --regulate-query" % cfg)
+            elif cfg:
+                where = ("in --config %s, which has no regulate_prometheus_url, "
+                         "or with --regulate-prometheus-url and "
+                         "--regulate-query" % cfg)
+            else:
+                where = ("with --regulate-prometheus-url and --regulate-query, "
+                         "or in a --config file")
+            logging.warning(
+                "Self-regulation disabled (no regulate_prometheus_url); running "
+                "at file_delay=%dms threads=%d. Set the URL and query %s, or "
+                "pass --no-regulate to declare that this run is meant to be "
+                "unregulated.", file_delay_ms, thread_count.limit, where)
+        elif _code == "userinfo":
+            # Reached for a CLI URL and for one from --config alike: the
+            # apply-time path deliberately stores a credentialed URL at
+            # startup and leaves the refusal to this function, so that this
+            # message -- the one that explains the remedy -- is what the
+            # operator sees. Nothing has sampled it; we return before that.
+            logging.warning(
+                "Self-regulation disabled: regulate_prometheus_url carries "
+                "embedded credentials (%s), which urllib does not use for "
+                "authentication -- it would fail on every sample. Remove the "
+                "user:password@ from the URL; if the endpoint needs basic "
+                "auth, it has to go through an HTTPBasicAuthHandler. Running "
+                "at file_delay=%dms threads=%d.",
+                _loggable_url(url), file_delay_ms, thread_count.limit)
+        elif _code == "band":
+            logging.warning(
+                "Self-regulation disabled: %s and the regulator would hit the "
+                "pause line without ever easing off first. Fix the config.",
+                _reason)
         else:
-            where = ("with --regulate-prometheus-url and --regulate-query, or "
-                     "in a --config file")
-        logging.warning(
-            "Self-regulation disabled (no regulate_prometheus_url); running at "
-            "file_delay=%dms threads=%d. Set the URL and query %s, or pass "
-            "--no-regulate to declare that this run is meant to be unregulated.",
-            file_delay_ms, thread_count.limit, where)
+            logging.warning("Self-regulation disabled: %s", _reason)
         return None
-    query, why = _resolve_query(args)
-    if not query:
-        logging.warning("Self-regulation disabled: %s", why)
-        return None
-    if args.regulate_slo_ms >= args.regulate_pause_ms:
-        logging.warning(
-            "Self-regulation disabled: regulate_slo_ms (%.0f) is not below "
-            "regulate_pause_ms (%.0f), so the soft band is empty or inverted "
-            "and the regulator would hit the pause line without ever easing "
-            "off first. Fix the config.",
-            args.regulate_slo_ms, args.regulate_pause_ms)
-        return None
+    # Resolved a second time for the value itself. One extra scandir at job
+    # startup, against a tree this job is about to walk in full.
+    query, _why = _resolve_query(args)
     reg = Regulator(args, query)
     try:
         lat = reg.sample()
@@ -1825,7 +2423,7 @@ def start_regulator(args):
             "retry every %ds. If that error is 'nan', the query window is "
             "probably shorter than this volume's request interval; widen it. "
             "Query: %s",
-            e, max(5, int(args.regulate_period_s)), query)
+            _redact_text(e, url), max(5, int(args.regulate_period_s)), query)
         logging.info(
             "Regulator: enabled, holding file_delay=%dms threads=%d until a "
             "usable sample arrives.", file_delay_ms, thread_count.limit)
@@ -1888,8 +2486,23 @@ _reclaimed_lock = threading.Lock()
 # settable, there is no ceph.dir.rmtime, and it only climbs. Preserving the
 # answer before we destroy it is the only option left.
 RUN_JOURNAL_NAME = ".vcephfs-transcode-runs.jsonl"
+# The final write only happens if Python gets to unwind, so a run also keeps a
+# per-run checkpoint beside each journal, rewritten this often or after this
+# many record changes, whichever comes first. See RunJournal.checkpoint().
+RUN_JOURNAL_CHECKPOINT_S = 300
+RUN_JOURNAL_CHECKPOINT_CHANGES = 10000
+# An artifact's first pin checkpoints this soon, so a burst of first pins shares
+# one rewrite, and no sooner than this many times the last checkpoint's own
+# duration after it, so a large snapshot is not rewritten constantly.
+RUN_JOURNAL_PIN_DEBOUNCE_S = 5
+RUN_JOURNAL_PIN_SPACING = 10
 # Names an artifact root, matching retention_path_policy's own marker.
 RETENTION_MARKER = "RETENTION"
+
+
+def _is_journal_file(name):
+    """The journal, or one of this tool's checkpoints of it (or their temps)."""
+    return name.startswith(RUN_JOURNAL_NAME)
 
 
 def read_rctime(path):
@@ -1942,6 +2555,18 @@ class RunJournal:
         self._artifacts = {}
         self._artifact_of = {}     # directory -> artifact root or None
         self._stop_at = set(stop_at)
+        # Checkpointing. _io_lock orders checkpoint() against the final
+        # write(), so a late checkpoint cannot land after write() removed it.
+        self._io_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._final = False
+        self._changes = 0
+        self._last_checkpoint = time.monotonic()
+        self._ckpt_thread = None
+        # Set by an artifact's first pin; see start_checkpoints().
+        self._wake = threading.Event()
+        self._pin_pending = False
+        self._ckpt_cost = 0.0
 
     def _artifact_root(self, dirpath):
         """Nearest ancestor holding a RETENTION file, or None.
@@ -1993,8 +2618,10 @@ class RunJournal:
                 rec = {"pre_rctime": read_rctime(root), "max_file_mtime": 0.0,
                        "pinned_at": None}
                 self._artifacts[root] = rec
+                self._changes += 1
             if st.st_mtime > rec["max_file_mtime"]:
                 rec["max_file_mtime"] = st.st_mtime
+                self._changes += 1
 
     def note_write(self, filepath):
         """Record that we have just replaced a file beneath its artifact.
@@ -2017,52 +2644,201 @@ class RunJournal:
         root = self._artifact_root(os.path.dirname(filepath))
         if root is None:
             return
+        first = False
         with self._lock:
             rec = self._artifacts.get(root)
             if rec is not None:
                 now = time.time()
+                if rec["pinned_at"] is None:
+                    # From here pre_rctime is the only record of what this pin
+                    # destroyed, and until a checkpoint it is in memory only.
+                    first = self._pin_pending = True
                 if rec["pinned_at"] is None or now > rec["pinned_at"]:
                     rec["pinned_at"] = now
+                    self._changes += 1
+        if first:
+            self._wake.set()
 
-    def write(self, roots, args):
-        """Append this run's records to a journal at each volume root."""
-        if not self.enabled:
-            return
+    def _rows_by_root(self, roots, args, **extra):
+        """[(volume_root, rows)] for each root holding records of this run."""
         with self._lock:
-            artifacts = dict(self._artifacts)
-        if not artifacts:
-            return
-        ended = time.time()
+            artifacts = {a: dict(r) for a, r in self._artifacts.items()}
         base = {
             "run": self.run_id,
             "host": os.uname().nodename,
             "pid": os.getpid(),
             "start": round(self.started, 6),
-            "end": round(ended, 6),
+            "end": round(time.time(), 6),
             "min_size": getattr(args, "min_size", None),
         }
+        base.update(extra)
+        out = []
         for volume_root in roots:
             prefix = volume_root.rstrip("/") + "/"
             mine = {a: r for a, r in artifacts.items()
                     if a == volume_root or a.startswith(prefix)}
-            if not mine:
-                continue
-            journal = os.path.join(volume_root, RUN_JOURNAL_NAME)
+            rows = []
+            for artifact, rec in sorted(mine.items()):
+                row = dict(base)
+                row["artifact"] = artifact
+                row["pre_rctime"] = rec["pre_rctime"]
+                row["max_file_mtime"] = round(rec["max_file_mtime"], 6)
+                pinned_at = rec.get("pinned_at")
+                row["pinned_at"] = (round(pinned_at, 6)
+                                    if pinned_at is not None else None)
+                rows.append(row)
+            if rows:
+                out.append((volume_root, rows))
+        return out
+
+    def _partial_path(self, volume_root):
+        return os.path.join(volume_root, "%s.%s.partial"
+                            % (RUN_JOURNAL_NAME, self.run_id))
+
+    def checkpoint(self, roots, args):
+        """Rewrite this run's snapshot beside each journal, atomically.
+
+        write() needs Python to unwind, so SIGKILL, the OOM killer or a power
+        loss used to lose every record of the run -- and a run that died
+        partway is the one whose damage most needs them. The snapshot is
+        per-run, so no other run's rows are ever rewritten, and temp+rename
+        means a reader sees one whole checkpoint or the one before it.
+
+        write() supersedes and removes it. One left behind is a run that did
+        not exit cleanly: the same rows plus "partial": true, with "end" the
+        time of its last checkpoint.
+        """
+        if not self.enabled:
+            return
+        with self._io_lock:
+            if self._final:
+                return
+            with self._lock:
+                self._changes = 0
+                self._pin_pending = False
+                self._last_checkpoint = time.monotonic()
+            t0 = time.monotonic()
+            for volume_root, rows in self._rows_by_root(
+                    list(roots), args, partial=True):
+                if not self._write_partial(volume_root, rows):
+                    with self._lock:
+                        self._changes += 1     # retry next interval
+            self._ckpt_cost = time.monotonic() - t0
+
+    def _write_partial(self, volume_root, rows):
+        """Replace this run's checkpoint at volume_root via temp+fsync+rename."""
+        path = self._partial_path(volume_root)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w") as fh:
+                for row in rows:
+                    fh.write(json.dumps(row, sort_keys=True) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            return True
+        except OSError as e:
+            logging.warning("Could not checkpoint run journal %s: %s", path, e)
+            # A temp cut short (ENOSPC after open) is never read; drop it.
             try:
-                with open(journal, "a") as fh:
-                    for artifact, rec in sorted(mine.items()):
-                        row = dict(base)
-                        row["artifact"] = artifact
-                        row["pre_rctime"] = rec["pre_rctime"]
-                        row["max_file_mtime"] = round(rec["max_file_mtime"], 6)
-                        pinned_at = rec.get("pinned_at")
-                        row["pinned_at"] = (round(pinned_at, 6)
-                                            if pinned_at is not None else None)
-                        fh.write(json.dumps(row, sort_keys=True) + "\n")
-                logging.info("Wrote %d artifact record(s) to %s",
-                             len(mine), journal)
-            except OSError as e:
-                logging.warning("Could not write run journal %s: %s", journal, e)
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+
+    def start_checkpoints(self, roots, args, every_s=RUN_JOURNAL_CHECKPOINT_S,
+                          every_changes=RUN_JOURNAL_CHECKPOINT_CHANGES,
+                          poll_s=10.0, pin_debounce_s=RUN_JOURNAL_PIN_DEBOUNCE_S):
+        """Checkpoint in the background until write() runs.
+
+        A thread, not a hook in the walk: a threads=0 pause parks the walker,
+        and the drain after SIGTERM runs with no walker at all, while
+        in-flight copies keep moving pinned_at.
+
+        An artifact's first pin wakes it too. Its rctime is pinned from that
+        moment, and a kill before the next periodic checkpoint lost the only
+        pre_rctime it will ever have -- the record this whole thing exists
+        to keep.
+        """
+        if not self.enabled or self._ckpt_thread is not None:
+            return
+
+        def loop():
+            timeout = min(poll_s, every_s)
+            pin_seen = None
+            while not self._stop.is_set():
+                self._wake.wait(timeout)
+                self._wake.clear()
+                if self._stop.is_set():
+                    return
+                now = time.monotonic()
+                with self._lock:
+                    n = self._changes
+                    age = now - self._last_checkpoint
+                    pending = self._pin_pending
+                timeout = min(poll_s, every_s)
+                pin_due = False
+                if not pending:
+                    pin_seen = None
+                else:
+                    if pin_seen is None:
+                        pin_seen = now
+                    left = max(pin_debounce_s - (now - pin_seen),
+                               RUN_JOURNAL_PIN_SPACING * self._ckpt_cost - age)
+                    if left > 0:
+                        timeout = min(timeout, left)
+                    else:
+                        pin_due = True
+                # Once do_exit is set, systemd may SIGKILL the drain of
+                # in-flight copies before write() is reached: stop waiting.
+                if n and (pin_due or n >= every_changes or age >= every_s
+                          or do_exit.is_set()):
+                    pin_seen = None
+                    try:
+                        self.checkpoint(roots, args)
+                    except Exception:
+                        logging.exception("Run journal checkpoint failed")
+
+        self._ckpt_thread = threading.Thread(
+            target=loop, name="journal-checkpoint", daemon=True)
+        self._ckpt_thread.start()
+
+    def write(self, roots, args):
+        """Append this run's records to a journal at each volume root."""
+        if not self.enabled:
+            return
+        self._stop.set()
+        self._wake.set()
+        with self._io_lock:
+            self._final = True
+            for volume_root, rows in self._rows_by_root(roots, args):
+                journal = os.path.join(volume_root, RUN_JOURNAL_NAME)
+                try:
+                    with open(journal, "a") as fh:
+                        for row in rows:
+                            fh.write(json.dumps(row, sort_keys=True) + "\n")
+                        # Durable before the checkpoint goes: the unlink is an
+                        # MDS op, and these bytes may still be dirty pages.
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    logging.info("Wrote %d artifact record(s) to %s",
+                                 len(rows), journal)
+                except OSError as e:
+                    logging.warning("Could not write run journal %s: %s",
+                                    journal, e)
+                    # The checkpoint is now the only record, so bring it up to
+                    # date: the last periodic one misses everything since, and
+                    # a run shorter than the interval never wrote one.
+                    self._write_partial(
+                        volume_root, [dict(r, partial=True) for r in rows])
+                    continue
+                try:
+                    os.unlink(self._partial_path(volume_root))
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    logging.warning("Could not remove run journal checkpoint "
+                                    "%s: %s", self._partial_path(volume_root), e)
 
 
 
@@ -2858,6 +3634,12 @@ def _iter_listed_paths(src):
             fh.close()
 
 
+def _poll_config():
+    """Re-read --config if it changed. Walker thread only."""
+    if runtime_config is not None:
+        runtime_config.poll(apply_config)
+
+
 def process_paths(args, hard_links, executor, dir_layouts, roots):
     """Transcode an explicit list of paths instead of walking the tree.
 
@@ -3003,7 +3785,8 @@ def process_paths(args, hard_links, executor, dir_layouts, roots):
             continue
 
         if not thread_count.acquire(
-                cancel=lambda: do_exit.is_set() or _limit_reached()):
+                cancel=lambda: do_exit.is_set() or _limit_reached(),
+                tick=_poll_config):
             return
         try:
             future = executor.submit(
@@ -3044,11 +3827,12 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
         # writing one right now, and transcoding a partial copy would be wrong.
         # Reclaim the aged ones here, for every directory the walk enters, so a
         # subtree that holds orphans but no current candidate is still swept.
-        if RUN_JOURNAL_NAME in filenames:
-            # Ours, and it lives at a volume root that is inside the walk.
-            # Being under --min-size already keeps it from being transcoded,
-            # but that is a coincidence of its size, not a rule.
-            filenames[:] = [f for f in filenames if f != RUN_JOURNAL_NAME]
+        if any(_is_journal_file(f) for f in filenames):
+            # Ours, and it lives at a volume root that is inside the walk --
+            # the journal, and any run's checkpoint of it. Being under
+            # --min-size already keeps it from being transcoded, but that is a
+            # coincidence of its size, not a rule.
+            filenames[:] = [f for f in filenames if not _is_journal_file(f)]
 
         orphans = [f for f in filenames if TMP_RE.match(f)]
         if orphans:
@@ -3120,7 +3904,9 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
         def submit(filepaths, st, file_layout, _layout=layout):
             if do_exit.is_set() or _limit_reached():
                 return
-            if not thread_count.acquire(cancel=lambda: do_exit.is_set() or _limit_reached()):
+            if not thread_count.acquire(
+                    cancel=lambda: do_exit.is_set() or _limit_reached(),
+                    tick=_poll_config):
                 return
             try:
                 future = executor.submit(
@@ -3293,6 +4079,10 @@ def process_files(args):
 
     global regulator, regulator_started
     regulator = start_regulator(args)
+    # Must come AFTER start_regulator(): _apply_regulate_keys() stays quiet
+    # while this is False, which is what keeps the startup config read from
+    # warning. Set it earlier and startup warns; drop it and no late change
+    # ever warns. ProcessFilesStartup pins both directions.
     regulator_started = True
 
     global run_journal
@@ -3300,6 +4090,7 @@ def process_files(args):
         enabled=args.run_journal,
         stop_at=[os.path.abspath(d) for d in args.dirs],
     )
+    run_journal.start_checkpoints(roots_seen, args)
 
     try:
         with ThreadPoolExecutor(max_workers=_EXECUTOR_MAX_WORKERS) as executor:
@@ -3356,10 +4147,13 @@ def process_files(args):
                 if do_exit.is_set():
                     break
     finally:
-        # Every exit path, including the --paths-from branch's early return
-        # and an exception mid-walk. The journal is the only record of the
-        # pre-transcode rctime, and a run that died partway is exactly the
-        # one whose damage cannot be reconstructed afterwards.
+        # Every exit path Python gets to run: a return (including the
+        # --paths-from branch's), an exception mid-walk, and SIGINT, SIGTERM
+        # or SIGHUP, which set do_exit and unwind the walk to here. The
+        # journal is the only record of the pre-transcode rctime, and a run
+        # that died partway is exactly the one whose damage cannot be
+        # reconstructed afterwards. SIGKILL, the OOM killer and power loss
+        # never get here; the checkpoint covers those, one interval behind.
         if run_journal is not None:
             run_journal.write(roots_seen, args)
 
@@ -3404,7 +4198,10 @@ def _amended_cmdline():
         _set(["--threads"], thread_count.limit)
     _set(["--min-age"], min_age_days)
     _set(["--file-delay"], file_delay_ms)
-    return shlex.join(argv)
+    # Redacted: this feeds _report_state()'s log line AND setproctitle(), so
+    # an unscrubbed return leaks a command-line credential to the log on
+    # every signal and to `ps` for the life of the job.
+    return shlex.join(_redact_argv(argv))
 
 
 def _update_proctitle():
@@ -3422,6 +4219,31 @@ def _report_state(prefix="State"):
         f"min_age={min_age_days}d | cmdline: {_amended_cmdline()}"
     )
     _update_proctitle()
+
+
+def _exit_signal_handler(sig, frame):
+    # The clean exit waits for in-flight copies. A second one of the same
+    # signal escalates, as a plain kill did before SIGTERM had a handler;
+    # otherwise kill -9 was the only way out, and it skips the journal write.
+    signal.signal(sig, signal.SIG_DFL)
+    name = signal.Signals(sig).name
+    logging.error(f"{name} received, exiting cleanly (send it again to stop "
+                  "now)...")
+    do_exit.set()
+
+
+def _install_exit_handlers():
+    """Route SIGINT, SIGTERM and SIGHUP to the same clean exit.
+
+    SIGTERM is what systemd, kill(1) and a shutdown send, and SIGHUP is a
+    closed terminal; both used to kill the job outright, skipping the run
+    journal. An inherited SIG_IGN is kept for those two, so a job started
+    under nohup still survives its terminal closing.
+    """
+    signal.signal(signal.SIGINT, _exit_signal_handler)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) != signal.SIG_IGN:
+            signal.signal(sig, _exit_signal_handler)
 
 
 def main():
@@ -3639,7 +4461,17 @@ def main():
              "(the default) disables regulation entirely and the job simply "
              "runs at --file-delay and --threads -- and says so at WARNING, "
              "since an accidental omission looks exactly like a deliberate "
-             "one. Pass --no-regulate to declare it deliberate and quiet.",
+             "one. Pass --no-regulate to declare it deliberate and quiet. "
+             "Credentials in the URL are NOT supported: urllib does not use "
+             "URL userinfo for authentication, so a user:password@ URL is "
+             "refused rather than failing on every sample -- use an "
+             "HTTPBasicAuthHandler if the endpoint needs basic auth. A "
+             "credential passed here is ALSO exposed in `ps`, which log "
+             "scrubbing cannot undo: the title is only rewritten from the "
+             "first retitle onward, so the original argv is visible until "
+             "then -- and if python3-setproctitle is not installed the title "
+             "is never rewritten at all and the credential stays visible for "
+             "the whole run. Do not put a credential on the command line.",
     )
     parser.add_argument(
         "--regulate-query",
@@ -3680,6 +4512,15 @@ def main():
              "change the thread count). The regulator adds at most one thread "
              "per quiet interval, and only after the file delay has already "
              "decayed to its floor.",
+    )
+    parser.add_argument(
+        "--regulate-blind-resume-s", type=non_negative_int,
+        default=REG_BLIND_RESUME_S_DEFAULT, metavar="SEC",
+        help="If the regulator has paused the job and no usable sample arrives "
+             "for this long (Prometheus down, empty result), resume at 1 thread "
+             "rather than stay paused; the first usable sample restores the "
+             "rest (default %d; 0 = stay paused until a sample arrives)."
+             % REG_BLIND_RESUME_S_DEFAULT,
     )
     parser.add_argument(
         "--source-pool",
@@ -3757,7 +4598,10 @@ def main():
         "stays pinned forever -- so retention reads transcoded data as fresh and "
         "stops expiring it. rctime cannot be restored (it is monotonic and not "
         "settable), so preserving the answer is the only option. Costs one "
-        "getxattr per artifact root. Disable only if nothing consumes rctime.",
+        "getxattr per artifact root. A run that does not exit cleanly leaves "
+        "its last checkpoint, at most %d minutes old, in "
+        ".vcephfs-transcode-runs.jsonl.<run>.partial. Disable only if nothing "
+        "consumes rctime." % (RUN_JOURNAL_CHECKPOINT_S // 60),
     )
 
     args = parser.parse_args()
@@ -3830,7 +4674,7 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=log_handlers,
     )
-    cmdline = shlex.join(sys.argv)
+    cmdline = shlex.join(_redact_argv(sys.argv))
     logging.info(f"Starting: {cmdline}")
 
     if has_rotation:
@@ -3944,11 +4788,6 @@ def main():
         _msg = crossover_warning(args.source_pool or layout.pool, _t.pool, args.min_size)
         if _msg:
             logging.warning(_msg)
-
-    def signal_handler(sig, frame):
-        name = signal.Signals(sig).name
-        logging.error(f"{name} received, exiting cleanly...")
-        do_exit.set()
 
     def sigtstp_handler(sig, frame):
         old = thread_count.limit
@@ -4122,7 +4961,7 @@ def main():
                      args.config, args.config_poll_seconds)
         runtime_config.poll(apply_config)     # apply once at startup
 
-    signal.signal(signal.SIGINT, signal_handler)
+    _install_exit_handlers()
     signal.signal(signal.SIGTSTP, sigtstp_handler)
     signal.signal(signal.SIGUSR1, sigusr1_handler)
     signal.signal(signal.SIGUSR2, sigusr2_handler)
