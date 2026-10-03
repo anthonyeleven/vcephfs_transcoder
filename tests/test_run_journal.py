@@ -5,9 +5,11 @@ the logic were wrong; a guard that only ever says yes proves nothing.
 """
 import importlib.util
 import json
+import logging as _logging
 import os
 import sys
 import tempfile
+import threading as _threading
 import time
 
 SRC = os.path.join(
@@ -553,6 +555,267 @@ os.makedirs(os.path.join(_ck9, tc.RUN_JOURNAL_NAME))
 _cj9.write([_ck9], _CArgs())
 check("... including a run that never checkpointed",
       os.path.exists(_cj9._partial_path(_ck9)))
+
+# An append that died partway left the journal ending mid-line. The next
+# run's first row then fused with the fragment into one unparseable line.
+_ck10, _a10, _cj10 = _art_journal()
+for _f, _st in _a10:
+    _cj10.note_file(_f, _st)
+    _cj10.note_write(_f)
+_j10 = os.path.join(_ck10, tc.RUN_JOURNAL_NAME)
+with open(_j10, "w") as _fh:
+    _fh.write('{"run": "old", "artifact": "/x", "pre_rct')
+_writes = []
+_real_write = tc.os.write
+tc.os.write = lambda fd, b: (_writes.append(len(b)), _real_write(fd, b))[1]
+try:
+    _cj10.write([_ck10], _CArgs())
+finally:
+    tc.os.write = _real_write
+_lines10 = open(_j10).read().splitlines()
+
+
+def _parses(line):
+    try:
+        json.loads(line)
+        return True
+    except ValueError:
+        return False
+
+
+check("a torn journal line does not swallow the next run's first row",
+      [_parses(x) for x in _lines10] == [False, True, True])
+check("... and the append is one write(2), so runs cannot interleave",
+      len(_writes) == 1)
+
+# A failed append can leave rows in both the journal and the checkpoint; a
+# reader dedupes on (run, artifact), which only works if the two agree.
+_ck11, _a11, _cj11 = _art_journal()
+for _f, _st in _a11:
+    _cj11.note_file(_f, _st)
+    _cj11.note_write(_f)
+_first = []
+
+
+def _fsync_fails_once(fd):
+    if not _first:
+        _first.append(fd)
+        raise OSError(5, "Input/output error")
+    return _real_fsync(fd)
+
+
+tc.os.fsync = _fsync_fails_once
+try:
+    _cj11.write([_ck11], _CArgs())
+finally:
+    tc.os.fsync = _real_fsync
+_jr11 = [json.loads(x) for x in open(os.path.join(_ck11, tc.RUN_JOURNAL_NAME))]
+_pr11 = [json.loads(x) for x in open(_cj11._partial_path(_ck11))]
+
+
+def _key(r):
+    return (r["run"], r["artifact"])
+
+
+check("rows in both the journal and the checkpoint share (run, artifact)",
+      sorted(map(_key, _jr11)) == sorted(map(_key, _pr11))
+      and len(set(map(_key, _pr11))) == len(_pr11))
+check("... and differ only by partial",
+      sorted(json.dumps(r, sort_keys=True) for r in _jr11)
+      == sorted(json.dumps({k: v for k, v in r.items() if k != "partial"},
+                           sort_keys=True) for r in _pr11))
+
+# Both writes failing loses pre_rctime for good: the rows go to the log.
+
+
+class _Grab(_logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, rec):
+        self.lines.append((rec.levelno, rec.getMessage()))
+
+
+_ck12, _a12, _cj12 = _art_journal()
+_cj12.note_file(*_a12[0])
+_cj12.note_write(_a12[0][0])
+os.makedirs(os.path.join(_ck12, tc.RUN_JOURNAL_NAME))
+os.makedirs(_cj12._partial_path(_ck12) + ".tmp")
+_grab = _Grab()
+_logging.getLogger().addHandler(_grab)
+try:
+    _cj12.write([_ck12], _CArgs())
+finally:
+    _logging.getLogger().removeHandler(_grab)
+_errs = [m for lv, m in _grab.lines if lv >= _logging.ERROR]
+check("a lost journal is logged at ERROR",
+      any("Run journal LOST" in m for m in _errs))
+check("... with the record itself, pre_rctime included",
+      any(os.path.dirname(_a12[0][0]) in m and "1757000000" in m
+          for m in _errs))
+
+# A failed pin-triggered checkpoint retries on the debounce, not the interval.
+_ck13, _a13, _cj13 = _art_journal()
+_cj13.note_file(*_a13[0])
+_cj13.note_write(_a13[0][0])
+os.makedirs(_cj13._partial_path(_ck13) + ".tmp")
+_cj13.checkpoint([_ck13], _CArgs())
+check("a failed first-pin checkpoint is still pin-pending", _cj13._pin_pending)
+
+# The change trigger is spaced by the last checkpoint's cost, like the pin one.
+_ck14, _a14, _cj14 = _art_journal()
+_cj14._ckpt_cost = 100.0
+_cj14.start_checkpoints([_ck14], _CArgs(), every_s=3600, every_changes=1,
+                        poll_s=0.05)
+_cj14.note_file(*_a14[0])
+time.sleep(0.5)
+check("a change-count checkpoint waits out the spacing",
+      not os.path.exists(_cj14._partial_path(_ck14)))
+_cj14._stop.set()
+_cj14._wake.set()
+_ck15, _a15, _cj15 = _art_journal()
+_cj15.start_checkpoints([_ck15], _CArgs(), every_s=3600, every_changes=1,
+                        poll_s=0.05)
+_cj15.note_file(*_a15[0])
+check("... and fires when the last one was cheap",
+      _wait_for(lambda: os.path.exists(_cj15._partial_path(_ck15)), 3.0))
+_cj15._stop.set()
+_cj15._wake.set()
+
+# SIGTERM invites a second signal, which kills outright: the checkpoint thread
+# must see do_exit within about a second, not at its old 10 s poll.
+_ck16, _a16, _cj16 = _art_journal()
+_cj16.start_checkpoints([_ck16], _CArgs(), every_s=3600, every_changes=10 ** 6,
+                        pin_debounce_s=3600)
+_cj16.note_file(*_a16[0])
+time.sleep(0.2)
+tc.do_exit.set()
+try:
+    check("a clean-exit signal checkpoints within about a second",
+          _wait_for(lambda: os.path.exists(_cj16._partial_path(_ck16)), 2.5))
+finally:
+    tc.do_exit.clear()
+    _cj16._stop.set()
+    _cj16._wake.set()
+
+# A fast failure (ENOSPC, EROFS) costs ~0 s, so the cost spacing alone let an
+# unrecorded first pin retry, and warn, every pin debounce while it lasted.
+_ck17, _a17, _cj17 = _art_journal()
+os.makedirs(_cj17._partial_path(_ck17) + ".tmp")        # every attempt fails
+_tries = []
+_real_wp = _cj17._write_partial
+
+
+def _counting_wp(*a, **kw):
+    _tries.append(1)
+    return _real_wp(*a, **kw)
+
+
+_cj17._write_partial = _counting_wp
+_grab17 = _Grab()
+_logging.getLogger().addHandler(_grab17)
+try:
+    _cj17.start_checkpoints([_ck17], _CArgs(), every_s=3600,
+                            every_changes=10 ** 6, poll_s=0.02,
+                            pin_debounce_s=0.05)
+    _cj17.note_file(*_a17[0])
+    _cj17.note_write(_a17[0][0])
+    time.sleep(1.2)
+finally:
+    _cj17._stop.set()
+    _cj17._wake.set()
+    _logging.getLogger().removeHandler(_grab17)
+check("a failing first-pin checkpoint still retries", len(_tries) >= 2)
+check("... backing off, not every debounce", len(_tries) <= 7)
+check("... and warns once, not per attempt",
+      sum(1 for lv, m in _grab17.lines if lv == _logging.WARNING
+          and "Could not checkpoint" in m) == 1)
+
+# A retry of a failing root logs at DEBUG, but a first failure on another
+# volume root still warns: failures are tracked per root, not per run.
+_vA, _aA, _ = _art_journal()
+_vB, _aB, _ = _art_journal()
+_cj21 = tc.RunJournal(enabled=True, stop_at=[_vA, _vB])
+_cj21.note_file(*_aA[0])
+_cj21.note_file(*_aB[0])
+os.makedirs(_cj21._partial_path(_vA) + ".tmp")          # A keeps failing
+
+
+def _ckpt_warnings(j, roots):
+    g = _Grab()
+    _logging.getLogger().addHandler(g)
+    try:
+        j.checkpoint(roots, _CArgs())
+    finally:
+        _logging.getLogger().removeHandler(g)
+    return [m for lv, m in g.lines
+            if lv == _logging.WARNING and "Could not checkpoint" in m]
+
+
+_w1 = _ckpt_warnings(_cj21, [_vA, _vB])
+_w2 = _ckpt_warnings(_cj21, [_vA, _vB])
+os.makedirs(_cj21._partial_path(_vB) + ".tmp")          # now B fails too
+_w3 = _ckpt_warnings(_cj21, [_vA, _vB])
+check("a failing root warns once", len(_w1) == 1 and _w2 == [])
+check("... and a first failure on another root still warns",
+      len(_w3) == 1 and _vB in _w3[0])
+
+# A success from another trigger clears the backoff: the next first pin is
+# back on the debounce, not left waiting up to the checkpoint interval.
+_ck20, _a20, _cj20 = _art_journal()
+_cj20.start_checkpoints([_ck20], _CArgs(), every_s=3600,
+                        every_changes=10 ** 6, poll_s=0.02,
+                        pin_debounce_s=0.05)
+_cj20._ckpt_failures, _cj20._retry_at = 3, time.monotonic() + 3600
+_cj20.note_file(*_a20[0])
+_cj20.checkpoint([_ck20], _CArgs())     # e.g. the change-count trigger
+_p20 = _cj20._partial_path(_ck20)
+_m20 = os.stat(_p20).st_mtime_ns
+time.sleep(0.05)
+_cj20.note_write(_a20[0][0])
+check("a success clears a stale backoff for the next first pin",
+      _wait_for(lambda: os.stat(_p20).st_mtime_ns != _m20, 2.0))
+_cj20._stop.set()
+_cj20._wake.set()
+
+# The final append takes the journal's flock, which CephFS enforces across
+# clients: O_APPEND alone orders appends only within one kernel.
+_ck18, _a18, _cj18 = _art_journal()
+_cj18.note_file(*_a18[0])
+_j18 = os.path.join(_ck18, tc.RUN_JOURNAL_NAME)
+_holder = os.open(_j18, os.O_RDWR | os.O_CREAT, 0o644)
+tc.fcntl.flock(_holder, tc.fcntl.LOCK_EX)
+_t18 = _threading.Thread(target=_cj18.write, args=([_ck18], _CArgs()))
+_t18.start()
+time.sleep(0.4)
+check("the append waits for another run's lock",
+      os.path.getsize(_j18) == 0)
+tc.fcntl.flock(_holder, tc.fcntl.LOCK_UN)
+os.close(_holder)
+_t18.join(5)
+check("... and appends once it is released",
+      len(open(_j18).read().splitlines()) == 1)
+
+# A hung lock holder must not cost the record: log, then append unlocked.
+_saved_wait = tc.RUN_JOURNAL_LOCK_WAIT_S
+tc.RUN_JOURNAL_LOCK_WAIT_S = 0.3
+_ck19, _a19, _cj19 = _art_journal()
+_cj19.note_file(*_a19[0])
+_j19 = os.path.join(_ck19, tc.RUN_JOURNAL_NAME)
+_holder = os.open(_j19, os.O_RDWR | os.O_CREAT, 0o644)
+tc.fcntl.flock(_holder, tc.fcntl.LOCK_EX)
+_grab19 = _Grab()
+_logging.getLogger().addHandler(_grab19)
+try:
+    _cj19.write([_ck19], _CArgs())
+finally:
+    _logging.getLogger().removeHandler(_grab19)
+    tc.RUN_JOURNAL_LOCK_WAIT_S = _saved_wait
+    os.close(_holder)
+check("a lock never granted still appends the rows",
+      len(open(_j19).read().splitlines()) == 1)
+check("... and says so", any("still locked" in m for _, m in _grab19.lines))
 
 check("the walker skips the journal, every checkpoint and their temps",
       all(tc._is_journal_file(n) for n in (
