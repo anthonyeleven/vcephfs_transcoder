@@ -111,7 +111,9 @@ usage: vcephfs_transcoder.py [-h] [--version] [--paths-from-pool POOL]
                              [--regulate-quiet-ticks N]
                              [--regulate-max-threads N]
                              [--regulate-blind-resume-s SEC]
-                             [--source-pool POOL] [--prune-small-subtrees]
+                             [--source-pool POOL] [--target-pool POOL]
+                             [--target-pool-kind {rep,ec}]
+                             [--prune-small-subtrees]
                              [--prune-subtree-max-bytes BYTES]
                              [--prune-budget-bytes BYTES]
                              [--max-files MAX_FILES] [--file-delay MS]
@@ -185,7 +187,10 @@ optional arguments:
   --max-size SIZE       Skip files larger than this size (same format as
                         --min-size). Omit for no upper limit.
   --threads THREADS     Number of threads for data copying
-  --dry-run, -n         Perform transcode but do not replace files
+  --dry-run, -n         Perform transcode but do not replace files. Without
+                        --stage-in-tmpdir each copy is still staged beside its
+                        target, which moves the directory's rctime, so the run
+                        journal records that pin.
   --config PATH         key=value file of live tunables (file_delay_ms,
                         threads, min_age_days, min_size, prune_dir_regex), re-
                         read when its mtime changes. Keep it on local disk,
@@ -265,7 +270,9 @@ optional arguments:
                         down to. Repeated pauses raise it; sustained quiet
                         releases it back to this baseline (default 0).
   --regulate-quiet-ticks N
-                        Consecutive clean samples before easing the delay
+                        Consecutive clean samples before easing the delay.
+                        Also the nan samples a regulator pause needs before it
+                        resumes at 1 thread; a stalled MDS reads nan too
                         (default 10).
   --regulate-max-threads N
                         Ceiling for regulator-driven thread increases (default
@@ -275,13 +282,36 @@ optional arguments:
   --regulate-blind-resume-s SEC
                         If the regulator has paused the job and no usable
                         sample arrives for this long (Prometheus down, empty
-                        result), resume at 1 thread rather than stay paused;
-                        the first usable sample restores the rest (default
-                        1800; 0 = stay paused until a sample arrives).
+                        result, nan, or a mix), resume at 1 thread rather than
+                        stay paused; the first usable sample restores the rest
+                        (default 1800; 0 = stay paused until a sample
+                        arrives).
   --source-pool POOL    Only transcode files whose CURRENT data pool is POOL.
                         Without it, every file not already on the target pool
                         is eligible. Use this to drain one pool into another
                         without also sweeping the default pool.
+  --target-pool POOL    Send eligible files to POOL instead of to their
+                        directory's layout pool. Directory layouts are never
+                        changed: a file whose directory points elsewhere is
+                        copied in a hidden staging subdirectory created with
+                        POOL's layout and renamed up into place, so new files
+                        keep landing where they always did. Needs a size band:
+                        a replicated POOL takes only --max-size below 614400,
+                        an EC POOL only --min-size at or above its floor (at
+                        least 614400). Lets a small-file pass run while the
+                        volume root stays on EC. With --paths-from or --paths-
+                        from-pool the list is read in full and grouped by
+                        directory before anything moves, spilling about 100
+                        bytes per path beside --log-file -- or, without one,
+                        in the system temp directory, which is often RAM-
+                        backed.
+  --target-pool-kind {rep,ec}
+                        Whether --target-pool is replicated or EC, for hosts
+                        without a usable ceph CLI. Without either, the pool's
+                        name must say: *.ecK.M.* for EC, exactly
+                        cephfs.<fs>.data or cephfs.<fs>.rdata for replicated;
+                        anything else is refused. Refused if it contradicts
+                        the cluster.
   --prune-small-subtrees
                         Skip whole subtrees whose recursive size makes them
                         not worth walking, using the MDS's own
@@ -340,6 +370,14 @@ runtime signals:
   SIGRTMIN+2(36) increase min-age by 3 days
   SIGRTMIN+3(37) decrease min-age by 3 days (min 1)
   SIGRTMIN+4(38) dump current state/tunables to the log
+
+exit signals:
+  SIGINT, SIGTERM and SIGHUP stop cleanly: in-flight copies
+  finish and the run journal is written, which can take as
+  long as the largest copy. A second one of the same signal
+  stops at once. So under timeout(1), give -k, e.g.
+  timeout -k 30m 24h vcephfs_transcoder.py ...  A SIGHUP inherited as
+  ignored (nohup) stays ignored.
 
 example --config file (every key at its default):
 
@@ -430,6 +468,11 @@ example --config file (every key at its default):
     # releases it, but never below this baseline.
     regulate_period_s   = 30
     regulate_floor_ms   = 0
+    
+    # Clean samples in a row before easing the delay. Also how many nan
+    # samples a regulator pause needs before it resumes at 1 thread: nan
+    # means no MDS request completed, which a quiet volume and a stalled
+    # MDS look the same.
     regulate_quiet_ticks = 10
     
     # Thread adaptivity, opt-in. 0 leaves the thread count exactly where
@@ -441,9 +484,9 @@ example --config file (every key at its default):
     regulate_max_threads = 0
     
     # A regulator pause with no usable sample (Prometheus down, empty
-    # result) for this long resumes at 1 thread instead of holding 0
-    # forever; the first usable sample restores the rest. 0 holds until
-    # a sample arrives.
+    # result, nan, or a mix) for this long resumes at 1 thread instead
+    # of holding 0 forever; the first usable sample restores the rest.
+    # 0 holds until a sample arrives.
     regulate_blind_resume_s = 1800
 
     redirect it to disk with:  vcephfs_transcoder.py --print-config-example > /home/USER/tc_VOLUME.conf

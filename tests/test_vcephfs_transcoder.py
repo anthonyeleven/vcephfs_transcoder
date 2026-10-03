@@ -1577,6 +1577,60 @@ class PathsFromList(unittest.TestCase):
         self.assertFalse(vct._under_roots("/vol/abc", ["/vol/ab"]))
 
 
+class PathsFromSkipsTheJournal(unittest.TestCase):
+    """The walker skips the journal and its checkpoints; a path list must too.
+
+    Replacing the shared journal by temp+rename would race another run's
+    append, and a --paths-from list or a pool drain can name it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._saved = (vct._path_source, vct.run_journal, vct.file_delay_ms,
+                       vct.runtime_config)
+        vct.file_delay_ms = 0
+        vct.runtime_config = None
+        self.noted = []
+        test = self
+
+        class Recording:
+            def note_file(self, path, st):
+                test.noted.append(path)
+
+        vct.run_journal = Recording()
+
+    def tearDown(self):
+        (vct._path_source, vct.run_journal, vct.file_delay_ms,
+         vct.runtime_config) = self._saved
+
+    def _run(self, paths):
+        vct._path_source = lambda args, roots: iter(paths)
+        vct.process_paths(Args(max_files=None, source_pool=None), {}, None, {},
+                          [self.tmp])
+
+    def test_the_journal_and_its_checkpoints_are_skipped(self):
+        names = [vct.RUN_JOURNAL_NAME, vct.RUN_JOURNAL_NAME + ".abc.partial",
+                 vct.RUN_JOURNAL_NAME + ".abc.partial.tmp"]
+        paths = []
+        for n in names:
+            paths.append(os.path.join(self.tmp, n))
+            open(paths[-1], "w").close()
+        self._run(paths)
+        self.assertEqual(self.noted, [], "a path list reached the journal")
+
+    def test_an_ordinary_file_is_not(self):
+        """Control: the skip is by name, not everything."""
+        p = os.path.join(self.tmp, "f.parquet")
+        open(p, "w").close()
+        saved = vct.get_layout_walking_up
+        self.addCleanup(setattr, vct, "get_layout_walking_up", saved)
+        vct.get_layout_walking_up = lambda d: None      # off CephFS
+        with self.assertLogs(level="ERROR"):
+            self._run([p])
+        self.assertEqual(self.noted, [p])
+
+
 class Crossover(unittest.TestCase):
     """Generalized source scheme: comparing against 3x replication only is wrong."""
 
@@ -1662,6 +1716,44 @@ class ThreadAdaptivity(unittest.TestCase):
         r = self._reg(threads=2, maxt=6)
         r._maybe_raise_threads(1.0)
         self.assertEqual(vct.thread_count.limit, 3)
+
+    def _operator_writes_before_the_write(self, n):
+        """Land an operator write between a regulator read and its write."""
+        sem = vct.thread_count
+        real = sem.set_limit_if
+
+        def racing(gen, new):
+            sem.set_limit_if = real
+            sem.set_limit(n)                # SIGUSR1, or a threads edit
+            return real(gen, new)
+
+        sem.set_limit_if = racing
+
+    def test_a_raise_does_not_overwrite_an_operator_write(self):
+        r = self._reg(threads=2, maxt=6)
+        self._operator_writes_before_the_write(10)
+        r._maybe_raise_threads(1.0)
+        self.assertEqual(vct.thread_count.limit, 10,
+                         "a regulator raise overwrote the operator's threads")
+
+    def test_a_shed_does_not_overwrite_an_operator_write(self):
+        r = self._reg(threads=1, maxt=0)
+        vct.thread_count.set_limit(4)
+        self._operator_writes_before_the_write(9)
+        r._tighten(100.0)
+        self.assertEqual(vct.thread_count.limit, 9,
+                         "a regulator shed overwrote the operator's threads")
+
+    def test_a_pause_racing_an_operator_write_pauses_from_theirs(self):
+        r = self._reg(threads=4, maxt=0)
+        real = vct.thread_count.set_limit_if
+        self._operator_writes_before_the_write(6)
+        r._pause(200.0)
+        vct.thread_count.set_limit_if = real    # only _pause() races here
+        self.assertEqual(vct.thread_count.limit, 0)
+        r._resume()
+        self.assertEqual(vct.thread_count.limit, 6,
+                         "the resume gave back a count the operator replaced")
 
     # -- the two gates --------------------------------------------------------
     def test_will_not_raise_while_the_delay_is_above_its_floor(self):
@@ -2323,16 +2415,19 @@ class ReclaimNameGuard(unittest.TestCase):
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
-        self.old = time.time() - vct.TMP_ORPHAN_MIN_AGE_S - 3600
+        self._saved_age = vct.TMP_ORPHAN_MIN_AGE_S
 
     def tearDown(self):
+        vct.TMP_ORPHAN_MIN_AGE_S = self._saved_age
         shutil.rmtree(self.d, ignore_errors=True)
 
     def _aged(self, name):
+        """Age is judged by ctime, which no test can backdate, so a file is
+        aged by moving the threshold instead."""
         p = os.path.join(self.d, name)
         with open(p, "w") as f:
             f.write("x")
-        os.utime(p, (self.old, self.old))
+        vct.TMP_ORPHAN_MIN_AGE_S = 0
         return p
 
     def test_real_data_is_not_unlinked(self):
@@ -2477,6 +2572,416 @@ class HardlinkStagingOrder(unittest.TestCase):
         for p in paths:
             with open(p, "rb") as f:
                 self.assertEqual(f.read(), b"payload" * 100)
+
+    def _flaky(self, real, fail_on, calls):
+        """real(), except call number fail_on (counted in calls) raises EIO."""
+        def f(*a, **kw):
+            calls.append(a)
+            if len(calls) == fail_on:
+                raise OSError(5, "Input/output error")
+            return real(*a, **kw)
+        return f
+
+    def test_a_failed_second_rename_rejoins_the_original_inode(self):
+        """The first name was already on the new inode when the second rename
+        failed. The set used to stay split, with c's staged link left
+        behind."""
+        paths = self._three_links()
+        st = os.lstat(paths[0])
+        os.rename = self._flaky(os.rename, 2, [])
+        with self.assertLogs(level="WARNING") as logs:
+            with self.assertRaises(OSError):
+                vct.process_file(self._args(), paths, st, self._Layout(),
+                                 self._Layout())
+        self.assertEqual({os.lstat(p).st_ino for p in paths}, {st.st_ino},
+                         "the names are split across two inodes")
+        self.assertEqual(os.lstat(paths[0]).st_nlink, 3)
+        leftovers = [n for n in os.listdir(self.d) if vct.TMP_RE.match(n)]
+        self.assertEqual(leftovers, [], "staged links survived: %s"
+                         % leftovers)
+        self.assertTrue(any("back on the original inode" in m
+                            and "Input/output error" in m
+                            for m in logs.output), logs.output)
+
+    def test_a_failed_first_rename_leaves_no_staged_links(self):
+        paths = self._three_links()
+        st = os.lstat(paths[0])
+        os.rename = self._flaky(os.rename, 1, [])
+        with self.assertRaises(OSError):
+            vct.process_file(self._args(), paths, st, self._Layout(),
+                             self._Layout())
+        self.assertEqual({os.lstat(p).st_ino for p in paths}, {st.st_ino})
+        leftovers = [n for n in os.listdir(self.d) if vct.TMP_RE.match(n)]
+        self.assertEqual(leftovers, [], "staged links survived: %s"
+                         % leftovers)
+
+    def test_a_split_that_cannot_be_rejoined_is_reported(self):
+        """Staging b and c are links 1 and 2; link 3 is the rejoin."""
+        paths = self._three_links()
+        st = os.lstat(paths[0])
+        os.rename = self._flaky(os.rename, 2, [])
+        os.link = self._flaky(os.link, 3, [])
+        with self.assertLogs(level="ERROR") as logs:
+            with self.assertRaises(OSError):
+                vct.process_file(self._args(), paths, st, self._Layout(),
+                                 self._Layout())
+        split = [m for m in logs.output if "SPLIT" in m]
+        self.assertEqual(len(split), 1, logs.output)
+        a, b, c = paths
+        self.assertIn(f"{a} on the new inode, {b}, {c} on the original, "
+                      "after a rename raised ([Errno 5] Input/output error)",
+                      split[0])
+        self.assertNotEqual(os.lstat(a).st_ino, st.st_ino)
+        leftovers = [n for n in os.listdir(self.d) if vct.TMP_RE.match(n)]
+        self.assertEqual(leftovers, [], "staged links survived: %s"
+                         % leftovers)
+
+    def test_a_rename_that_lands_but_raises_is_still_rejoined(self):
+        """Which names moved comes from their inodes, not from which renames
+        returned: here the first rename takes effect and still raises."""
+        paths = self._three_links()
+        st = os.lstat(paths[0])
+        real_rename = os.rename
+        calls = []
+
+        def lands_then_raises(src, dst):
+            calls.append(dst)
+            real_rename(src, dst)
+            if len(calls) == 1:
+                raise OSError(5, "Input/output error")
+        os.rename = lands_then_raises
+        with self.assertLogs(level="WARNING") as logs:
+            with self.assertRaises(OSError):
+                vct.process_file(self._args(), paths, st, self._Layout(),
+                                 self._Layout())
+        self.assertEqual({os.lstat(p).st_ino for p in paths}, {st.st_ino},
+                         "the name that moved was not rejoined")
+        leftovers = [n for n in os.listdir(self.d) if vct.TMP_RE.match(n)]
+        self.assertEqual(leftovers, [], "staged links survived: %s"
+                         % leftovers)
+        self.assertTrue(any("back on the original inode" in m
+                            and "Input/output error" in m
+                            for m in logs.output), logs.output)
+
+    def _lands_then_raises_on(self, n):
+        real_rename = os.rename
+        calls = []
+
+        def f(src, dst):
+            calls.append(dst)
+            real_rename(src, dst)
+            if len(calls) == n:
+                raise OSError(5, "Input/output error")
+        return f
+
+    def _completes(self, paths):
+        """process_file() finishes, counted as transcoded, with no ERROR."""
+        st = os.lstat(paths[0])
+        before = vct.stats.files_transcoded
+        with self.assertLogs(level="WARNING") as logs:
+            vct.process_file(self._args(), paths, st, self._Layout(),
+                             self._Layout())
+        self.assertEqual([m for m in logs.output if m.startswith("ERROR")], [])
+        self.assertTrue(any("the replace completed" in m
+                            and "Input/output error" in m
+                            for m in logs.output), logs.output)
+        self.assertEqual(vct.stats.files_transcoded, before + 1)
+        inos = {os.lstat(p).st_ino for p in paths}
+        self.assertEqual(len(inos), 1)
+        self.assertNotEqual(inos.pop(), st.st_ino, "nothing was replaced")
+        leftovers = [n for n in os.listdir(self.d) if vct.TMP_RE.match(n)]
+        self.assertEqual(leftovers, [], "staged links survived: %s"
+                         % leftovers)
+
+    def test_a_last_rename_that_lands_but_raises_completes(self):
+        """Every name is already on the new inode: nothing is split."""
+        os.rename = self._lands_then_raises_on(3)
+        self._completes(self._three_links())
+
+    def test_a_single_name_whose_rename_lands_but_raises_completes(self):
+        a = os.path.join(self.d, "solo")
+        with open(a, "wb") as f:
+            f.write(b"payload")
+        os.rename = self._lands_then_raises_on(1)
+        self._completes([a])
+
+    def test_a_name_someone_else_replaced_is_left_alone(self):
+        """b is replaced by an owner write while its rename fails. The rejoin
+        must not link the original over it, and must not claim success."""
+        paths = self._three_links()
+        a, b, c = paths
+        st = os.lstat(a)
+        real_rename = os.rename
+        calls = []
+
+        def owner_replaces_b(src, dst):
+            calls.append(dst)
+            if len(calls) == 2:
+                owner = os.path.join(self.d, "owner.tmp")
+                with open(owner, "wb") as f:
+                    f.write(b"owner write")
+                real_rename(owner, b)
+                raise OSError(5, "Input/output error")
+            return real_rename(src, dst)
+        os.rename = owner_replaces_b
+        with self.assertLogs(level="ERROR") as logs:
+            with self.assertRaises(OSError):
+                vct.process_file(self._args(), paths, st, self._Layout(),
+                                 self._Layout())
+        with open(b, "rb") as f:
+            self.assertEqual(f.read(), b"owner write",
+                             "the owner's b was lost")
+        self.assertEqual(os.lstat(a).st_ino, st.st_ino)
+        self.assertEqual(os.lstat(c).st_ino, st.st_ino)
+        split = [m for m in logs.output if "SPLIT" in m]
+        self.assertEqual(len(split), 1, logs.output)
+        self.assertIn(f"{b} on neither", split[0])
+
+
+class _ProcessFileHarness(unittest.TestCase):
+    """process_file() off CephFS, with a real RunJournal over one artifact."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.art = os.path.join(self.d, "art")
+        os.mkdir(self.art)
+        open(os.path.join(self.art, vct.RETENTION_MARKER), "w").close()
+        self.src = os.path.join(self.art, "data.parquet")
+        with open(self.src, "wb") as f:
+            f.write(b"payload" * 100)
+        self._saved = (vct.thread_count, vct._setproctitle, os.chown,
+                       vct._apply_and_verify_layout, vct.run_journal,
+                       vct.read_rctime, vct._copy_file_data)
+        vct._setproctitle = None
+        vct.thread_count = vct.DynamicSemaphore(1)
+        vct._apply_and_verify_layout = lambda layout, path: None
+        vct.read_rctime = lambda path: 1.0
+        os.chown = lambda *a, **k: None          # unprivileged test runner
+        vct.run_journal = vct.RunJournal(enabled=True, stop_at=[self.d])
+
+    def tearDown(self):
+        (vct.thread_count, vct._setproctitle, os.chown,
+         vct._apply_and_verify_layout, vct.run_journal,
+         vct.read_rctime, vct._copy_file_data) = self._saved
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    _Layout = HardlinkStagingOrder._Layout
+
+    def _args(self, **kw):
+        a = dict(dirs=[self.d], dry_run=False, stage_in_tmpdir=False,
+                 tmpdir=self.d, no_copy_file_range=True, threads=1)
+        a.update(kw)
+        return Args(**a)
+
+    def _process(self, **kw):
+        st = os.lstat(self.src)
+        vct.run_journal.note_file(self.src, st)
+        vct.process_file(self._args(**kw), [self.src], st, self._Layout(),
+                         self._Layout())
+
+    def _pinned_at(self):
+        return vct.run_journal._artifacts[self.art]["pinned_at"]
+
+
+class EveryChangeIsClaimed(_ProcessFileHarness):
+    """A sibling temp moves its directory's rctime whether or not the replace
+    goes through. An exit that left pinned_at null let retention trust an
+    rctime that was ours; --dry-run did that on every candidate."""
+
+    def assertClaimed(self):
+        pinned = self._pinned_at()
+        self.assertIsNotNone(pinned, "the directory changed, but no pin")
+        self.assertLessEqual(os.stat(self.art).st_mtime, pinned,
+                             "pinned_at is behind the directory's last change")
+
+    def test_dry_run(self):
+        ino = os.lstat(self.src).st_ino
+        self._process(dry_run=True)
+        self.assertEqual(os.lstat(self.src).st_ino, ino, "dry run replaced")
+        self.assertClaimed()
+
+    def test_lock_skip(self):
+        holder = open(self.src, "rb")
+        self.addCleanup(holder.close)
+        vct.fcntl.flock(holder, vct.fcntl.LOCK_EX)
+        with self.assertLogs(level="WARNING"):
+            self._process()
+        self.assertClaimed()
+
+    def test_source_changed(self):
+        real = self._saved[-1]
+
+        def copy_then_append(ifd, ofd, size, object_size):
+            r = real(ifd, ofd, size, object_size)
+            with open(self.src, "ab") as f:
+                f.write(b"owner write")
+            return r
+        vct._copy_file_data = copy_then_append
+        with self.assertLogs(level="ERROR"):
+            self._process()
+        self.assertClaimed()
+
+    def test_copy_error(self):
+        def eio(*a):
+            raise OSError(5, "Input/output error")
+        vct._copy_file_data = eio
+        with self.assertRaises(OSError):
+            self._process()
+        self.assertClaimed()
+
+    def test_a_replace_still_claims(self):
+        """Control: the path that always claimed still does."""
+        self._process()
+        self.assertClaimed()
+
+    def test_staging_elsewhere_claims_nothing_it_did_not_touch(self):
+        """Control: --stage-in-tmpdir with a dry run never enters the tree."""
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        self._process(dry_run=True, stage_in_tmpdir=True, tmpdir=tmpdir)
+        self.assertIsNone(self._pinned_at())
+
+    def test_the_walks_orphan_sweep_is_claimed(self):
+        """An orphan in the artifact root is swept before any of the root's
+        files is stat'd: pre_rctime must still be read before the unlink."""
+        orphan = os.path.join(self.art, "." + "c" * 32 + vct.TMP_SUFFIX)
+        open(orphan, "w").close()
+        vct.read_rctime = lambda p: 100.0 if os.path.exists(orphan) else 999.0
+        saved = (vct.TMP_ORPHAN_MIN_AGE_S, vct.get_layout_walking_up,
+                 vct.CephLayout.__dict__["from_dir"], vct.runtime_config)
+        vct.TMP_ORPHAN_MIN_AGE_S = 0
+        vct.get_layout_walking_up = lambda d: None      # off CephFS
+        vct.CephLayout.from_dir = classmethod(lambda cls, p: None)
+        vct.runtime_config = None
+        try:
+            with self.assertLogs(level="ERROR"):
+                vct.process_dir(self._args(max_files=None), self.art, {},
+                                None, set(), {})
+        finally:
+            (vct.TMP_ORPHAN_MIN_AGE_S, vct.get_layout_walking_up,
+             from_dir, vct.runtime_config) = saved
+            vct.CephLayout.from_dir = from_dir
+        self.assertFalse(os.path.exists(orphan), "the orphan was not swept")
+        rec = vct.run_journal._artifacts.get(self.art)
+        self.assertIsNotNone(rec, "the sweep changed an unrecorded artifact")
+        self.assertEqual(rec["pre_rctime"], 100.0,
+                         "pre_rctime was read after our own unlink")
+        self.assertIsNotNone(rec["pinned_at"])
+
+
+class ChownBeforeCopystat(_ProcessFileHarness):
+    """The kernel clears setuid/setgid (and drops security.capability) on
+    chown, so a chown after copystat stripped the bits copystat had copied."""
+
+    def test_setuid_survives_the_replace(self):
+        os.chmod(self.src, 0o4755)
+
+        def kernel_chown(path, uid, gid, **kw):
+            mode = vct.stat.S_IMODE(os.stat(path).st_mode)
+            os.chmod(path, mode & ~(vct.stat.S_ISUID | vct.stat.S_ISGID))
+        os.chown = kernel_chown
+        ino = os.lstat(self.src).st_ino
+        self._process()
+        st = os.lstat(self.src)
+        self.assertNotEqual(st.st_ino, ino, "nothing was replaced")
+        self.assertEqual(vct.stat.S_IMODE(st.st_mode), 0o4755)
+
+
+class OrphanAgeIsCtime(unittest.TestCase):
+    """copystat backdates a finished copy's mtime to its source's before the
+    rename, so an mtime age made another job's in-flight temp look a day old.
+    cleanup_tmpdir had no age check at all."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self._saved_age = vct.TMP_ORPHAN_MIN_AGE_S
+        self.addCleanup(setattr, vct, "TMP_ORPHAN_MIN_AGE_S", self._saved_age)
+
+    def _temp(self, name, backdate=True):
+        p = os.path.join(self.d, name)
+        with open(p, "w") as f:
+            f.write("x")
+        if backdate:
+            old = time.time() - 30 * 86400      # what copystat does
+            os.utime(p, (old, old))
+        return p
+
+    def test_a_backdated_in_flight_temp_survives_the_walk_sweep(self):
+        p = self._temp("." + "d" * 32 + vct.TMP_SUFFIX)
+        vct._reclaim_named(self.d, [os.path.basename(p)])
+        self.assertTrue(os.path.exists(p))
+
+    def test_a_backdated_in_flight_temp_survives_process_file_sweep(self):
+        p = self._temp("." + "e" * 32 + vct.TMP_SUFFIX)
+        with vct._reclaimed_lock:
+            vct._reclaimed_dirs.discard(self.d)
+        vct.reclaim_orphans(self.d)
+        self.assertTrue(os.path.exists(p))
+
+    def test_cleanup_tmpdir_spares_another_jobs_temps(self):
+        live = [self._temp("f" * 32, backdate=False),
+                self._temp("." + "f" * 32 + vct.TMP_SUFFIX)]
+        vct.cleanup_tmpdir(self.d)
+        self.assertEqual([p for p in live if not os.path.exists(p)], [])
+
+    def test_cleanup_tmpdir_still_reclaims_aged_temps(self):
+        """Control: only the age changed, not what counts as ours."""
+        ours = [self._temp("a" * 32),
+                self._temp("." + "a" * 32 + vct.TMP_SUFFIX)]
+        theirs = self._temp("results.parquet")
+        vct.TMP_ORPHAN_MIN_AGE_S = 0
+        vct.cleanup_tmpdir(self.d)
+        self.assertEqual([p for p in ours if os.path.exists(p)], [])
+        self.assertTrue(os.path.exists(theirs))
+
+
+class FileDelayWakes(unittest.TestCase):
+    """time.sleep(file_delay) could not be interrupted, so at DELAY_MAX_MS an
+    exit, or a --config edit lowering the delay, waited up to 10 minutes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._saved = (vct._path_source, vct.run_journal, vct.file_delay_ms,
+                       vct.runtime_config, vct.do_exit)
+        vct.run_journal = None
+        vct.runtime_config = None
+        vct.do_exit = threading.Event()
+        vct.file_delay_ms = vct.DELAY_MAX_MS
+        vct._path_source = lambda args, roots: iter(
+            [os.path.join(self.tmp, "a"), os.path.join(self.tmp, "b")])
+
+    def tearDown(self):
+        (vct._path_source, vct.run_journal, vct.file_delay_ms,
+         vct.runtime_config, vct.do_exit) = self._saved
+
+    def _walk_returns_within(self, seconds):
+        t = threading.Thread(target=vct.process_paths, daemon=True,
+                             args=(Args(max_files=None, source_pool=None), {},
+                                   None, {}, [self.tmp]))
+        start = time.monotonic()
+        t.start()
+        t.join(seconds)
+        self.assertFalse(t.is_alive(), "the walker is still asleep")
+        return time.monotonic() - start
+
+    def test_exit_wakes_the_delay(self):
+        threading.Timer(0.3, vct.do_exit.set).start()
+        self._walk_returns_within(5)
+
+    def test_a_config_edit_wakes_the_delay(self):
+        """The poll inside the sleep is what reads the edit."""
+        polls = []
+
+        class Config:
+            def poll(self, apply):
+                polls.append(time.monotonic())
+                if len(polls) >= 2:
+                    vct.file_delay_ms = 0   # the operator lowered it
+        vct.runtime_config = Config()
+        with self.assertLogs(level="INFO"):
+            self._walk_returns_within(5)
 
 
 class ConfigReadWhilePaused(unittest.TestCase):
@@ -2764,6 +3269,188 @@ class RegulatorPauseAlwaysEnds(unittest.TestCase):
         self.assertEqual(vct.thread_count.limit, 0,
                          "the regulator resumed an operator pause as its own")
 
+    def _alternate(self, r, ticks, step=30):
+        """nan, error, nan, error ... with step seconds passing per tick."""
+        for i in range(ticks):
+            self._tick(r, self._nan if i % 2 == 0 else self._down)
+            if r._blind_since is not None:
+                r._blind_since -= step
+
+    def test_nan_and_errors_alternating_still_resume(self):
+        """They reset each other's clocks, so a Prometheus alternating nan and
+        errors reached neither bound and the pause held forever."""
+        r = self._reg(blind_s=600)
+        self._paused(r)
+        self._alternate(r, 6)               # 3 nan: regulate_quiet_ticks
+        self.assertEqual(vct.thread_count.limit, 1,
+                         "alternating nan and errors held the pause")
+
+    def test_the_blind_bound_caps_a_long_nan_streak(self):
+        r = self._reg(blind_s=600)
+        r.args.regulate_quiet_ticks = 1000
+        self._paused(r)
+        self._alternate(r, 30)              # 900 s blind, past the 600 s bound
+        self.assertEqual(vct.thread_count.limit, 1,
+                         "the blind bound was not a hard upper limit")
+
+    def test_the_blind_bound_caps_pure_nan_too(self):
+        r = self._reg(blind_s=600)
+        r.args.regulate_quiet_ticks = 1000
+        self._paused(r)
+        for _ in range(30):                 # 900 s of nan alone
+            self._tick(r, self._nan)
+            if r._blind_since is not None:
+                r._blind_since -= 30
+        self.assertEqual(vct.thread_count.limit, 1,
+                         "nan alone never reached the blind bound")
+
+    def _operator_writes_after_the_check(self, r, n):
+        """Land an operator write right after r's own _paused_by_me()."""
+        real = r._paused_by_me
+
+        def racing():
+            mine = real()
+            if mine:
+                vct.thread_count.set_limit(n)   # SIGUSR1, or a threads edit
+            return mine
+
+        r._paused_by_me = racing
+
+    def test_a_blind_resume_does_not_overwrite_an_operator_write(self):
+        r = self._reg(blind_s=600)
+        self._paused(r)
+        self._tick(r, self._down)
+        r._blind_since -= 601
+        self._operator_writes_after_the_check(r, 5)
+        self._tick(r, self._down)
+        self.assertEqual(vct.thread_count.limit, 5,
+                         "a blind resume overwrote the operator's threads")
+
+    def test_a_nan_resume_does_not_overwrite_an_operator_write(self):
+        r = self._reg()
+        self._paused(r)
+        self._tick(r, self._nan)
+        self._tick(r, self._nan)
+        self._operator_writes_after_the_check(r, 5)
+        self._tick(r, self._nan)
+        self.assertEqual(vct.thread_count.limit, 5,
+                         "a nan resume overwrote the operator's threads")
+
+    def test_a_resume_does_not_overwrite_an_operator_write(self):
+        r = self._reg()
+        self._paused(r)
+        self._operator_writes_after_the_check(r, 2)
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 2,
+                         "a resume overwrote the operator's threads")
+
+    def test_a_pause_racing_an_operator_write_drops_the_probe_debt(self):
+        """The operator replaced the probe; its debt must not come back."""
+        r = self._reg()
+        self._nan_probe(r)                  # probe at 1, owing 4
+        sem = vct.thread_count
+        real = sem.set_limit_if
+
+        def racing(gen, new):
+            sem.set_limit_if = real
+            sem.set_limit(2)                # threads = 2, before the pause
+            return real(gen, new)
+
+        sem.set_limit_if = racing
+        r._pause(200.0)
+        self.assertEqual(vct.thread_count.limit, 0)
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 2,
+                         "the pause resumed to the probe's old debt")
+
+    def _as_the_regulator(self, r):
+        saved = vct.regulator
+        vct.regulator = r
+        self.addCleanup(setattr, vct, "regulator", saved)
+
+    def test_an_operator_pause_during_a_regulator_pause_stands(self):
+        """"threads = 0" read while the regulator already holds 0.
+
+        The walker reads --config during a regulator pause now, so the edit
+        arrives while the limit is already 0. A value test skipped it, the
+        config reader never passed it again, and the regulator resumed over
+        the operator's pause.
+        """
+        r = self._reg()
+        self._as_the_regulator(r)
+        self._paused(r)
+        with self.assertLogs(level="INFO") as cm:
+            vct._apply_config_threads(0)
+        self.assertTrue(any("operator's setting" in m
+                            and "will not resume or pay back" in m
+                            for m in cm.output), cm.output)
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 0,
+                         "the regulator resumed over threads = 0")
+
+    def test_an_operator_choosing_one_thread_during_the_probe_stands(self):
+        r = self._reg()
+        self._as_the_regulator(r)
+        self._nan_probe(r)
+        vct._apply_config_threads(1)
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 1,
+                         "the probe payback overrode threads = 1")
+
+    def test_sigtstp_during_the_probe_stands(self):
+        r = self._reg()
+        self._nan_probe(r)
+        vct.sigtstp_handler(signal.SIGTSTP, None)
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 1,
+                         "the probe payback overrode SIGTSTP")
+
+    def test_sigusr2_during_a_regulator_pause_stands(self):
+        r = self._reg()
+        self._paused(r)
+        vct.sigusr2_handler(signal.SIGUSR2, None)
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 0,
+                         "the regulator resumed over SIGUSR2")
+
+    def test_a_soft_band_sample_pays_the_probe_back_to_threads(self):
+        """Over the target is no evidence of room for the full count, but
+        --threads is the operator's floor. Held at 1, a volume whose latency
+        sits in the soft band stayed below it indefinitely."""
+        r = self._reg()
+        r.args.threads = 2
+        self._nan_probe(r)                  # at 1, owing 4
+        self._tick(r, lambda: 60.0)         # over 51 ms, under the pause line
+        self.assertEqual(vct.thread_count.limit, 2,
+                         "a soft-band sample left the probe below --threads")
+        self._tick(r, lambda: 60.0)
+        self.assertEqual(vct.thread_count.limit, 2,
+                         "a soft-band sample paid back past --threads")
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 4,
+                         "the rest of the debt was forgotten")
+
+    def test_a_soft_band_sample_keeps_a_one_thread_probe_at_one(self):
+        r = self._reg()
+        r.args.threads = 1
+        self._nan_probe(r)
+        self._tick(r, lambda: 60.0)
+        self.assertEqual(vct.thread_count.limit, 1)
+        self._tick(r, lambda: 1.0)
+        self.assertEqual(vct.thread_count.limit, 4)
+
+    def test_a_soft_band_sample_pays_a_debt_within_threads(self):
+        r = self._reg()                     # --threads 4, owing 4
+        self._nan_probe(r)
+        self._tick(r, lambda: 60.0)
+        self.assertEqual(vct.thread_count.limit, 4)
+
+    def test_quiet_ticks_documents_the_nan_resume(self):
+        ex = vct.config_example("vol")
+        i = ex.index("regulate_quiet_ticks =")
+        self.assertIn("nan", ex[max(0, i - 300):i],
+                      "the example config does not say quiet_ticks gates it")
+
     def test_the_bound_is_a_live_config_key(self):
         self.assertIn("regulate_blind_resume_s", vct.RuntimeConfig.KEYS)
         out, errs = vct.RuntimeConfig._parse("regulate_blind_resume_s = 0\n")
@@ -2846,6 +3533,30 @@ class ExitSignalsUnwindCleanly(unittest.TestCase):
                          "a second SIGTERM would still wait for the drain")
         self.assertIs(signal.getsignal(signal.SIGHUP), vct._exit_signal_handler)
 
+    def test_the_exit_log_says_what_is_draining(self):
+        saved = vct.thread_count
+        vct.thread_count = vct.DynamicSemaphore(4)
+        self.addCleanup(setattr, vct, "thread_count", saved)
+        vct.thread_count.acquire()
+        vct.thread_count.acquire()          # two copies in flight
+        vct._install_exit_handlers()
+        with self.assertLogs(level="ERROR") as cm:
+            os.kill(os.getpid(), signal.SIGTERM)
+            for _ in range(200):
+                if vct.do_exit.is_set():
+                    break
+                time.sleep(0.01)
+        blob = "\n".join(cm.output)
+        self.assertIn("draining 2 in-flight copies", blob)
+        self.assertIn("send SIGTERM again", blob)
+
+    def test_help_documents_the_drain_and_timeout_k(self):
+        import subprocess
+        r = subprocess.run([sys.executable, os.path.abspath(TARGET), "--help"],
+                           capture_output=True, text=True)
+        self.assertIn("exit signals:", r.stdout)
+        self.assertIn("timeout -k", r.stdout)
+
     def test_nohup_is_kept(self):
         signal.signal(signal.SIGHUP, signal.SIG_IGN)
         vct._install_exit_handlers()
@@ -2918,6 +3629,900 @@ class ProcessFilesStartup(unittest.TestCase):
         self._run(journal=True)
         self.assertEqual(len(started), 1,
                          "process_files() never started journal checkpoints")
+
+
+
+# --- --target-pool ------------------------------------------------------------
+
+_L = ("stripe_unit=4194304 stripe_count=1 object_size=4194304 "
+      "pool=cephfs.v.ec4.2.qlc.data")
+
+
+class TargetPoolLayout(unittest.TestCase):
+    """--target-pool replaces only the pool, and a file already in the target
+    must still read as matched however its xattr string is formatted."""
+
+    def test_equality_is_by_field_not_string(self):
+        a = vct.CephLayout(_L)
+        b = vct.CephLayout("pool=cephfs.v.ec4.2.qlc.data object_size=4194304 "
+                           "stripe_count=1 stripe_unit=4194304")
+        self.assertEqual(a, b)
+        self.assertEqual(hash(a), hash(b))
+
+    def test_namespace_distinguishes(self):
+        self.assertNotEqual(vct.CephLayout(_L),
+                            vct.CephLayout(_L + " pool_namespace=ns"))
+
+    def test_with_pool_changes_only_the_pool(self):
+        a = vct.CephLayout(_L)
+        t = a.with_pool("cephfs.v.data")
+        self.assertEqual(t, vct.CephLayout(_L.replace(
+            "cephfs.v.ec4.2.qlc.data", "cephfs.v.data")))
+        self.assertEqual((t.stripe_unit, t.stripe_count, t.object_size),
+                         (a.stripe_unit, a.stripe_count, a.object_size))
+        self.assertIs(a.with_pool(a.pool), a)
+
+    def test_target_layout(self):
+        d = vct.CephLayout(_L)
+        self.assertIs(vct.target_layout(Args(target_pool=None), d), d,
+                      "without --target-pool the directory's layout is the target")
+        self.assertIs(vct.target_layout(Args(), d), d)
+        self.assertEqual(
+            vct.target_layout(Args(target_pool="cephfs.v.data"), d).pool,
+            "cephfs.v.data")
+        self.assertIsNone(vct.target_layout(Args(target_pool="x"), None))
+
+
+class TargetPoolGates(unittest.TestCase):
+    """The override sends every eligible file to one pool, so the size band is
+    all that stops it moving a whole volume to the wrong tier."""
+
+    def setUp(self):
+        self._saved = vct._pool_scheme
+        vct._pool_scheme = lambda pool: None        # no ceph CLI, as on clients
+
+    def tearDown(self):
+        vct._pool_scheme = self._saved
+
+    def test_kind_from_the_name_without_a_cli(self):
+        self.assertEqual(vct.target_pool_kind("cephfs.v.ec4.2.qlc.data"),
+                         ("ec", "name"))
+        self.assertEqual(vct.target_pool_kind("cephfs.v.ec6.3.ssd.data"),
+                         ("ec", "name"))
+        self.assertEqual(vct.target_pool_kind("cephfs.v.data")[0], "rep")
+        self.assertIn("no filesystem pin", vct.target_pool_kind("cephfs.v.data")[1],
+                      "an unpinned name match must say so on the startup line")
+        self.assertEqual(vct.target_pool_kind("cephfs.vec.data")[0], "rep",
+                         "an 'ec' inside a volume name is not a profile")
+        for odd in ("cephfs.x.qlc.data", "cephfs.x.ec42.data", "cephfs.x.ec8_3.data"):
+            self.assertEqual(vct.target_pool_kind(odd)[0], None,
+                             "%s read as replicated by its .data suffix" % odd)
+
+    def test_the_cluster_beats_the_name(self):
+        vct._pool_scheme = lambda pool: ("rep", 3)
+        self.assertEqual(vct.target_pool_kind("cephfs.v.ec4.2.qlc.data"),
+                         ("rep", "cluster"))
+
+    def test_replicated_needs_a_max_size_below_the_floor(self):
+        r = vct.target_pool_refusal
+        self.assertIsNotNone(r("rep", None, 0, None, "p"))
+        self.assertIsNotNone(r("rep", None, 0, vct.YIELD_FLOOR_BYTES, "p"))
+        self.assertIsNone(r("rep", None, 0, vct.YIELD_FLOOR_BYTES - 1, "p"))
+
+    def test_ec_needs_a_min_size_at_the_floor(self):
+        floor = vct.target_pool_floor("cephfs.v.data", "cephfs.v.ec4.2.qlc.data")
+        self.assertEqual(floor, vct.YIELD_FLOOR_BYTES)
+        r = vct.target_pool_refusal
+        self.assertIsNotNone(r("ec", floor, floor - 1, None, "p"))
+        self.assertIsNone(r("ec", floor, floor, None, "p"))
+
+    def test_the_floor_never_drops_below_the_yield_floor(self):
+        vct._pool_scheme = lambda pool: (("rep", 3) if pool.endswith(".data")
+                                         and ".ec" not in pool
+                                         else ("ec", 4, 2, 4096))
+        saved = vct._min_alloc_hint
+        vct._min_alloc_hint = lambda: 4096
+        try:
+            self.assertEqual(
+                vct.target_pool_floor("cephfs.v.data", "cephfs.v.ec4.2.qlc.data"),
+                vct.YIELD_FLOOR_BYTES,
+                "a 12 KiB space crossover must not lower the floor")
+        finally:
+            vct._min_alloc_hint = saved
+
+
+class PathsFromPoolSweep(unittest.TestCase):
+    """--paths-from-pool refuses a pool that is still the write target -- a
+    drain cannot converge -- except for a --target-pool small-file sweep."""
+
+    def test_draining_the_write_target_is_refused(self):
+        self.assertIsNotNone(vct.write_target_refusal(
+            Args(target_pool=None, max_size=None), "P", "/r", "P"))
+
+    def test_a_sweep_is_allowed(self):
+        with self.assertLogs(level="INFO"):
+            self.assertIsNone(vct.write_target_refusal(
+                Args(target_pool="R", max_size=614399), "P", "/r", "P"))
+
+    def test_a_sweep_needs_a_max_size(self):
+        self.assertIsNotNone(vct.write_target_refusal(
+            Args(target_pool="R", max_size=None), "P", "/r", "P"))
+
+    def test_targeting_the_same_pool_is_still_refused(self):
+        self.assertIsNotNone(vct.write_target_refusal(
+            Args(target_pool="P", max_size=614399), "P", "/r", "P"))
+
+    def test_another_pool_is_not_a_question(self):
+        self.assertIsNone(vct.write_target_refusal(
+            Args(target_pool=None, max_size=None), "P", "/r", "Q"))
+
+
+class StagingRefcount(unittest.TestCase):
+    """One staging directory per directory, shared by its files in flight and
+    by the producer while it is there, and removed with the last reference."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.s = vct.StagingDirs("0" * 16)
+        self.made = []
+
+        def fake_create(dirpath, layout):          # off CephFS: no layout xattr
+            p = os.path.join(dirpath, self.s.name)
+            os.mkdir(p)
+            self.made.append(p)
+            return p
+        self.s._create = fake_create
+        self.stage = os.path.join(self.d, self.s.name)
+
+    def test_shared_and_removed_with_the_last_reference(self):
+        p1 = self.s.acquire(self.d, None)
+        p2 = self.s.acquire(self.d, None)
+        self.assertEqual(p1, p2)
+        self.assertEqual(len(self.made), 1)
+        self.assertFalse(self.s.release(self.d))
+        self.assertTrue(os.path.isdir(self.stage))
+        self.assertTrue(self.s.release(self.d))
+        self.assertFalse(os.path.exists(self.stage))
+
+    def test_the_producer_hold_keeps_it_between_files(self):
+        self.s.hold(self.d)
+        for _ in range(3):
+            self.s.acquire(self.d, None)
+            self.s.release(self.d)
+            self.assertTrue(os.path.isdir(self.stage),
+                            "removed between two files of the same directory")
+        self.assertEqual(len(self.made), 1, "made once per file, not per directory")
+        self.assertTrue(self.s.release(self.d))
+        self.assertFalse(os.path.exists(self.stage))
+
+    def test_nothing_is_made_where_nothing_is_staged(self):
+        self.s.hold(self.d)
+        self.s.release(self.d)
+        self.assertEqual(self.made, [])
+
+    def test_a_failed_create_does_not_leak_a_reference(self):
+        def boom(dirpath, layout):
+            raise OSError(22, "Invalid argument")
+        self.s._create = boom
+        with self.assertRaises(OSError):
+            self.s.acquire(self.d, None)
+        self.assertEqual(self.s._refs, {})
+
+    def test_remove_all(self):
+        self.s.acquire(self.d, None)
+        self.assertEqual(self.s.remove_all(), [self.d])
+        self.assertFalse(os.path.exists(self.stage))
+
+    def test_concurrent_files_share_one(self):
+        self.s.hold(self.d)
+
+        def worker():
+            for _ in range(200):
+                self.s.acquire(self.d, None)
+                self.s.release(self.d)
+        ts = [threading.Thread(target=worker) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(len(self.made), 1)
+        self.s.release(self.d)
+        self.assertFalse(os.path.exists(self.stage))
+
+
+class StagedReplace(_ProcessFileHarness):
+    """The staging path. The temp is BORN in the staging directory and never
+    given a layout afterwards: setting one would record an old pool, and the MDS
+    keeps a backtrace object there for the life of the file."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_staging = (vct.staging, vct._verify_layout)
+        vct.staging = vct.StagingDirs("ab" * 8)
+        self.made = []
+
+        def fake_create(dirpath, layout):
+            p = os.path.join(dirpath, vct.staging.name)
+            os.mkdir(p)
+            self.made.append(p)
+            return p
+        vct.staging._create = fake_create
+        self.applied, self.verified = [], []
+        vct._apply_and_verify_layout = lambda layout, path: self.applied.append(path)
+        vct._verify_layout = lambda layout, path: self.verified.append(path)
+        self.renames = []
+        real = os.rename
+
+        def spy(src, dst):
+            self.renames.append((src, dst))
+            return real(src, dst)
+        os.rename = spy
+        self.addCleanup(setattr, os, "rename", real)
+
+    def tearDown(self):
+        vct.staging, vct._verify_layout = self._saved_staging
+        super().tearDown()
+
+    def _staged(self, stage=True):
+        st = os.lstat(self.src)
+        vct.run_journal.note_file(self.src, st)
+        vct.process_file(self._args(), [self.src], st, self._Layout(),
+                         self._Layout(), stage)
+
+    def test_born_in_the_staging_dir_and_renamed_up(self):
+        ino = os.lstat(self.src).st_ino
+        self._staged()
+        stage = os.path.join(self.art, vct.staging.name)
+        self.assertEqual(len(self.renames), 1)
+        src, dst = self.renames[0]
+        self.assertEqual(os.path.dirname(src), stage)
+        self.assertEqual(dst, self.src)
+        self.assertEqual(self.applied, [],
+                         "a layout was set on the staged temp: that records an "
+                         "old pool and leaves a backtrace object behind")
+        self.assertEqual(self.verified, [src], "the read-back check was skipped")
+        self.assertNotEqual(os.lstat(self.src).st_ino, ino)
+        with open(self.src, "rb") as f:
+            self.assertEqual(f.read(), b"payload" * 100)
+        self.assertFalse(os.path.exists(stage), "staging directory left behind")
+        self.assertIsNotNone(self._pinned_at())
+
+    def test_unstaged_is_the_sibling_path_unchanged(self):
+        """Control: stage=False is today's path -- sibling temp, layout applied."""
+        self._staged(stage=False)
+        self.assertEqual(self.made, [])
+        self.assertEqual(len(self.applied), 1)
+        self.assertEqual(os.path.dirname(self.applied[0]), self.art)
+        self.assertEqual(os.path.dirname(self.renames[0][0]), self.art)
+
+    def test_a_failed_copy_leaves_nothing(self):
+        def eio(*a):
+            raise OSError(5, "Input/output error")
+        vct._copy_file_data = eio
+        with self.assertRaises(OSError):
+            self._staged()
+        self.assertFalse(os.path.exists(os.path.join(self.art, vct.staging.name)))
+        self.assertEqual(sorted(os.listdir(self.art)),
+                         sorted([vct.RETENTION_MARKER, "data.parquet"]))
+
+
+class _FakeExecutor:
+    def __init__(self):
+        self.calls = []
+
+    def submit(self, fn, *a):
+        self.calls.append(a)
+
+        class F:
+            def add_done_callback(self, cb):
+                pass
+        return F()
+
+
+class StagingOnlyWithTargetPool(unittest.TestCase):
+    """Without --target-pool nothing is staged: the regular replicated -> EC
+    path stays exactly what it was. With it, only files whose directory points
+    elsewhere are."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.f = os.path.join(self.d, "f")
+        with open(self.f, "wb") as fh:
+            fh.write(b"x" * 1000)
+        old = time.time() - 30 * 86400
+        os.utime(self.f, (old, old))
+        self._saved = (vct._path_source, vct.run_journal, vct.file_delay_ms,
+                       vct.runtime_config, vct.thread_count, vct.staging,
+                       vct.get_layout_walking_up,
+                       vct.CephLayout.__dict__["from_file"],
+                       vct.CephLayout.__dict__["from_dir"])
+        vct.file_delay_ms = 0
+        vct.runtime_config = None
+        vct.run_journal = None
+        vct.thread_count = vct.DynamicSemaphore(100)
+        self.dir_layout = vct.CephLayout(_L)
+        vct.get_layout_walking_up = lambda d: self.dir_layout
+        vct.CephLayout.from_dir = classmethod(lambda cls, p: self.dir_layout)
+        src = vct.CephLayout(_L.replace("cephfs.v.ec4.2.qlc.data",
+                                        "cephfs.v.ec6.3.ssd.data"))
+        vct.CephLayout.from_file = classmethod(lambda cls, p: src)
+
+    def tearDown(self):
+        (vct._path_source, vct.run_journal, vct.file_delay_ms,
+         vct.runtime_config, vct.thread_count, vct.staging,
+         vct.get_layout_walking_up, from_file, from_dir) = self._saved
+        vct.CephLayout.from_file = from_file
+        vct.CephLayout.from_dir = from_dir
+
+    def _args(self, **kw):
+        a = dict(max_files=None, source_pool=None, min_size=0, max_size=None,
+                 process_hardlinks=False, tmpdir="/nonexistent", dirs=[self.d],
+                 stage_in_tmpdir=False, target_pool=None)
+        a.update(kw)
+        return Args(**a)
+
+    def _paths(self, args):
+        ex = _FakeExecutor()
+        vct._path_source = lambda a, r: iter([self.f])
+        vct.process_paths(args, {}, ex, {}, [self.d])
+        return ex.calls
+
+    def _walk(self, args):
+        ex = _FakeExecutor()
+        vct.process_dir(args, self.d, {}, ex, set(), {})
+        return ex.calls
+
+    def test_no_target_pool_never_stages(self):
+        vct.staging = None
+        for run in (self._paths, self._walk):
+            calls = run(self._args())
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(calls[0][5], "%s staged without --target-pool"
+                             % run.__name__)
+            self.assertEqual(calls[0][3], self.dir_layout)
+
+    def test_target_pool_elsewhere_stages(self):
+        vct.staging = vct.StagingDirs("c" * 16)
+        for run in (self._paths, self._walk):
+            calls = run(self._args(target_pool="cephfs.v.data", max_size=614399))
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0][5])
+            self.assertEqual(calls[0][3].pool, "cephfs.v.data")
+
+    def test_target_pool_equal_to_the_directory_does_not_stage(self):
+        vct.staging = vct.StagingDirs("c" * 16)
+        for run in (self._paths, self._walk):
+            calls = run(self._args(target_pool="cephfs.v.ec4.2.qlc.data",
+                                   min_size=0))
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(calls[0][5])
+
+    def test_already_in_the_target_is_matched(self):
+        vct.staging = vct.StagingDirs("c" * 16)
+        there = vct.CephLayout(_L.replace("cephfs.v.ec4.2.qlc.data",
+                                          "cephfs.v.data"))
+        vct.CephLayout.from_file = classmethod(lambda cls, p: there)
+        for run in (self._paths, self._walk):
+            self.assertEqual(
+                run(self._args(target_pool="cephfs.v.data", max_size=614399)), [])
+
+    def test_a_staging_dir_is_never_walked(self):
+        vct.staging = None
+        stage = os.path.join(self.d, vct.STAGE_PREFIX + "d" * 16)
+        os.mkdir(stage)
+        inside = os.path.join(stage, "copy")
+        with open(inside, "wb") as fh:
+            fh.write(b"y")
+        os.utime(inside, (0, 0))
+        saved = vct.TMP_ORPHAN_MIN_AGE_S
+        vct.TMP_ORPHAN_MIN_AGE_S = 10 ** 9            # not aged: left alone
+        try:
+            calls = self._walk(self._args())
+        finally:
+            vct.TMP_ORPHAN_MIN_AGE_S = saved
+        self.assertEqual([c[1][0] for c in calls], [self.f])
+        self.assertTrue(os.path.exists(inside))
+
+    def test_an_aged_staging_dir_is_reclaimed(self):
+        vct.staging = None
+        stage = os.path.join(self.d, vct.STAGE_PREFIX + "d" * 16)
+        os.mkdir(stage)
+        tmp = os.path.join(stage, "." + "e" * 32 + vct.TMP_SUFFIX)
+        open(tmp, "w").close()
+        saved = vct.TMP_ORPHAN_MIN_AGE_S
+        vct.TMP_ORPHAN_MIN_AGE_S = -1
+        try:
+            with self.assertLogs(level="INFO"):
+                self._walk(self._args())
+        finally:
+            vct.TMP_ORPHAN_MIN_AGE_S = saved
+        self.assertFalse(os.path.exists(stage))
+
+    def test_a_user_dir_with_a_similar_name_is_walked(self):
+        """Control: matched on the whole shape, not the prefix."""
+        vct.staging = None
+        other = os.path.join(self.d, vct.STAGE_PREFIX + "notours")
+        os.mkdir(other)
+        g = os.path.join(other, "g")
+        with open(g, "wb") as fh:
+            fh.write(b"z")
+        os.utime(g, (0, 0))
+        calls = self._walk(self._args())
+        self.assertIn(g, [c[1][0] for c in calls])
+
+    def test_a_listed_path_inside_a_staging_dir_is_skipped(self):
+        vct.staging = None
+        stage = os.path.join(self.d, vct.STAGE_PREFIX + "d" * 16)
+        os.mkdir(stage)
+        inside = os.path.join(stage, "copy")
+        open(inside, "w").close()
+        ex = _FakeExecutor()
+        vct._path_source = lambda a, r: iter([inside, self.f])
+        with self.assertLogs(level="INFO") as cm:
+            vct.process_paths(self._args(), {}, ex, {}, [self.d])
+        self.assertEqual([c[1][0] for c in ex.calls], [self.f])
+        self.assertTrue(any("inside a staging directory" in m for m in cm.output))
+
+
+class GroupByDirectory(unittest.TestCase):
+    """A pool lists in object-hash order, so one directory's files are spread
+    through it. Grouped, its files share one staging directory."""
+
+    def setUp(self):
+        self.spill = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.spill, True)
+
+    def _grouped(self, paths, run_paths):
+        return list(vct.group_by_directory(iter(paths), self.spill, run_paths))
+
+    def _contiguous(self, out):
+        seen, last = set(), None
+        for p in out:
+            d = os.path.dirname(p)
+            if d != last:
+                self.assertNotIn(d, seen, "directory %s split in two" % d)
+                seen.add(d)
+                last = d
+
+    def test_groups_with_spills(self):
+        paths = ["/v/%s/f%03d" % (d, i) for i in range(40) for d in "abcde"]
+        out = self._grouped(paths, run_paths=7)
+        self.assertEqual(sorted(out), sorted(paths))
+        self._contiguous(out)
+        self.assertEqual(os.listdir(self.spill), [], "spill files left behind")
+
+    def test_a_subdirectory_does_not_split_its_parent(self):
+        """Sorting on the whole path would put /v/a/b/y between /v/a/a and /v/a/c."""
+        out = self._grouped(["/v/a/c", "/v/a/b/y", "/v/a/a"], run_paths=2)
+        self._contiguous(out)
+
+    def test_in_memory_when_small(self):
+        out = self._grouped(["/v/b/1", "/v/a/1", "/v/b/2"], run_paths=100)
+        self._contiguous(out)
+        self.assertEqual(os.listdir(self.spill), [])
+
+    def test_undecodable_bytes_round_trip(self):
+        bad = b"/v/a/bad\xff".decode("utf-8", "surrogateescape")
+        out = self._grouped([bad, "/v/b/1", "/v/a/ok"], run_paths=1)
+        self.assertIn(bad, out)
+
+    def test_an_abandoned_merge_cleans_up(self):
+        g = vct.group_by_directory(iter(["/v/%d/f" % i for i in range(10)]),
+                                   self.spill, 3)
+        next(g)
+        self.assertNotEqual(os.listdir(self.spill), [])
+        g.close()
+        self.assertEqual(os.listdir(self.spill), [])
+
+
+
+class PoolListingRace(unittest.TestCase):
+    """An object listed and then purged before its backtrace is read is gone,
+    not an error. Raising killed the whole run part way through the listing --
+    seen on a live volume, where a file transcoded away is purged from the pool the
+    sweep is reading."""
+
+    def setUp(self):
+        import types
+        self.mp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.mp, True)
+        for n in ("a", "b"):
+            open(os.path.join(self.mp, n), "w").close()
+
+        class ObjectNotFound(Exception):
+            pass
+
+        class NoData(Exception):
+            pass
+
+        class Obj:
+            def __init__(self, key):
+                self.key = key
+
+        class Ioctx:
+            def list_objects(self):
+                return [Obj("10000000001.00000000"), Obj("10000000002.00000000"),
+                        Obj("10000000003.00000000")]
+
+            def get_xattr(self, key, name):
+                if key.startswith("10000000002."):
+                    raise ObjectNotFound("Failed to get xattr 'parent'")
+                return key.split(".")[0].encode()
+
+            def close(self):
+                pass
+
+        class Rados:
+            def __init__(self, **kw):
+                pass
+
+            def connect(self):
+                pass
+
+            def open_ioctx(self, pool):
+                return Ioctx()
+
+            def shutdown(self):
+                pass
+
+        fake = types.ModuleType("rados")
+        fake.Rados, fake.ObjectNotFound, fake.NoData = Rados, ObjectNotFound, NoData
+        self._saved = (sys.modules.get("rados"), vct._ceph_connect_args,
+                       vct._mount_ancestry_prefix, vct.decode_backtrace,
+                       getattr(os, "getxattr", None))
+        sys.modules["rados"] = fake
+        vct._ceph_connect_args = lambda *a: ("/x.conf", {})
+        vct._mount_ancestry_prefix = lambda root: (self.mp, "/")
+        names = {0x10000000001: b"a", 0x10000000003: b"b"}
+        vct.decode_backtrace = lambda blob: (int(blob, 16), [names[int(blob, 16)]], 0)
+
+        def no_layout(path, name, **kw):
+            raise OSError(vct.ENODATA, "No data available")
+        os.getxattr = no_layout
+
+    def tearDown(self):
+        rados, cca, map_, dbt, gx = self._saved
+        if rados is None:
+            sys.modules.pop("rados", None)
+        else:
+            sys.modules["rados"] = rados
+        vct._ceph_connect_args, vct._mount_ancestry_prefix = cca, map_
+        vct.decode_backtrace = dbt
+        if gx is None:
+            del os.getxattr
+        else:
+            os.getxattr = gx
+
+    def test_a_purged_object_is_skipped_not_fatal(self):
+        args = Args(paths_from_pool="Q", rados_conffile=None, rados_mon_host=None,
+                    rados_keyring=None, rados_name=None, target_pool=None,
+                    max_size=None)
+        with self.assertLogs(level="INFO") as cm:
+            got = list(vct._iter_pool_paths(args, [self.mp]))
+        self.assertEqual(got, [os.path.join(self.mp, "a"), os.path.join(self.mp, "b")])
+        self.assertTrue(any("1 gone before read" in m for m in cm.output), cm.output)
+
+
+
+class TmpdirConflictUnderTargetPool(unittest.TestCase):
+    """The tmpdir check guards temps staged IN the tmpdir. A staged
+    --target-pool run puts none there, and its usual target -- the replicated
+    pool -- is the default pool the tmpdir belongs on, so the check must not
+    refuse it."""
+
+    def setUp(self):
+        self._saved = vct.get_layout_walking_up
+        vct.get_layout_walking_up = lambda d: vct.CephLayout(_L)   # dirs on Q
+
+    def tearDown(self):
+        vct.get_layout_walking_up = self._saved
+
+    def _args(self, **kw):
+        a = dict(dirs=["/v"], target_pool=None, stage_in_tmpdir=False)
+        a.update(kw)
+        return Args(**a)
+
+    def test_a_staged_replicated_target_on_the_tmpdir_pool_is_fine(self):
+        self.assertEqual(vct.tmpdir_conflicts(
+            self._args(target_pool="cephfs.v.data"), "cephfs.v.data"), [])
+
+    def test_stage_in_tmpdir_still_checks_the_target(self):
+        self.assertEqual(vct.tmpdir_conflicts(
+            self._args(target_pool="cephfs.v.data", stage_in_tmpdir=True),
+            "cephfs.v.data"), [("/v", "cephfs.v.data")])
+
+    def test_without_target_pool_it_is_the_old_check(self):
+        self.assertEqual(vct.tmpdir_conflicts(self._args(),
+                                              "cephfs.v.ec4.2.qlc.data"),
+                         [("/v", "cephfs.v.ec4.2.qlc.data")])
+        self.assertEqual(vct.tmpdir_conflicts(self._args(), "cephfs.v.data"), [])
+
+
+class TargetPoolKindFailsClosed(unittest.TestCase):
+    """Without the ceph CLI the kind comes from the operator or a positive name
+    match. Guessing is unsafe both ways: an EC pool read as replicated is sent
+    exactly the small files the yield floor keeps off EC."""
+
+    def setUp(self):
+        self._saved = vct._pool_scheme
+        vct._pool_scheme = lambda pool: None
+
+    def tearDown(self):
+        vct._pool_scheme = self._saved
+
+    def test_an_unrecognized_name_is_refused(self):
+        kind, why = vct.target_pool_kind("fastpool")
+        self.assertIsNone(kind)
+        self.assertIn("--target-pool-kind", why)
+
+    def test_rdata_is_replicated(self):
+        self.assertEqual(vct.target_pool_kind("cephfs.myvol.rdata")[0], "rep")
+
+    def test_declared_kind_decides_without_a_cli(self):
+        self.assertEqual(vct.target_pool_kind("fastpool", "ec"),
+                         ("ec", "--target-pool-kind"))
+
+    def test_a_declared_kind_the_cluster_contradicts_is_refused(self):
+        vct._pool_scheme = lambda pool: ("ec", 4, 2, 4096)
+        kind, why = vct.target_pool_kind("fastpool", "rep")
+        self.assertIsNone(kind)
+        self.assertIn("cluster", why)
+        self.assertEqual(vct.target_pool_kind("fastpool", "ec"), ("ec", "cluster"))
+
+
+class GroupingStopsAndYields(unittest.TestCase):
+    """The pre-read can take hours on a large pool: an exit must not wait for
+    it, and a short spill disk must not fill."""
+
+    def setUp(self):
+        self.spill = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.spill, True)
+
+    def test_stop_ends_the_read_and_closes_the_source(self):
+        closed = []
+        n = [0]
+
+        def source():
+            try:
+                for i in range(100):
+                    n[0] += 1
+                    yield "/v/%d/f" % (i % 7)
+            finally:
+                closed.append(True)
+
+        out = list(vct.group_by_directory(source(), self.spill, 3,
+                                          stop=lambda: n[0] >= 10))
+        self.assertEqual(out, [])
+        self.assertLess(n[0], 100, "kept reading after stop")
+        self.assertEqual(closed, [True], "the source was not closed")
+        self.assertEqual(os.listdir(self.spill), [])
+
+    def test_short_space_falls_back_to_listing_order(self):
+        saved = vct.shutil.disk_usage
+        vct.shutil.disk_usage = lambda p: type("U", (), {"free": 0})()
+        self.addCleanup(setattr, vct.shutil, "disk_usage", saved)
+        paths = ["/v/%s/f%d" % (d, i) for i in range(5) for d in "ab"]
+        with self.assertLogs(level="WARNING"):
+            out = list(vct.group_by_directory(iter(paths), self.spill, 3))
+        self.assertEqual(sorted(out), sorted(paths), "a path was lost or doubled")
+        self.assertEqual(os.listdir(self.spill), [])
+
+
+class StagingDirVanished(StagedReplace):
+    """A held staging directory idle past TMP_ORPHAN_MIN_AGE_S can be reclaimed
+    by another run. The next file must recreate it, not fail."""
+
+    # Only this test: the inherited ones already run under StagedReplace.
+    test_born_in_the_staging_dir_and_renamed_up = None
+    test_unstaged_is_the_sibling_path_unchanged = None
+    test_a_failed_copy_leaves_nothing = None
+
+    def test_recreated_when_reclaimed_under_a_hold(self):
+        vct.staging.hold(self.art)
+        p = vct.staging.acquire(self.art, self._Layout())
+        os.rmdir(p)                                    # another run reclaims it
+        vct.staging.release(self.art)                  # the hold is still there
+        with self.assertLogs(level="WARNING") as cm:
+            self._staged()
+        self.assertTrue(any("had vanished" in m for m in cm.output))
+        self.assertEqual(os.path.dirname(self.renames[0][0]), p)
+        self.assertTrue(os.path.isdir(p), "held, so it stays until the hold goes")
+        vct.staging.release(self.art)
+        self.assertFalse(os.path.exists(p))
+
+
+class WalkSurvivesAVanishedFile(StagingOnlyWithTargetPool):
+    """A file listed by os.walk and deleted before its stat is a vanished file,
+    as it already was for --paths-from -- not the end of the run."""
+
+    # Only this test: the inherited ones already run under their own class.
+    test_no_target_pool_never_stages = None
+    test_target_pool_elsewhere_stages = None
+    test_target_pool_equal_to_the_directory_does_not_stage = None
+    test_already_in_the_target_is_matched = None
+    test_a_staging_dir_is_never_walked = None
+    test_an_aged_staging_dir_is_reclaimed = None
+    test_a_user_dir_with_a_similar_name_is_walked = None
+    test_a_listed_path_inside_a_staging_dir_is_skipped = None
+
+    def test_deleted_between_listing_and_stat(self):
+        vct.staging = None
+        other = os.path.join(self.d, "e_gone")
+        open(other, "w").close()
+        real = os.stat
+
+        def racing_stat(p, *a, **kw):
+            if p == other:
+                raise FileNotFoundError(2, "No such file or directory", p)
+            return real(p, *a, **kw)
+        os.stat = racing_stat
+        self.addCleanup(setattr, os, "stat", real)
+        before = vct.stats.files_vanished
+        calls = self._walk(self._args())
+        self.assertEqual([c[1][0] for c in calls], [self.f])
+        self.assertEqual(vct.stats.files_vanished, before + 1)
+
+
+
+class PathsFromSurvivesAVanishedFile(StagingOnlyWithTargetPool):
+    """A listed file deleted between its stat and its layout read is vanished,
+    as in the walk -- a sweep of a live pool is where this happens most."""
+
+    test_no_target_pool_never_stages = None
+    test_target_pool_elsewhere_stages = None
+    test_target_pool_equal_to_the_directory_does_not_stage = None
+    test_already_in_the_target_is_matched = None
+    test_a_staging_dir_is_never_walked = None
+    test_an_aged_staging_dir_is_reclaimed = None
+    test_a_user_dir_with_a_similar_name_is_walked = None
+    test_a_listed_path_inside_a_staging_dir_is_skipped = None
+
+    def test_deleted_between_stat_and_layout_read(self):
+        vct.staging = None
+
+        def gone(cls, p):
+            raise FileNotFoundError(2, "No such file or directory", p)
+        vct.CephLayout.from_file = classmethod(gone)
+        before = vct.stats.files_vanished
+        self.assertEqual(self._paths(self._args()), [])
+        self.assertEqual(vct.stats.files_vanished, before + 1)
+
+
+class LivePoolListingWarns(PoolListingRace):
+    """A sweep reads a pool still being written: its end-of-listing checks are
+    expected to find fresh files without a backtrace, so WARNING, not ERROR."""
+
+    test_a_purged_object_is_skipped_not_fatal = None
+
+    def _unusable_run(self, root_pool):
+        def layout(path, name, **kw):
+            return root_pool.encode()
+        os.getxattr = layout
+        real = vct.decode_backtrace
+
+        def none_for_three(blob):
+            if int(blob, 16) == 0x10000000003:
+                raise vct.BacktraceError("fresh, not yet flushed")
+            return real(blob)
+        vct.decode_backtrace = none_for_three
+        args = Args(paths_from_pool="Q", rados_conffile=None, rados_mon_host=None,
+                    rados_keyring=None, rados_name=None, target_pool="R",
+                    max_size=614399)
+        with self.assertLogs(level="INFO") as cm:
+            list(vct._iter_pool_paths(args, [self.mp]))
+        return [r for r in cm.records if "could not be used" in r.getMessage()]
+
+    def test_a_sweep_of_the_write_target_warns(self):
+        recs = self._unusable_run("Q")
+        self.assertEqual([r.levelno for r in recs], [logging.WARNING])
+
+    def test_a_drain_still_errors(self):
+        """Control: off the write target the same finding is still an ERROR."""
+        recs = self._unusable_run("S")
+        self.assertEqual([r.levelno for r in recs], [logging.ERROR])
+
+
+
+class ReplicatedNameMatchesTheFilesystem(unittest.TestCase):
+    """With the roots' filesystem known, only ITS default-shaped pool reads as
+    replicated: cephfs.qlc.data has the shape but is not myvol's."""
+
+    def setUp(self):
+        self._saved = vct._pool_scheme
+        vct._pool_scheme = lambda pool: None
+
+    def tearDown(self):
+        vct._pool_scheme = self._saved
+
+    def test_only_the_roots_filesystem(self):
+        self.assertEqual(vct.target_pool_kind("cephfs.myvol.data", None, {"myvol"}),
+                         ("rep", "name, pinned to filesystem myvol"))
+        self.assertEqual(vct.target_pool_kind("cephfs.myvol.rdata", None, {"myvol"})[0],
+                         "rep")
+        self.assertEqual(vct.target_pool_kind("cephfs.a.b.data", None, {"a.b"})[0], "rep",
+                         "a filesystem name with a dot")
+        self.assertIsNone(vct.target_pool_kind("cephfs.qlc.data", None, {"myvol"})[0])
+        self.assertEqual(vct.target_pool_kind("cephfs.qlc.data", "ec", {"myvol"}),
+                         ("ec", "--target-pool-kind"))
+
+
+class PoolListingInheritedRootLayout(PoolListingRace):
+    """A root with no layout of its own writes where it inherits from. Both the
+    drain refusal and the live-pool level must see that."""
+
+    test_a_purged_object_is_skipped_not_fatal = None
+
+    def setUp(self):
+        super().setUp()
+        self._saved_glwu = vct.get_layout_walking_up
+        vct.get_layout_walking_up = lambda p: vct.CephLayout(
+            _L.replace("cephfs.v.ec4.2.qlc.data", "Q"))
+
+    def tearDown(self):
+        vct.get_layout_walking_up = self._saved_glwu
+        super().tearDown()
+
+    def test_a_drain_of_an_inherited_write_target_is_refused(self):
+        args = Args(paths_from_pool="Q", rados_conffile=None, rados_mon_host=None,
+                    rados_keyring=None, rados_name=None, target_pool=None,
+                    max_size=None)
+        with self.assertRaises(SystemExit) as cm:
+            list(vct._iter_pool_paths(args, [self.mp]))
+        self.assertIn("still the default write target", str(cm.exception))
+
+
+class VanishedDirectory(StagingOnlyWithTargetPool):
+    """A directory removed between being listed and its layout read is skipped,
+    in the walk and in --paths-from, not the end of the run."""
+
+    test_no_target_pool_never_stages = None
+    test_target_pool_elsewhere_stages = None
+    test_target_pool_equal_to_the_directory_does_not_stage = None
+    test_already_in_the_target_is_matched = None
+    test_a_staging_dir_is_never_walked = None
+    test_an_aged_staging_dir_is_reclaimed = None
+    test_a_user_dir_with_a_similar_name_is_walked = None
+    test_a_listed_path_inside_a_staging_dir_is_skipped = None
+
+    def _gone(self, *a, **kw):
+        raise FileNotFoundError(2, "No such file or directory")
+
+    def test_walk(self):
+        vct.staging = None
+        vct.CephLayout.from_dir = classmethod(lambda cls, p: self._gone())
+        vct.get_layout_walking_up = lambda d: self._gone()
+        with self.assertLogs(level="INFO") as cm:
+            self.assertEqual(self._walk(self._args()), [])
+        self.assertTrue(any("no longer exists" in m for m in cm.output))
+
+    def test_paths(self):
+        vct.staging = None
+        vct.get_layout_walking_up = lambda d: self._gone()
+        before = vct.stats.files_vanished
+        self.assertEqual(self._paths(self._args()), [])
+        self.assertEqual(vct.stats.files_vanished, before + 1)
+
+
+
+class PoolListingUnreadableRootIsSaid(PoolListingRace):
+    """An error other than "no layout here" leaves the root out of a check that
+    fails open, so it must be logged, not skipped silently."""
+
+    test_a_purged_object_is_skipped_not_fatal = None
+
+    def test_eacces_is_warned(self):
+        def denied(path, name, **kw):
+            raise PermissionError(13, "Permission denied")
+        os.getxattr = denied
+        args = Args(paths_from_pool="Q", rados_conffile=None, rados_mon_host=None,
+                    rados_keyring=None, rados_name=None, target_pool=None,
+                    max_size=None)
+        with self.assertLogs(level="WARNING") as cm:
+            list(vct._iter_pool_paths(args, [self.mp]))
+        self.assertTrue(any("left out of the write-target check" in m
+                            for m in cm.output), cm.output)
 
 
 if __name__ == "__main__":

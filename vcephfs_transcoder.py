@@ -10,7 +10,7 @@
 import errno, json, shlex, urllib.parse, urllib.request
 import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
-import threading, uuid, argparse
+import threading, uuid, argparse, heapq, tempfile
 
 _VERSION = "2112"
 
@@ -87,7 +87,9 @@ min_age_days = 1
 #     directory. It is freely settable, including on the volume root, which is
 #     how a transcode target is chosen.
 # Pointing the root layout at an EC pool changes where NEW files land. It does
-# NOT change the first data pool.
+# NOT change the first data pool. --target-pool overrides the target per run
+# without touching any directory's layout; see "--target-pool: stage in a
+# subdirectory" below.
 #
 # BACKTRACES. Every inode carries a backtrace -- the path from the inode to the
 # root, used for hard-link resolution, for path lookup when the inode is not in
@@ -309,6 +311,11 @@ def config_example(volume="VOLUME"):
         "# releases it, but never below this baseline.",
         "regulate_period_s   = %d" % REG_PERIOD_S_DEFAULT,
         "regulate_floor_ms   = %d" % REG_FLOOR_MS_DEFAULT,
+        "",
+        "# Clean samples in a row before easing the delay. Also how many nan",
+        "# samples a regulator pause needs before it resumes at 1 thread: nan",
+        "# means no MDS request completed, which a quiet volume and a stalled",
+        "# MDS look the same.",
         "regulate_quiet_ticks = %d" % REG_QUIET_TICKS_DEFAULT,
         "",
         "# Thread adaptivity, opt-in. 0 leaves the thread count exactly where",
@@ -320,9 +327,9 @@ def config_example(volume="VOLUME"):
         "regulate_max_threads = %d" % REG_MAX_THREADS_DEFAULT,
         "",
         "# A regulator pause with no usable sample (Prometheus down, empty",
-        "# result) for this long resumes at 1 thread instead of holding 0",
-        "# forever; the first usable sample restores the rest. 0 holds until",
-        "# a sample arrives.",
+        "# result, nan, or a mix) for this long resumes at 1 thread instead",
+        "# of holding 0 forever; the first usable sample restores the rest.",
+        "# 0 holds until a sample arrives.",
         "regulate_blind_resume_s = %d" % REG_BLIND_RESUME_S_DEFAULT,
         "",
     ))
@@ -569,6 +576,12 @@ class DynamicSemaphore:
         self._cond = threading.Condition(threading.RLock())
         self._limit = value
         self._value = value  # available permits
+        # Bumped by every limit write, including one that repeats the current
+        # value: an operator asking for 0 while the regulator already holds 0,
+        # or for 1 during its 1-thread probe, is intent the number cannot show.
+        # The regulator compares generations, not values, to tell its own
+        # pause or probe from the operator's.
+        self._gen = 0
 
     def acquire(self, cancel=None, tick=None):
         """Acquire a permit, blocking until one is available.
@@ -609,15 +622,48 @@ class DynamicSemaphore:
         with self._cond:
             return self._limit
 
+    @property
+    def gen(self):
+        with self._cond:
+            return self._gen
+
+    @property
+    def in_use(self):
+        """Permits held right now: the copies in flight."""
+        with self._cond:
+            return self._limit - self._value
+
+    def snapshot(self):
+        """(limit, generation), read together."""
+        with self._cond:
+            return self._limit, self._gen
+
     def set_limit(self, new_limit):
-        """Change the permit count.  If raised, blocked acquires may wake."""
+        """Change the permit count.  If raised, blocked acquires may wake.
+
+        Returns the new generation.
+        """
         with self._cond:
             delta = new_limit - self._limit
             self._limit = new_limit
             self._value += delta
+            self._gen += 1
             # Wake waiters if we added permits
             if delta > 0:
                 self._cond.notify_all()
+            return self._gen
+
+    def set_limit_if(self, gen, new_limit):
+        """set_limit(), unless something wrote the limit since generation gen.
+
+        Returns the new generation, or None when it lost that race. The check
+        and the write are one step under the lock, so an operator change that
+        lands between a caller's read and its write is never overwritten.
+        """
+        with self._cond:
+            if self._gen != gen:
+                return None
+            return self.set_limit(new_limit)
 
 # errno for "no data available" — ENODATA on Linux.
 # We check explicitly rather than hardcoding 61, which means ECONNREFUSED on
@@ -1002,7 +1048,26 @@ class CephLayout:
         self.stripe_count = int(vals["stripe_count"])
         self.object_size = int(vals["object_size"])
         self.pool = vals["pool"]
+        self.pool_namespace = vals.get("pool_namespace", "")
         self.layout = layout
+
+    def _fields(self):
+        return (self.stripe_unit, self.stripe_count, self.object_size,
+                self.pool, self.pool_namespace)
+
+    def with_pool(self, pool):
+        """This layout with only the pool changed: what --target-pool asks for.
+
+        Built as a layout string so __str__ and log mining see the same shape
+        a real xattr read returns.
+        """
+        if pool == self.pool:
+            return self
+        s = (f"stripe_unit={self.stripe_unit} stripe_count={self.stripe_count} "
+             f"object_size={self.object_size} pool={pool}")
+        if self.pool_namespace:
+            s += f" pool_namespace={self.pool_namespace}"
+        return CephLayout(s)
 
     @classmethod
     def from_dir(cls, path):
@@ -1043,13 +1108,16 @@ class CephLayout:
     def __str__(self):
         return self.layout
 
+    # Compared field by field, not as the raw xattr string. A layout built by
+    # with_pool() for --target-pool must match the layout a file read back after
+    # it landed there, however the kernel happens to format or order the string.
     def __eq__(self, other):
         if not isinstance(other, CephLayout):
             return NotImplemented
-        return self.layout == other.layout
+        return self._fields() == other._fields()
 
     def __hash__(self):
-        return hash(self.layout)
+        return hash(self._fields())
 
     def diff(self, other):
         diff = []
@@ -1068,6 +1136,99 @@ def get_layout_walking_up(path):
         parent = os.path.split(parent)[0]
         layout = CephLayout.from_dir(parent)
     return layout
+
+
+def target_layout(args, dir_layout):
+    """The layout a file under a directory with dir_layout should end up with.
+
+    Normally that is the directory's own layout. --target-pool replaces only the
+    pool, so a small-file pass can land on the replicated pool while the volume
+    root stays on EC and every other file keeps landing where it should.
+    """
+    pool = getattr(args, "target_pool", None)
+    if dir_layout is None or not pool:
+        return dir_layout
+    return dir_layout.with_pool(pool)
+
+
+# Shard-object yield floor. Every file moved to EC 4+2 goes from 3 pieces to
+# k+m+3 = 9 whatever its size; below ~600 KiB the bytes saved per extra piece
+# collapse (0.10-0.15 TB raw per million added pieces, against 13.2 above it,
+# measured 2026-09-18). So a replicated target takes only files below this, and
+# an EC target only files at or above it.
+YIELD_FLOOR_BYTES = 614400
+
+# Pool names on these clusters carry their profile, e.g. cephfs.x.ec4.2.qlc.data
+# for EC. Replicated is matched only on its plain shape, cephfs.<fs>.data or
+# cephfs.<fs>.rdata with nothing in between: EC pools end in .data too, so a
+# bare suffix match would read cephfs.x.qlc.data as replicated.
+_EC_POOL_NAME_RE = re.compile(r"\.ec\d+\.\d+(\.|$)")
+_REP_POOL_NAME_RE = re.compile(r"^cephfs\.([^.]+)\.r?data$")
+
+
+def target_pool_kind(pool, declared=None, fs_names=None):
+    """("rep" | "ec", how) for a --target-pool, or (None, why not).
+
+    The cluster decides when the ceph CLI is usable; a --target-pool-kind that
+    contradicts it is refused. Without the CLI -- the transcode hosts have none
+    -- the operator's --target-pool-kind decides, and failing that the pool's
+    name, but only on a POSITIVE match either way. Guessing is not safe in
+    either direction: an EC pool read as replicated would be sent exactly the
+    small files the yield floor exists to keep off EC. fs_names, the
+    filesystems the roots are on, pins the replicated shape to the actual
+    filesystem, so cephfs.qlc.data does not pass on its shape alone.
+    """
+    scheme = _pool_scheme(pool)
+    if scheme is not None:
+        kind = "rep" if scheme[0] == "rep" else "ec"
+        if declared and declared != kind:
+            return None, (f"--target-pool-kind {declared}, but the cluster "
+                          f"says {pool} is {kind}")
+        return kind, "cluster"
+    if declared:
+        return declared, "--target-pool-kind"
+    if _EC_POOL_NAME_RE.search(pool):
+        return "ec", "name"
+    if fs_names:
+        # Exact names, not the regex: a filesystem name may contain a dot.
+        if pool in {f"cephfs.{n}.{s}" for n in fs_names for s in ("data", "rdata")}:
+            return "rep", "name, pinned to filesystem %s" % ",".join(sorted(fs_names))
+    elif _REP_POOL_NAME_RE.match(pool):
+        # ceph-fuse, or a kernel mount of the default fs with no mds_namespace:
+        # nothing to pin to, and the startup line says so.
+        return "rep", "name, no filesystem pin (no mds_namespace on the mount)"
+    return None, (f"cannot tell whether {pool} is replicated or EC without the "
+                  f"ceph CLI; pass --target-pool-kind rep|ec")
+
+
+def target_pool_floor(src_pool, dst_pool):
+    """--min-size floor for an EC --target-pool: max(space crossover, yield)."""
+    src, dst = _pool_scheme(src_pool), _pool_scheme(dst_pool)
+    x = None
+    if src and dst:
+        x = size_crossover(src, dst, _min_alloc_hint() or 4096)
+    return max(x or 0, YIELD_FLOOR_BYTES)
+
+
+def target_pool_refusal(kind, floor, min_size, max_size, pool):
+    """Why a --target-pool run must not start with these bounds, or None.
+
+    The override sends every eligible file to one pool regardless of where its
+    directory points, so the size band is the only thing keeping it from moving
+    the whole volume to the wrong tier.
+    """
+    if kind == "rep":
+        if max_size is None:
+            return (f"--target-pool {pool} is replicated: give --max-size below "
+                    f"{YIELD_FLOOR_BYTES} so only small files move to it")
+        if max_size >= YIELD_FLOOR_BYTES:
+            return (f"--target-pool {pool} is replicated: --max-size {max_size} "
+                    f"must be below {YIELD_FLOOR_BYTES}")
+        return None
+    if min_size < floor:
+        return (f"--target-pool {pool} is EC: --min-size {min_size} is below "
+                f"the {floor}-byte floor")
+    return None
 
 
 def alloc_bytes(size, scheme, min_alloc):
@@ -1349,14 +1510,23 @@ class Regulator(threading.Thread):
         self._last_ceiling_decay = 0.0
         self._last_pressure_at = 0.0
         self._quiet = 0
-        self._last_err = 0.0
+        # Monotonic, like _blind_since. -inf so the first warning is not held
+        # back on a host whose monotonic clock is still small.
+        self._last_err = float("-inf")
         self._paused_threads = None
-        # When a regulator pause started going without a usable sample.
+        # Monotonic time a regulator pause last had a usable sample; None
+        # while it has one. nan counts as unusable here too, so nan and
+        # errors cannot keep resetting each other's clocks.
         self._blind_since = None
-        # nan samples in a row during a regulator pause; see _nan_while_paused().
+        # nan samples during a regulator pause since the last usable sample;
+        # see _nan_while_paused(). Errors do not reset it.
         self._nan_ticks = 0
         # What a 1-thread resume on no real evidence still owes; see _probing().
         self._probe_owed = None
+        # thread_count generation of the regulator's own last write while it
+        # holds a pause or probe. Any other write, even one repeating the
+        # value, is the operator's, and ends the regulator's claim.
+        self._own_gen = None
         # Learned ceiling for regulator-driven thread increases. A pause
         # lowers it and it never falls below the operator's own --threads
         # value. It moves UP two ways: immediately when the operator raises
@@ -1490,7 +1660,7 @@ class Regulator(threading.Thread):
         ceil = self._thread_ceiling()
         if not ceil:
             return
-        cur = thread_count.limit
+        cur, gen = thread_count.snapshot()
         if cur <= 0 or cur >= ceil:
             return
         if file_delay_ms > self.floor_ms:
@@ -1499,7 +1669,8 @@ class Regulator(threading.Thread):
         # measurement is under the soft target, not merely under the pause line.
         if lat >= self.args.regulate_slo_ms:
             return
-        thread_count.set_limit(cur + 1)
+        if thread_count.set_limit_if(gen, cur + 1) is None:
+            return      # the operator wrote the limit meanwhile; theirs stands
         _update_proctitle()
         logging.info(
             "Regulator: %.1f ms is under the %.0f ms target and the delay is at "
@@ -1518,72 +1689,148 @@ class Regulator(threading.Thread):
         # every tick; this is the same property for the ceiling's.
         self._last_pressure_at = time.time()
         extra = self._note_pause()
-        cur = thread_count.limit
-        if cur > 0:
-            # Pausing a 1-thread probe must not shrink what it still owes.
-            owed = self._probe_owed if self._probing() else None
-            self._probe_owed = None
-            self._paused_threads = max(cur, owed or 0)
-            self._lower_ceiling(cur)
-            thread_count.set_limit(0)
-            logging.warning(
-                "Regulator: PAUSE at %.1f ms (%.0f%% of the %.0f ms target) -- "
-                "threads %d -> 0, in-flight copies will finish%s",
-                lat, 100.0 * lat / self.args.regulate_slo_ms,
-                self.args.regulate_slo_ms, cur, extra)
+        # Pausing a 1-thread probe must not shrink what it still owes.
+        owed = self._probe_owed if self._probing() else None
+        for _ in range(3):
+            cur, gen = thread_count.snapshot()
+            if cur <= 0:
+                return
+            if gen != self._own_gen:
+                owed = None     # the operator replaced the probe; not ours
+            g = thread_count.set_limit_if(gen, 0)
+            if g is not None:
+                break
+            # The operator wrote the limit between the read and the write:
+            # pause from their value, so a resume gives back theirs.
+        else:
+            return
+        self._own_gen = g
+        self._probe_owed = None
+        self._paused_threads = max(cur, owed or 0)
+        self._lower_ceiling(cur)
+        logging.warning(
+            "Regulator: PAUSE at %.1f ms (%.0f%% of the %.0f ms target) -- "
+            "threads %d -> 0, in-flight copies will finish%s",
+            lat, 100.0 * lat / self.args.regulate_slo_ms,
+            self.args.regulate_slo_ms, cur, extra)
+
+    def _operator_took_over(self):
+        """True, and the claim dropped, once anyone else wrote thread_count."""
+        if self._own_gen is not None and thread_count.gen != self._own_gen:
+            self._paused_threads = self._probe_owed = self._own_gen = None
+            return True
+        return False
 
     def _paused_by_me(self):
         """True while threads sit at 0 because THIS regulator paused them.
 
-        The operator can resume in the meantime (SIGUSR1, or a threads edit in
-        --config). Forget the pause then, or a later operator pause reads as
-        ours and gets "resumed" on the next quiet sample.
+        The operator can take over in the meantime: SIGUSR1/SIGUSR2/SIGTSTP,
+        or a threads edit in --config, including one to 0 while the regulator
+        already holds 0. Forget the pause then, or the next quiet sample
+        resumes over the operator's own pause. Compared by generation, not
+        value: since the walker reads --config during a pause, "threads = 0"
+        arrives while the limit is already 0, and a value test cannot see it.
         """
-        if self._paused_threads and thread_count.limit != 0:
-            self._paused_threads = None
+        self._operator_took_over()
         return bool(self._paused_threads)
 
     def _probing(self):
-        """True while threads sit at the 1 that a no-evidence resume set.
+        """True while a no-evidence resume's probe still owes threads.
+
+        It starts at 1, and a soft-band sample may raise it to --threads.
 
         nan and a Prometheus outage both resume a regulator pause without any
         evidence the filesystem has recovered, so they bring back 1 thread,
         not the pause's full count. The rest is owed, and the first usable
         sample under the pause line pays it through _resume(). Without the
         debt, a job with thread adaptivity off (the default) stayed at 1
-        thread for good. As with _paused_by_me(), an operator change to the
-        thread count forgets it.
+        thread for good. As with _paused_by_me(), an operator write to the
+        thread count forgets it -- including SIGTSTP or "threads = 1", which
+        leave the value at 1.
         """
-        if self._probe_owed and thread_count.limit != 1:
-            self._probe_owed = None
+        self._operator_took_over()
         return bool(self._probe_owed)
 
+    def holding(self):
+        """True while the regulator holds a pause or a probe it will undo.
+
+        Read-only, for other threads: the regulator's own thread does the
+        forgetting.
+        """
+        gen = self._own_gen
+        return bool((self._paused_threads or self._probe_owed)
+                    and gen is not None and thread_count.gen == gen)
+
     def _resume_one(self):
-        """Take a regulator pause to 1 thread, owing the rest. Returns its count."""
+        """Take a regulator pause to 1 thread, owing the rest.
+
+        Returns the paused count, or None when the operator wrote the limit
+        after the caller's _paused_by_me(): theirs stands, and the pause is no
+        longer the regulator's to end.
+        """
         was = self._paused_threads
         self._paused_threads = None
-        thread_count.set_limit(1)
+        self._blind_since = None
+        self._nan_ticks = 0
+        g = thread_count.set_limit_if(self._own_gen, 1)
+        if g is None:
+            self._probe_owed = self._own_gen = None
+            return None
+        self._own_gen = g
         self._probe_owed = was if was > 1 else None
         _update_proctitle()
         return was
 
-    def _resume(self):
+    def _resume(self, pay_probe=True):
+        """End a regulator pause, or pay back what a 1-thread probe owes.
+
+        pay_probe=False is a soft-band sample: evidence the filesystem answers,
+        not that it has room for the full count, and the probe exists because
+        nan or an outage resumed with no evidence. It pays back only as far as
+        the operator's --threads, the floor _tighten() never sheds below
+        either; the rest waits for a sample under the target. Holding the
+        probe at 1 left a volume whose latency sits in the soft band below
+        --threads indefinitely, with nothing else to move it.
+        """
         if self._paused_by_me():
             want, cur = self._paused_threads, 0
         elif self._probing():
-            want, cur = self._probe_owed, 1
+            want, cur = self._probe_owed, thread_count.limit
+            if not pay_probe:
+                base = self._thread_base()
+                if cur >= base:
+                    return
+                if want > base:
+                    self._pay_to_base(cur, base)
+                    return
+                # Owed no more than --threads: the whole debt, as below.
         else:
             return
-        self._paused_threads = self._probe_owed = None
+        gen = self._own_gen
+        self._paused_threads = self._probe_owed = self._own_gen = None
         ceil = self._thread_ceiling()
-        if ceil and want > ceil:
-            thread_count.set_limit(ceil)
+        new = ceil if ceil and want > ceil else want
+        if thread_count.set_limit_if(gen, new) is None:
+            return      # the operator wrote the limit meanwhile; theirs stands
+        if new != want:
             logging.info(
                 "Regulator: resumed, threads %d -> %d (held under the %d it "
                 "paused at by the learned ceiling)", cur, ceil, want)
         else:
-            thread_count.set_limit(want)
             logging.info("Regulator: resumed, threads %d -> %d", cur, want)
+
+    def _pay_to_base(self, cur, base):
+        """Raise a probe to --threads, keeping the rest of its debt owed."""
+        g = thread_count.set_limit_if(self._own_gen, base)
+        if g is None:
+            self._probe_owed = self._own_gen = None
+            return      # the operator wrote the limit meanwhile; theirs stands
+        self._own_gen = g
+        _update_proctitle()
+        logging.info(
+            "Regulator: over the target but under the pause line, threads "
+            "%d -> %d (--threads); the other %d wait for a sample under the "
+            "target", cur, base, self._probe_owed - base)
 
     def _ease(self):
         global file_delay_ms
@@ -1639,10 +1886,11 @@ class Regulator(threading.Thread):
                     "delay %dms -> %dms", lat, self.args.regulate_slo_ms,
                     old, new)
                 return
-        cur = thread_count.limit
+        cur, gen = thread_count.snapshot()
         if cur <= self._thread_base():
             return
-        thread_count.set_limit(cur - 1)
+        if thread_count.set_limit_if(gen, cur - 1) is None:
+            return      # the operator wrote the limit meanwhile; theirs stands
         # Treat this the same as a pause for ceiling purposes, so the next
         # quiet spell does not climb straight back into the same latency.
         self._lower_ceiling(cur)
@@ -1725,8 +1973,12 @@ class Regulator(threading.Thread):
         So a regulator pause gets regulate_blind_resume_s of blindness, then
         resumes at 1 thread. The rest waits for a usable sample (_probing()),
         so that is as far as it goes blind.
+
+        nan is blind here too (_nan_while_paused() starts the same clock), so
+        a Prometheus alternating nan and errors still reaches the bound. The
+        clock is monotonic: a wall-clock step must not end or stretch it.
         """
-        now = time.time()
+        now = time.monotonic()
         if not self._paused_by_me():
             self._blind_since = None
             if now - self._last_err > REG_ERR_QUIET_S:
@@ -1748,16 +2000,22 @@ class Regulator(threading.Thread):
             return
         blind = now - self._blind_since
         if limit and blind >= limit:
-            self._blind_since = None
-            was = self._resume_one()
-            logging.error(
-                "Regulator: no usable sample for %ds while paused (%s) -- "
-                "resuming BLIND, threads 0 -> 1 (paused at %d); the rest waits "
-                "for a usable sample", blind, why, was)
+            self._resume_blind(blind, why)
         elif now - self._last_err > REG_ERR_QUIET_S:
             logging.warning("Regulator: still no usable sample (%s), paused "
                             "blind for %ds", why, blind)
             self._last_err = now
+
+    def _resume_blind(self, blind, why):
+        was = self._resume_one()
+        if was is None:
+            logging.info("Regulator: the operator set threads during the "
+                         "pause; not resuming blind over it")
+            return
+        logging.error(
+            "Regulator: no usable sample for %ds while paused (%s) -- "
+            "resuming BLIND, threads 0 -> 1 (paused at %d); the rest waits "
+            "for a usable sample", blind, why, was)
 
     def _nan_while_paused(self):
         """nan during our own pause: quiet, once it has lasted.
@@ -1767,10 +2025,17 @@ class Regulator(threading.Thread):
         holding on it was a pause that never ended. But an MDS that is
         stalled, or in replay/rejoin after a failover, completes nothing
         either, and that is what the pause is for. So it takes
-        regulate_quiet_ticks nan samples in a row, the same evidence a quiet
-        volume needs before easing, and then only 1 thread comes back.
+        regulate_quiet_ticks nan samples, the same evidence a quiet volume
+        needs before easing, and then only 1 thread comes back.
+
+        Counted since the last usable sample: an error in between neither
+        counts nor resets the streak, and nan does not reset the blind clock
+        either. When they reset each other, a Prometheus alternating nan and
+        errors reached neither bound and the pause held forever.
         """
-        self._blind_since = None
+        now = time.monotonic()
+        if self._blind_since is None:
+            self._blind_since = now
         self._nan_ticks += 1
         need = max(1, int(self.args.regulate_quiet_ticks))
         if self._nan_ticks == 1:
@@ -1779,9 +2044,18 @@ class Regulator(threading.Thread):
                 "completed in the query window; resuming at 1 thread if that "
                 "lasts %d samples", need)
         if self._nan_ticks < need:
+            # The blind bound stays a hard upper limit, even with
+            # regulate_quiet_ticks set longer than it.
+            limit = int(getattr(self.args, "regulate_blind_resume_s", 0) or 0)
+            blind = now - self._blind_since
+            if limit and blind >= limit:
+                self._resume_blind(blind, "query returned nan")
             return
-        self._nan_ticks = 0
         was = self._resume_one()
+        if was is None:
+            logging.info("Regulator: the operator set threads during the "
+                         "pause; not resuming over it")
+            return
         logging.warning(
             "Regulator: nan for %d samples while paused -- threads 0 -> 1 "
             "(paused at %d); the rest waits for a usable sample, since a "
@@ -1804,7 +2078,7 @@ class Regulator(threading.Thread):
                 do_exit.wait(period)
                 continue
             except Exception as e:
-                self._nan_ticks = 0
+                # No reset of _nan_ticks: an error is no evidence either way.
                 self._hold(_redact_text(e, self.args.regulate_prometheus_url))
                 do_exit.wait(period)
                 continue
@@ -1820,7 +2094,7 @@ class Regulator(threading.Thread):
                 # the target it is supposed to defend, and the only protection
                 # left was the pause cliff. Back off a step instead.
                 self._quiet = 0
-                self._resume()
+                self._resume(pay_probe=False)
                 self._tighten(lat)
             else:
                 self._resume()
@@ -2462,6 +2736,10 @@ def _recursive_stats(path):
         return None, None
 
 
+# A path that was there a moment ago and is not now. Counted as vanished, not
+# failed: on a live volume files are deleted under the walk all the time.
+_VANISHED_ERRNOS = (errno.ENOENT, errno.ESTALE, errno.ENOTDIR)
+
 TMP_SUFFIX = ".vcephfs-tc-tmp"
 # A staged temp file is ".<32 hex>.vcephfs-tc-tmp". Matching on the whole shape
 # rather than the suffix alone keeps reclamation from touching anything a user
@@ -2469,7 +2747,9 @@ TMP_SUFFIX = ".vcephfs-tc-tmp"
 TMP_RE = re.compile(r"^\.[0-9a-f]{32}" + re.escape(TMP_SUFFIX) + r"$")
 
 # Never reclaim a temp file younger than this: a concurrent job may be mid-copy
-# into it. No single file copy runs for a day.
+# into it. No single file copy runs for a day. Age is judged by ctime, not
+# mtime: copystat backdates a finished copy's mtime to its source's before the
+# rename, and nothing can set ctime, which every write, chown and link moves.
 TMP_ORPHAN_MIN_AGE_S = 24 * 3600
 
 _reclaimed_dirs = set()
@@ -2495,6 +2775,8 @@ RUN_JOURNAL_CHECKPOINT_CHANGES = 10000
 # one rewrite, and no sooner than this many times the last checkpoint's own
 # duration after it, so a large snapshot is not rewritten constantly.
 RUN_JOURNAL_PIN_DEBOUNCE_S = 5
+# How long the final append waits for another run's lock on the journal.
+RUN_JOURNAL_LOCK_WAIT_S = 30
 RUN_JOURNAL_PIN_SPACING = 10
 # Names an artifact root, matching retention_path_policy's own marker.
 RETENTION_MARKER = "RETENTION"
@@ -2522,8 +2804,10 @@ class RunJournal:
     sites stat every file ahead of any gating, so that ordering holds for the
     walk and for --paths-from alike.
 
-    note_write() must run AFTER each replace, because what the consumer needs is
-    the timestamp of the write whose value the MDS then stamped into rctime.
+    note_write() must run AFTER each change beneath an artifact -- a replace,
+    and also a temp file created and removed by one that did not go through --
+    because what the consumer needs is the timestamp of the write whose value
+    the MDS then stamped into rctime.
     Only that identifies which write an rctime is showing. The run's own
     start/end cannot: a run lasts days, so an rctime somewhere inside the window
     is as likely to be an owner write that landed mid-run as it is to be ours,
@@ -2544,6 +2828,17 @@ class RunJournal:
 
     Consuming this requires a matching change in the retention scripts; without
     that the journal is written but nothing reads it.
+
+    ROWS ARE KEYED BY (run, artifact): one per artifact per run. A reader must
+    skip blank lines and, defensively, lines that do not parse (an append that
+    ran unlocked because a lock holder hung). A reader that
+    also reads the per-run .partial checkpoints must dedupe on that key and
+    prefer the row without "partial": a live run's checkpoint and its later
+    final rows share a run id, and a final append that fails after writing
+    some rows leaves them in both. That reader belongs to retention, not to a
+    later transcoder run folding stale checkpoints in: a live run that makes
+    no record changes never rewrites its checkpoint, so a checkpoint's age
+    does not say whether its run is still alive.
     """
 
     def __init__(self, enabled, stop_at=()):
@@ -2567,6 +2862,15 @@ class RunJournal:
         self._wake = threading.Event()
         self._pin_pending = False
         self._ckpt_cost = 0.0
+        # Failed checkpoints in a row, and when the next pin retry may run.
+        # A fast failure (ENOSPC, EDQUOT, EROFS) costs ~0 s, so the cost
+        # spacing alone let it retry, and warn, every pin debounce.
+        self._ckpt_failures = 0
+        self._retry_at = 0.0
+        self._pin_debounce_s = RUN_JOURNAL_PIN_DEBOUNCE_S
+        # Volume roots whose checkpoint failure has already warned; a retry
+        # of one logs at DEBUG, a first failure on another still warns.
+        self._warned = set()
 
     def _artifact_root(self, dirpath):
         """Nearest ancestor holding a RETENTION file, or None.
@@ -2611,24 +2915,45 @@ class RunJournal:
         if root is None:
             return
         with self._lock:
-            rec = self._artifacts.get(root)
-            if rec is None:
-                # First sighting: nothing under this root has been touched yet,
-                # so this rctime is still the owner's, not ours.
-                rec = {"pre_rctime": read_rctime(root), "max_file_mtime": 0.0,
-                       "pinned_at": None}
-                self._artifacts[root] = rec
-                self._changes += 1
+            rec = self._first_sighting(root)
             if st.st_mtime > rec["max_file_mtime"]:
                 rec["max_file_mtime"] = st.st_mtime
                 self._changes += 1
 
+    def note_dir(self, dirpath):
+        """note_file() for a change to dirpath that no stat'd file precedes.
+
+        The walk sweeps a directory's orphans before it stats the directory's
+        files, so an artifact whose root holds an orphan would otherwise read
+        its pre_rctime after our own unlink.
+        """
+        if not self.enabled:
+            return
+        root = self._artifact_root(dirpath)
+        if root is None:
+            return
+        with self._lock:
+            self._first_sighting(root)
+
+    def _first_sighting(self, root):
+        """root's record, created on first sight. Caller holds _lock."""
+        rec = self._artifacts.get(root)
+        if rec is None:
+            # First sighting: nothing under this root has been touched yet,
+            # so this rctime is still the owner's, not ours.
+            rec = {"pre_rctime": read_rctime(root), "max_file_mtime": 0.0,
+                   "pinned_at": None}
+            self._artifacts[root] = rec
+            self._changes += 1
+        return rec
+
     def note_write(self, filepath):
-        """Record that we have just replaced a file beneath its artifact.
+        """Record that we have just changed filepath's directory.
 
         The last of these is the write rctime ends up showing, which is what
         lets the consumer tell our pin from an owner write. Called after the
-        rename, so a failed replace leaves no claim on the artifact -- and an
+        last change, whether that was a replace or a temp file created and
+        removed again by a replace that did not happen: both move rctime. An
         artifact this run only READ keeps pinned_at null, because its rctime is
         still the owner's and must go on being trusted.
 
@@ -2715,18 +3040,46 @@ class RunJournal:
                 return
             with self._lock:
                 self._changes = 0
-                self._pin_pending = False
+                pinned, self._pin_pending = self._pin_pending, False
                 self._last_checkpoint = time.monotonic()
             t0 = time.monotonic()
+            failed = False
             for volume_root, rows in self._rows_by_root(
                     list(roots), args, partial=True):
-                if not self._write_partial(volume_root, rows):
+                ok = self._write_partial(volume_root, rows,
+                                         quiet=volume_root in self._warned)
+                if ok:
+                    self._warned.discard(volume_root)
+                else:
+                    self._warned.add(volume_root)
+                    failed = True
                     with self._lock:
                         self._changes += 1     # retry next interval
-            self._ckpt_cost = time.monotonic() - t0
+                        # ... or sooner, if a first pin is what is
+                        # unrecorded: its pre_rctime is in memory only.
+                        self._pin_pending = self._pin_pending or pinned
+            now = time.monotonic()
+            self._ckpt_cost = now - t0
+            if failed:
+                # Back off: the pin debounce, doubling, up to the interval.
+                self._ckpt_failures += 1
+                self._retry_at = now + min(
+                    RUN_JOURNAL_CHECKPOINT_S, self._pin_debounce_s
+                    * 2 ** min(self._ckpt_failures - 1, 16))
+            else:
+                # A success from another trigger must not leave the next
+                # first pin waiting out a backoff that no longer applies.
+                self._retry_at = 0.0
+                if self._ckpt_failures:
+                    logging.info("Run journal checkpoint written again after "
+                                 "%d failed attempt(s)", self._ckpt_failures)
+                    self._ckpt_failures = 0
 
-    def _write_partial(self, volume_root, rows):
-        """Replace this run's checkpoint at volume_root via temp+fsync+rename."""
+    def _write_partial(self, volume_root, rows, quiet=False):
+        """Replace this run's checkpoint at volume_root via temp+fsync+rename.
+
+        quiet logs a failure at DEBUG: a retry of one already warned about.
+        """
         path = self._partial_path(volume_root)
         tmp = path + ".tmp"
         try:
@@ -2738,7 +3091,8 @@ class RunJournal:
             os.replace(tmp, path)
             return True
         except OSError as e:
-            logging.warning("Could not checkpoint run journal %s: %s", path, e)
+            (logging.debug if quiet else logging.warning)(
+                "Could not checkpoint run journal %s: %s", path, e)
             # A temp cut short (ENOSPC after open) is never read; drop it.
             try:
                 os.unlink(tmp)
@@ -2748,7 +3102,8 @@ class RunJournal:
 
     def start_checkpoints(self, roots, args, every_s=RUN_JOURNAL_CHECKPOINT_S,
                           every_changes=RUN_JOURNAL_CHECKPOINT_CHANGES,
-                          poll_s=10.0, pin_debounce_s=RUN_JOURNAL_PIN_DEBOUNCE_S):
+                          poll_s=1.0,
+                          pin_debounce_s=RUN_JOURNAL_PIN_DEBOUNCE_S):
         """Checkpoint in the background until write() runs.
 
         A thread, not a hook in the walk: a threads=0 pause parks the walker,
@@ -2759,9 +3114,18 @@ class RunJournal:
         moment, and a kill before the next periodic checkpoint lost the only
         pre_rctime it will ever have -- the record this whole thing exists
         to keep.
+
+        It polls every poll_s so a SIGTERM checkpoints within about a second:
+        the exit log invites a second signal, which kills outright.
+
+        Every trigger but the interval and do_exit waits until the last
+        checkpoint is RUN_JOURNAL_PIN_SPACING times its own duration old.
+        Each one rewrites every row, so on a volume with many artifacts an
+        unspaced change trigger rewrote roughly N^2/every_changes rows.
         """
         if not self.enabled or self._ckpt_thread is not None:
             return
+        self._pin_debounce_s = pin_debounce_s     # the failure backoff's base
 
         def loop():
             timeout = min(poll_s, every_s)
@@ -2778,21 +3142,23 @@ class RunJournal:
                     pending = self._pin_pending
                 timeout = min(poll_s, every_s)
                 pin_due = False
+                spaced = age >= RUN_JOURNAL_PIN_SPACING * self._ckpt_cost
                 if not pending:
                     pin_seen = None
                 else:
                     if pin_seen is None:
                         pin_seen = now
                     left = max(pin_debounce_s - (now - pin_seen),
-                               RUN_JOURNAL_PIN_SPACING * self._ckpt_cost - age)
+                               RUN_JOURNAL_PIN_SPACING * self._ckpt_cost - age,
+                               self._retry_at - now)
                     if left > 0:
                         timeout = min(timeout, left)
                     else:
                         pin_due = True
                 # Once do_exit is set, systemd may SIGKILL the drain of
                 # in-flight copies before write() is reached: stop waiting.
-                if n and (pin_due or n >= every_changes or age >= every_s
-                          or do_exit.is_set()):
+                if n and (pin_due or (n >= every_changes and spaced)
+                          or age >= every_s or do_exit.is_set()):
                     pin_seen = None
                     try:
                         self.checkpoint(roots, args)
@@ -2804,7 +3170,20 @@ class RunJournal:
         self._ckpt_thread.start()
 
     def write(self, roots, args):
-        """Append this run's records to a journal at each volume root."""
+        """Append this run's records to a journal at each volume root.
+
+        Under an exclusive flock on the journal, which CephFS enforces across
+        clients through the MDS: O_APPEND alone orders appends within one
+        kernel, and runs on other hosts append to the same volume root. The
+        lock also covers the mid-line check, so a run appending between the
+        check and the write cannot leave a stray blank line.
+
+        If an earlier append died partway, the journal ends mid-line; a newline
+        goes first, or the fragment and this run's first row fuse into one line
+        no reader can parse. A lock not granted within RUN_JOURNAL_LOCK_WAIT_S
+        (a hung holder) is logged and the append goes ahead unlocked: losing
+        the record is worse than risking an interleave.
+        """
         if not self.enabled:
             return
         self._stop.set()
@@ -2814,13 +3193,22 @@ class RunJournal:
             for volume_root, rows in self._rows_by_root(roots, args):
                 journal = os.path.join(volume_root, RUN_JOURNAL_NAME)
                 try:
-                    with open(journal, "a") as fh:
-                        for row in rows:
-                            fh.write(json.dumps(row, sort_keys=True) + "\n")
+                    data = "".join(json.dumps(row, sort_keys=True) + "\n"
+                                   for row in rows).encode()
+                    fd = os.open(journal,
+                                 os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+                    try:
+                        # On failure it logs, and the append goes ahead.
+                        _lock_journal(fd, journal)
+                        if _fd_ends_mid_line(fd):
+                            data = b"\n" + data
+                        while data:
+                            data = data[os.write(fd, data):]
                         # Durable before the checkpoint goes: the unlink is an
                         # MDS op, and these bytes may still be dirty pages.
-                        fh.flush()
-                        os.fsync(fh.fileno())
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
                     logging.info("Wrote %d artifact record(s) to %s",
                                  len(rows), journal)
                 except OSError as e:
@@ -2829,8 +3217,9 @@ class RunJournal:
                     # The checkpoint is now the only record, so bring it up to
                     # date: the last periodic one misses everything since, and
                     # a run shorter than the interval never wrote one.
-                    self._write_partial(
-                        volume_root, [dict(r, partial=True) for r in rows])
+                    marked = [dict(r, partial=True) for r in rows]
+                    if not self._write_partial(volume_root, marked):
+                        _log_lost_rows(volume_root, rows)
                     continue
                 try:
                     os.unlink(self._partial_path(volume_root))
@@ -2840,6 +3229,49 @@ class RunJournal:
                     logging.warning("Could not remove run journal checkpoint "
                                     "%s: %s", self._partial_path(volume_root), e)
 
+
+def _fd_ends_mid_line(fd):
+    """True if fd's file is non-empty and its last byte is not a newline."""
+    size = os.fstat(fd).st_size
+    return size > 0 and os.pread(fd, 1, size - 1) != b"\n"
+
+
+def _lock_journal(fd, path):
+    """flock(LOCK_EX) on fd, for up to RUN_JOURNAL_LOCK_WAIT_S. True if held.
+
+    Released by the close that follows the append.
+    """
+    deadline = time.monotonic() + RUN_JOURNAL_LOCK_WAIT_S
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                logging.warning("Run journal %s still locked after %ds; "
+                                "appending without the lock", path,
+                                RUN_JOURNAL_LOCK_WAIT_S)
+                return False
+            time.sleep(0.1)
+        except OSError as e:
+            logging.warning("Could not lock run journal %s (%s); appending "
+                            "without the lock", path, e)
+            return False
+
+
+def _log_lost_rows(volume_root, rows):
+    """Last resort when the journal and its checkpoint both failed.
+
+    pre_rctime cannot be recovered once the run is gone, and the log usually
+    lives on another device than the volume that just refused two writes.
+    """
+    logging.error("Run journal LOST at %s: the append and the checkpoint both "
+                  "failed; its %d record(s) follow, one per line", volume_root,
+                  len(rows))
+    keys = ("run", "artifact", "pre_rctime", "max_file_mtime", "pinned_at")
+    for row in rows:
+        logging.error("run-journal record: %s", json.dumps(
+            {k: row.get(k) for k in keys}, sort_keys=True))
 
 
 def _reclaim_named(dirpath, names):
@@ -2863,7 +3295,7 @@ def _reclaim_named(dirpath, names):
             st = os.lstat(p)
             if not stat.S_ISREG(st.st_mode):
                 continue
-            if now - st.st_mtime < TMP_ORPHAN_MIN_AGE_S:
+            if now - st.st_ctime < TMP_ORPHAN_MIN_AGE_S:
                 continue
             os.unlink(p)
             count += 1
@@ -2884,7 +3316,7 @@ def reclaim_orphans(dirpath):
     """
     with _reclaimed_lock:
         if dirpath in _reclaimed_dirs:
-            return
+            return 0
         _reclaimed_dirs.add(dirpath)
     now = time.time()
     count = 0
@@ -2895,17 +3327,253 @@ def reclaim_orphans(dirpath):
             try:
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                if now - entry.stat(follow_symlinks=False).st_mtime < TMP_ORPHAN_MIN_AGE_S:
+                if (now - entry.stat(follow_symlinks=False).st_ctime
+                        < TMP_ORPHAN_MIN_AGE_S):
                     continue
                 os.unlink(entry.path)
                 count += 1
             except OSError:
                 pass
     except OSError:
-        return
+        pass
     if count:
         logging.info(f"Reclaimed {count} orphaned temp file(s) from {dirpath}")
+    return count
 
+
+# --- --target-pool: stage in a subdirectory, never switch a file's pool ------
+#
+# --target-pool sends a file to a pool its directory does not point at. The
+# obvious way -- create the sibling temp as usual, then set its
+# ceph.file.layout.pool -- leaves a permanent object behind. Setting a file's
+# layout records the pool it had in old_pools (Server.cc handle_set_vxattr ->
+# add_old_pool), and the MDS writes the file's backtrace into every old pool
+# for as long as the file exists. A small file swept from QLC to replicated
+# would leave a zero-byte 4+2 object (six shards) in QLC, so the sweep would
+# not lower QLC's object count at all.
+#
+# So the temp is CREATED where it already inherits the target: a hidden staging
+# subdirectory of the file's own directory, `.vcephfs-tc-stage-<run>`, made with
+# ceph.dir.layout.pool set to the target. Setting only the pool keeps the
+# directory's inherited stripe settings (the MDS starts from the inherited
+# layout). The finished copy is renamed up into the parent, so the user's
+# directory layouts are never written and new files there keep landing where
+# they always did. The staging directory is shared by every file of its
+# directory in flight, and removed when the last one finishes.
+STAGE_PREFIX = ".vcephfs-tc-stage-"
+STAGE_RE = re.compile(r"^" + re.escape(STAGE_PREFIX) + r"[0-9a-f]{16}$")
+
+
+class StagingDirs:
+    """Reference-counted staging subdirectories, one per directory touched.
+
+    A reference is held by each file in flight and, for the directory the
+    producer is currently on, by the producer itself -- so a directory's files
+    share one staging directory instead of making and removing one each. It is
+    created lazily on the first file that needs it, and removed when the count
+    returns to zero.
+    """
+
+    def __init__(self, run_id):
+        self.name = STAGE_PREFIX + run_id
+        self._lock = threading.Lock()
+        self._refs = {}
+        self._made = {}
+        self._stripes = [threading.Lock() for _ in range(_REPLACE_LOCK_STRIPES)]
+
+    def _stripe(self, dirpath):
+        return self._stripes[hash(dirpath) % len(self._stripes)]
+
+    def hold(self, dirpath):
+        with self._lock:
+            self._refs[dirpath] = self._refs.get(dirpath, 0) + 1
+
+    def acquire(self, dirpath, layout):
+        """Take a reference and return the staging directory, creating it."""
+        self.hold(dirpath)
+        try:
+            with self._stripe(dirpath):
+                with self._lock:
+                    path = self._made.get(dirpath)
+                if path is None:
+                    path = self._create(dirpath, layout)
+                    with self._lock:
+                        self._made[dirpath] = path
+            return path
+        except Exception:
+            self.release(dirpath)
+            raise
+
+    def _create(self, dirpath, layout):
+        path = os.path.join(dirpath, self.name)
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        try:
+            os.setxattr(path, "ceph.dir.layout.pool", layout.pool.encode("utf-8"),
+                        follow_symlinks=False)
+            got = CephLayout.from_dir(path)
+            if got != layout:
+                # Only the pool was set, so anything else that differs came
+                # from the MDS not starting where it should. Set every field
+                # rather than stage into the wrong layout.
+                for attr in ("stripe_unit", "stripe_count", "object_size", "pool"):
+                    os.setxattr(path, f"ceph.dir.layout.{attr}",
+                                str(getattr(layout, attr)).encode("utf-8"),
+                                follow_symlinks=False)
+                got = CephLayout.from_dir(path)
+                if got != layout:
+                    raise RuntimeError(
+                        f"staging layout did not apply to {path}: wanted "
+                        f"{layout}, read back {got}")
+        except Exception:
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
+            raise
+        return path
+
+    def recreate(self, dirpath, layout):
+        """Make dirpath's staging directory again after it vanished.
+
+        A held directory goes idle during a long pause -- threads = 0 over a
+        weekend -- and after TMP_ORPHAN_MIN_AGE_S another run walking the same
+        tree reclaims it as a killed run's leftover. Caught where it shows, at
+        the temp's open, so the common path pays no stat for it.
+        """
+        with self._stripe(dirpath):
+            path = self._create(dirpath, layout)
+            with self._lock:
+                self._made[dirpath] = path
+        logging.warning(f"Staging directory {path} had vanished; recreated it")
+        return path
+
+    def release(self, dirpath):
+        """Drop a reference; True if this removed the staging directory."""
+        with self._stripe(dirpath):
+            with self._lock:
+                n = self._refs.get(dirpath, 0) - 1
+                if n > 0:
+                    self._refs[dirpath] = n
+                    return False
+                self._refs.pop(dirpath, None)
+                path = self._made.pop(dirpath, None)
+            if path is None:
+                return False
+            try:
+                os.rmdir(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logging.warning(f"Could not remove staging directory {path}: {e}")
+            return True
+
+    def remove_all(self):
+        """Remove whatever is still made. Every exit Python gets to run."""
+        with self._lock:
+            left = list(self._made.items())
+            self._made.clear()
+            self._refs.clear()
+        for _dirpath, path in left:
+            try:
+                os.rmdir(path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logging.warning(f"Could not remove staging directory {path}: {e}")
+        return [d for d, _ in left]
+
+
+staging = None
+
+
+def _release_hold(dirpath):
+    """Drop the producer's hold on dirpath, journaling a removal it causes."""
+    if dirpath is None or staging is None:
+        return
+    if staging.release(dirpath) and run_journal is not None:
+        run_journal.note_write(os.path.join(dirpath, staging.name))
+
+
+def _group_spill_dir(args):
+    """Local disk for group_by_directory's sorted runs: beside the log, which
+    is where the lists live, else the system temp dir. Never the CephFS volume."""
+    if getattr(args, "log_file", None):
+        return os.path.dirname(os.path.abspath(args.log_file))
+    return tempfile.gettempdir()
+
+
+def tmpdir_conflicts(args, tmpdir_pool):
+    """(dir, pool) for each root whose target pool is the tmpdir's pool.
+
+    Both reasons for the check are about temps staged IN the tmpdir. A staged
+    --target-pool run never puts one there: its temps are born in a staging
+    subdirectory, a no-op rewrite is already skipped as a layout match, and the
+    read-back in _verify_layout() is what catches a layout that did not take.
+    And its usual target, the replicated pool, IS the default pool the tmpdir
+    is supposed to be on, so checking it would refuse the main use case.
+    """
+    if getattr(args, "target_pool", None) and not args.stage_in_tmpdir:
+        return []
+    out = []
+    for d in args.dirs:
+        target = target_layout(args, get_layout_walking_up(d))
+        if target is not None and target.pool == tmpdir_pool:
+            out.append((d, target.pool))
+    return out
+
+
+def probe_target_pool(pool, where):
+    """None if a file can be born in pool under where, else why not.
+
+    Exercises the exact mechanism staging uses -- a directory set to the pool, a
+    file created inside it, its layout read back -- so a pool the filesystem
+    does not have, or one the client cannot write, fails here at startup rather
+    than once per file for the length of the run.
+    """
+    probe = os.path.join(where, STAGE_PREFIX + uuid.uuid4().hex[:16])
+    f = os.path.join(probe, f".{uuid.uuid4().hex}{TMP_SUFFIX}")
+    try:
+        os.mkdir(probe, 0o700)
+        try:
+            os.setxattr(probe, "ceph.dir.layout.pool", pool.encode("utf-8"),
+                        follow_symlinks=False)
+            with open(f, "wb"):
+                pass
+            got = CephLayout.from_file(f)
+            if got is None or got.pool != pool:
+                return f"a file created under {probe} landed in {got and got.pool}"
+        finally:
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+            os.rmdir(probe)
+    except OSError as e:
+        return f"{probe}: {e}"
+    return None
+
+
+def reclaim_staging_orphan(path):
+    """Remove an aged staging directory a killed run left behind.
+
+    Aged by ctime like temp files: any create, rename or unlink inside moves
+    it, so a staging directory still in use is never this old. Only our own
+    temp files are unlinked from it, and rmdir refuses anything else.
+    """
+    try:
+        if time.time() - os.lstat(path).st_ctime < TMP_ORPHAN_MIN_AGE_S:
+            return False
+        for entry in os.scandir(path):
+            if TMP_RE.match(entry.name) and entry.is_file(follow_symlinks=False):
+                os.unlink(entry.path)
+        os.rmdir(path)
+    except OSError:
+        return False
+    logging.info(f"Reclaimed orphaned staging directory {path}")
+    return True
 
 
 def _tmp_path_for(args, target):
@@ -2929,21 +3597,137 @@ def _apply_and_verify_layout(layout, path):
     explicit -- which is the stronger of the two.
     """
     layout.apply_file(path)
+    _verify_layout(layout, path)
+
+
+def _verify_layout(layout, path):
     got = CephLayout.from_file(path)
     if got != layout:
         raise RuntimeError(
             f"layout did not apply to {path}: wanted {layout}, read back {got}")
 
 
-def process_file(args, filepaths, st, layout, file_layout):
+def _undo_partial_relink(args, filepaths, st, new_id, link_tmps, err):
+    """Rejoin a hard-link set after a rename failed partway through it.
+
+    err is the rename's exception, for the log. Returns (names found on the
+    new inode, whose directories changed; whether the replace in fact
+    completed). It completed if every name is already on
+    the new inode: the last rename took effect and still raised.
+
+    Which names moved is read from their inodes, not from which renames
+    returned: a rename can take effect and still raise. A name still on the
+    ORIGINAL inode is linked back over each one that moved, which puts the set
+    back as if the replace had never started. A name on neither inode was
+    replaced by someone else and is left alone. Staged links that were never
+    renamed are removed either way. If the set does not end whole on the
+    original, say exactly how it split: nothing else will notice two inodes
+    with identical contents.
+    """
+    for link_tmp, _ in link_tmps:
+        try:
+            os.unlink(link_tmp)
+        except OSError:
+            pass
+
+    orig_id = (st.st_dev, st.st_ino)
+
+    def _on(ident):
+        out = []
+        for path in filepaths:
+            try:
+                s = os.lstat(path)
+            except OSError:
+                continue
+            if (s.st_dev, s.st_ino) == ident:
+                out.append(path)
+        return out
+
+    moved = _on(new_id)
+    if not moved:
+        return moved, False
+    if len(moved) == len(filepaths):
+        logging.warning(
+            f"A rename in the replace of {filepaths[0]} raised ({err}), but "
+            f"all {len(filepaths)} name(s) are on the new inode; the replace "
+            "completed")
+        return moved, True
+    try:
+        src = next(iter(_on(orig_id)), None)
+        if src is None:
+            raise FileNotFoundError("no name still holds the original inode")
+        for path in moved:
+            stage = _tmp_path_for(args, path)
+            os.link(src, stage, follow_symlinks=False)
+            try:
+                os.rename(stage, path)
+            except Exception:
+                try:
+                    os.unlink(stage)
+                except OSError:
+                    pass
+                raise
+        if len(_on(orig_id)) != len(filepaths):
+            raise RuntimeError("not every name is on the original inode")
+    except Exception as e:
+        orig, new = _on(orig_id), _on(new_id)
+        other = [p for p in filepaths if p not in orig and p not in new]
+        logging.error(
+            f"Hard links of {filepaths[0]} are SPLIT: "
+            f"{', '.join(new) or 'none'} on the new inode, "
+            f"{', '.join(orig) or 'none'} on the original"
+            + (f", {', '.join(other)} on neither" if other else "")
+            + f", after a rename raised ({err}). Could not rejoin them "
+            f"({e}); relink by hand.")
+        return moved, False
+    logging.warning(
+        f"A rename in the replace of {filepaths[0]} raised ({err}); all "
+        f"{len(filepaths)} names are back on the original inode")
+    return moved, False
+
+
+def process_file(args, filepaths, st, layout, file_layout, stage=False):
+    # Every target whose directory this call changes. A sibling temp, a staged
+    # link and a swept orphan move that directory's rctime as surely as the
+    # replace does, and they happen before the dry-run, lock-skip,
+    # source-changed and error exits. So each is claimed in the journal after
+    # the call's last change, whether or not the replace went through.
+    #
+    # stage: the file's directory does not point at layout's pool (only ever
+    # under --target-pool), so the temp is made in a staging subdirectory.
+    touched = set()
+    stage_dir = None
+    try:
+        if stage and staging is not None and not do_exit.is_set():
+            # acquire() drops its own reference if it raises, so a reference
+            # is released below exactly when one was taken.
+            stage_dir = staging.acquire(os.path.dirname(filepaths[0]), layout)
+            touched.add(filepaths[0])
+        _replace_file(args, filepaths, st, layout, file_layout, touched,
+                      stage_dir)
+    finally:
+        if (stage_dir is not None
+                and staging.release(os.path.dirname(filepaths[0]))):
+            touched.add(filepaths[0])
+        if run_journal is not None:
+            for path in touched:
+                run_journal.note_write(path)
+
+
+def _replace_file(args, filepaths, st, layout, file_layout, touched,
+                  stage_dir=None):
     if do_exit.is_set():
         return
 
     if not args.stage_in_tmpdir:
         # Covers both the walk and --paths-from, which has no walk to hook.
-        reclaim_orphans(os.path.dirname(filepaths[0]))
+        if reclaim_orphans(os.path.dirname(filepaths[0])):
+            touched.add(filepaths[0])
 
-    tmp_file = _tmp_path_for(args, filepaths[0])
+    if stage_dir is not None:
+        tmp_file = os.path.join(stage_dir, f".{uuid.uuid4().hex}{TMP_SUFFIX}")
+    else:
+        tmp_file = _tmp_path_for(args, filepaths[0])
 
     if len(filepaths) == 1:
         logging.info(
@@ -2955,8 +3739,24 @@ def process_file(args, filepaths, st, layout, file_layout):
         )
 
     try:
-        with open(tmp_file, "wb") as ofd:
-            _apply_and_verify_layout(layout, tmp_file)
+        try:
+            ofd = open(tmp_file, "wb")
+        except FileNotFoundError:
+            if stage_dir is None:
+                raise
+            staging.recreate(os.path.dirname(filepaths[0]), layout)
+            ofd = open(tmp_file, "wb")
+        with ofd:
+            if not args.stage_in_tmpdir:
+                touched.add(filepaths[0])
+            tmp_st = os.fstat(ofd.fileno())
+            if stage_dir is None:
+                _apply_and_verify_layout(layout, tmp_file)
+            else:
+                # Born in the target via the staging directory's layout, so
+                # there is nothing to apply -- applying would record an old
+                # pool. Reading it back is still the check that matters.
+                _verify_layout(layout, tmp_file)
             with open(filepaths[0], "rb") as ifd:
                 with stats._lock:
                     stats.files_submitted += 1
@@ -2988,8 +3788,10 @@ def process_file(args, filepaths, st, layout, file_layout):
                 copy_elapsed = time.monotonic() - copy_start
                 # Lock released when ifd is closed
 
-        shutil.copystat(filepaths[0], tmp_file, follow_symlinks=False)
+        # chown first: it clears setuid/setgid and drops security.capability,
+        # so a chown after copystat stripped what copystat had just copied.
         os.chown(tmp_file, st.st_uid, st.st_gid)
+        shutil.copystat(filepaths[0], tmp_file, follow_symlinks=False)
 
         # The per-copy rate and copy method were here to show whether
         # copy_file_range (server-side copy) was actually faster in practice.
@@ -3024,10 +3826,11 @@ def process_file(args, filepaths, st, layout, file_layout):
 
     with _replace_lock_for(filepaths[0]):
         try:
-            # Block SIGINT in this thread to reduce the chance of EINTR during
-            # the rename sequence.  Note: Python's signal handler runs on the
-            # main thread regardless, so this is primarily belt-and-suspenders.
-            signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGINT])
+            # Block the exit signals in this thread to reduce the chance of
+            # EINTR during the rename sequence.  Note: Python's signal handler
+            # runs on the main thread regardless, so this is primarily
+            # belt-and-suspenders.
+            signal.pthread_sigmask(signal.SIG_BLOCK, _EXIT_SIGNALS)
             st2 = os.stat(filepaths[0], follow_symlinks=False)
             # Check mtime, ctime, and size for a more robust change-detection
             if (
@@ -3096,6 +3899,8 @@ def process_file(args, filepaths, st, layout, file_layout):
                     logging.info(f"Linking {tmp_file} -> {path}")
                     os.link(tmp_file, link_tmp, follow_symlinks=False)
                     link_tmps.append((link_tmp, path))
+                    if not args.stage_in_tmpdir:
+                        touched.add(path)
             except Exception:
                 # Clean up the links already staged. Leaving them to the
                 # orphan reclaimer works, but only after
@@ -3111,16 +3916,20 @@ def process_file(args, filepaths, st, layout, file_layout):
                 raise
 
             logging.info(f"Renaming {tmp_file} -> {filepaths[0]}")
-            os.rename(tmp_file, filepaths[0])
-            for link_tmp, path in link_tmps:
-                os.rename(link_tmp, path)
-
-            if run_journal is not None:
-                # After the renames: this is the write rctime now reflects.
-                # Hard links can sit under different artifacts, so every target
-                # is claimed, not just the first.
-                for path in filepaths:
-                    run_journal.note_write(path)
+            try:
+                os.rename(tmp_file, filepaths[0])
+                for link_tmp, path in link_tmps:
+                    os.rename(link_tmp, path)
+            except Exception as e:
+                moved, completed = _undo_partial_relink(
+                    args, filepaths, st, (tmp_st.st_dev, tmp_st.st_ino),
+                    link_tmps, e)
+                touched.update(moved)
+                if not completed:
+                    raise
+            # Hard links can sit under different artifacts, so every target
+            # is claimed, not just the first.
+            touched.update(filepaths)
 
             with stats._lock:
                 stats.files_transcoded += 1
@@ -3135,7 +3944,7 @@ def process_file(args, filepaths, st, layout, file_layout):
                 pass
             raise
         finally:
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, [signal.SIGINT])
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, _EXIT_SIGNALS)
 
 
 def handler(future):
@@ -3414,6 +4223,29 @@ def _prefix_error(checked, example):
             "that moved nothing." % (checked, example))
 
 
+def write_target_refusal(args, pool, root, cur):
+    """Why --paths-from-pool must not read pool for root, or None.
+
+    cur is root's ceph.dir.layout.pool. A pool that is still the default write
+    target cannot be DRAINED -- new files keep landing in it -- so that is
+    refused. A --target-pool sweep of small files is the exception: it is not
+    meant to converge to empty, only to take what is there now.
+    """
+    if cur != pool:
+        return None
+    if (getattr(args, "target_pool", None) and args.target_pool != pool
+            and args.max_size is not None):
+        logging.info(
+            "--paths-from-pool %s is still the default write target of %s; "
+            "allowed for a --target-pool %s sweep of files up to %d bytes",
+            pool, root, args.target_pool, args.max_size)
+        return None
+    return ("--paths-from-pool %s is still the default write target of %s. New "
+            "files keep landing in it, so a drain cannot converge and the list "
+            "would be stale immediately. Repoint ceph.dir.layout.pool first."
+            % (pool, root))
+
+
 def _iter_pool_paths(args, roots):
     """Yield the CephFS path of every file currently in args.paths_from_pool.
 
@@ -3449,17 +4281,35 @@ def _iter_pool_paths(args, roots):
     conffile, conf_over = _ceph_connect_args(args.rados_conffile, roots[0],
                                              args.rados_mon_host)
 
+    # A sweep reads a pool that is still being written, where the end-of-listing
+    # checks below cannot be told from damage: a file created mid-listing has
+    # no backtrace yet, and one created or deleted then can show some stripe
+    # objects without its bno-0. Expected there, so said at WARNING.
+    live = False
     for r in roots:
         try:
             cur = os.getxattr(r, "ceph.dir.layout.pool").decode()
-        except OSError:
-            continue
-        if cur == pool:
-            raise SystemExit(
-                "--paths-from-pool %s is still the default write target of %s. New "
-                "files keep landing in it, so a drain cannot converge and the list "
-                "would be stale immediately. Repoint ceph.dir.layout.pool first."
-                % (pool, r))
+        except OSError as e:
+            # No layout of its own: the root writes where it inherits from,
+            # which is what both the drain refusal and `live` are about. Any
+            # other error leaves the root out of a check that fails open, so
+            # it is said, not skipped silently.
+            lay = None
+            if e.errno == ENODATA:
+                try:
+                    lay = get_layout_walking_up(r)
+                except OSError as e2:
+                    e = e2
+            if lay is None:
+                logging.warning(
+                    "%s: cannot read its layout pool (%s); left out of the "
+                    "write-target check", r, e)
+                continue
+            cur = lay.pool
+        live = live or cur == pool
+        why = write_target_refusal(args, pool, r, cur)
+        if why:
+            raise SystemExit(why)
         snapdir = os.path.join(r, ".snap")
         try:
             snaps = [e for e in os.listdir(snapdir) if not e.startswith("_")]
@@ -3491,6 +4341,7 @@ def _iter_pool_paths(args, roots):
     last_unresolved = None
     first_objs = 0
     unusable = 0
+    vanished = 0
     yielded = 0
     checked = 0
     resolved = 0
@@ -3526,6 +4377,14 @@ def _iter_pool_paths(args, roots):
             except rados.NoData:
                 logging.warning("%s has no %s xattr; skipping", key, BACKTRACE_XATTR)
                 unusable += 1
+                continue
+            except rados.ObjectNotFound:
+                # Listed, then gone before its backtrace was read: a file
+                # deleted, or transcoded away, and purged mid-listing. A pool
+                # that is still being written -- what a --target-pool sweep
+                # reads by design -- does this all the time. Nothing to emit,
+                # and nothing left holding the pool.
+                vanished += 1
                 continue
             try:
                 bt_ino, names, _pool = decode_backtrace(blob)
@@ -3575,22 +4434,27 @@ def _iter_pool_paths(args, roots):
             logging.warning(
                 "bno-0 cross-check skipped: more than %d distinct inodes",
                 INODE_TRACK_MAX)
+        level = logging.WARNING if live else logging.ERROR
+        note = (" Expected for files written during the listing of a pool "
+                "that is still being written." if live else "")
         if complete and missing > 0:
-            logging.error(
+            logging.log(
+                level,
                 "%d inode(s) in %s have objects but no .00000000 object: no "
-                "backtrace, no path, not in this list. Pool will not reach zero.",
-                missing, pool)
+                "backtrace, no path, not in this list. Pool will not reach "
+                "zero.%s", missing, pool, note)
         if complete and unusable > 0:
-            logging.error(
+            logging.log(
+                level,
                 "%d inode(s) in %s have a .00000000 object whose backtrace could "
                 "not be used (absent, undecodable, or for a different inode): no "
-                "path was emitted for them and they will hold the pool above zero.",
-                unusable, pool)
+                "path was emitted for them and they will hold the pool above "
+                "zero.%s", unusable, pool, note)
         logging.info(
-            "--paths-from-pool %s: %d inodes, %d bno-0 objects (%d unusable), "
-            "%d paths emitted, %d/%d sampled paths resolved%s",
+            "--paths-from-pool %s: %d inodes, %d bno-0 objects (%d unusable, "
+            "%d gone before read), %d paths emitted, %d/%d sampled paths resolved%s",
             pool, len(inodes_seen) if inodes_seen is not None else -1,
-            first_objs, unusable, yielded, resolved, checked,
+            first_objs, unusable, vanished, yielded, resolved, checked,
             "" if complete else " (listing stopped early; counts are partial)")
         ioctx.close()
         cluster.shutdown()
@@ -3634,10 +4498,217 @@ def _iter_listed_paths(src):
             fh.close()
 
 
+# Under --target-pool a directory's files share one staging directory, which
+# only pays if they arrive together. A list or a pool drain comes in arbitrary
+# order -- a pool lists in object-hash order, so one directory's files are
+# scattered through it -- and taking that as-is would make and remove a
+# staging directory per file. So the paths are grouped by directory first, with
+# a bounded-memory external sort: runs of GROUP_RUN_PATHS are sorted in memory
+# and spilled to local disk, then merged. The whole source is read before the
+# first file is processed.
+GROUP_RUN_PATHS = 500000
+
+
+def _dir_key(path):
+    return (os.path.dirname(path), os.path.basename(path))
+
+
+def _spill_run(paths, spill_dir):
+    fd, name = tempfile.mkstemp(prefix="vcephfs-tc-group-", dir=spill_dir)
+    with os.fdopen(fd, "wb") as fh:
+        for p in paths:
+            fh.write(p.encode("utf-8", "surrogateescape") + b"\0")
+    return name
+
+
+def _read_run(name):
+    with open(name, "rb") as fh:
+        buf = b""
+        while True:
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                break
+            parts = (buf + chunk).split(b"\0")
+            buf = parts.pop()
+            for raw in parts:
+                yield raw.decode("utf-8", "surrogateescape")
+
+
+# Kept free on the spill filesystem beyond the run being written: it is where
+# the log lives, and a full log disk is worse than an ungrouped list.
+GROUP_SPILL_RESERVE_BYTES = 1 << 30
+
+
+def _spill_fits(chunk, spill_dir):
+    need = sum(len(p) + 1 for p in chunk)
+    try:
+        return shutil.disk_usage(spill_dir).free >= need + GROUP_SPILL_RESERVE_BYTES
+    except OSError:
+        return False
+
+
+def group_by_directory(paths, spill_dir, run_paths=None, stop=None):
+    """Yield paths with each directory's entries together, in bounded memory.
+
+    stop() is polled while reading: the pre-read can take hours on a large
+    pool, and an exit signal must not wait for it. If the spill filesystem
+    runs short, what is read so far is yielded grouped and the rest in listing
+    order, rather than filling the log disk.
+    """
+    run_paths = run_paths or GROUP_RUN_PATHS
+    it = iter(paths)
+    runs = []
+    chunk = []
+    read = 0
+    try:
+        for p in it:
+            if stop is not None and stop():
+                return
+            chunk.append(p)
+            read += 1
+            if len(chunk) < run_paths:
+                continue
+            chunk.sort(key=_dir_key)
+            if not _spill_fits(chunk, spill_dir):
+                logging.warning(
+                    "Not enough free space under %s to keep grouping paths by "
+                    "directory; the %d read so far are grouped, the rest follow "
+                    "in listing order", spill_dir, read)
+                yield from heapq.merge(*(_read_run(r) for r in runs), chunk,
+                                       key=_dir_key)
+                yield from it
+                return
+            runs.append(_spill_run(chunk, spill_dir))
+            chunk = []
+            logging.info("Grouping by directory: %d paths read, %d run(s) "
+                         "spilled under %s", read, len(runs), spill_dir)
+        if stop is not None and stop():
+            return
+        chunk.sort(key=_dir_key)
+        if not runs:
+            yield from chunk
+            return
+        logging.info("Grouped %d paths by directory in %d sorted run(s) under %s",
+                     read, len(runs) + (1 if chunk else 0), spill_dir)
+        yield from heapq.merge(*(_read_run(r) for r in runs), chunk, key=_dir_key)
+    finally:
+        close = getattr(it, "close", None)
+        if close is not None:
+            close()
+        for r in runs:
+            try:
+                os.unlink(r)
+            except OSError:
+                pass
+
+
+# Every operator path writes thread_count, even when the value is already
+# the one asked for: the write is what tells the regulator its pause or
+# probe is no longer its own (see DynamicSemaphore._gen).
+def sigtstp_handler(sig, frame):
+    old = thread_count.limit
+    thread_count.set_limit(1)
+    if old != 1:
+        logging.info(f"SIGTSTP received, thread limit: {old} -> 1")
+    else:
+        logging.info(f"SIGTSTP received, already at 1")
+    _report_state()
+
+
+def sigusr1_handler(sig, frame):
+    old = thread_count.limit
+    new = min(old + 1, _EXECUTOR_MAX_WORKERS)
+    thread_count.set_limit(new)
+    if new != old:
+        if old == 0:
+            logging.info(f"SIGUSR1 received, processing resumed (thread limit: 0 -> {new})")
+        else:
+            logging.info(f"SIGUSR1 received, thread limit: {old} -> {new}")
+    else:
+        logging.warning(f"SIGUSR1 received, already at maximum ({_EXECUTOR_MAX_WORKERS})")
+    _report_state()
+
+
+def sigusr2_handler(sig, frame):
+    old = thread_count.limit
+    new = max(old - 1, 0)
+    thread_count.set_limit(new)
+    if new != old:
+        if new == 0:
+            logging.info(
+                f"SIGUSR2 received, thread limit: {old} -> 0 — "
+                f"processing paused (in-flight copies will complete; send SIGUSR1 to resume)"
+            )
+        else:
+            logging.info(f"SIGUSR2 received, thread limit: {old} -> {new}")
+    else:
+        logging.warning(f"SIGUSR2 received, already paused (thread limit 0; send SIGUSR1 to resume)")
+    _report_state()
+
+
+def _apply_config_threads(n):
+    """Apply a threads value from --config, logging only what changes.
+
+    Written even when it equals the current limit, because that is not a no-op
+    while the regulator holds the value: the walker reads --config during a
+    regulator pause, so "threads = 0" arrives while the limit is already 0,
+    and "threads = 1" during its 1-thread probe. Either is the operator taking
+    over, and the write is how the regulator knows (DynamicSemaphore._gen).
+    Skipped, the edit was lost -- RuntimeConfig never passes it again -- and
+    the regulator later resumed over the operator's pause.
+    """
+    old_v = thread_count.limit
+    if n == old_v:
+        held = regulator is not None and regulator.holding()
+        thread_count.set_limit(n)
+        if held:
+            logging.info("Config: threads = %d is now the operator's setting; "
+                         "the regulator will not resume or pay back over it",
+                         n)
+        return
+    thread_count.set_limit(n)
+    # Match the SIGUSR2/SIGUSR1 wording so a log scan finds a pause the same
+    # way regardless of which interface caused it.
+    if n == 0:
+        logging.info(
+            "Config: thread limit %d -> 0 — processing paused "
+            "(in-flight copies will complete; set threads > 0 to resume)",
+            old_v)
+    elif old_v == 0:
+        logging.info("Config: processing resumed (thread limit: 0 -> %d)", n)
+    else:
+        logging.info("Config: thread limit %d -> %d", old_v, n)
+
+
 def _poll_config():
     """Re-read --config if it changed. Walker thread only."""
     if runtime_config is not None:
         runtime_config.poll(apply_config)
+
+
+# The longest single sleep inside one file delay, so an exit or a config change
+# is seen this soon even at DELAY_MAX_MS. Plain sleeps, not do_exit.wait(): the
+# walker is the main thread, where the signal handlers run, and a handler's
+# do_exit.set() deadlocks on the Event's plain Lock if it interrupts this
+# thread inside Event.wait() while it holds that lock.
+FILE_DELAY_SLICE_S = 1.0
+
+
+def _file_delay():
+    """Sleep file_delay_ms, waking early for an exit or a shorter delay.
+
+    One time.sleep() of the whole delay held off both for as long as 10 min
+    at DELAY_MAX_MS. The delay in force is re-read after each slice, so a
+    --config or regulator change applies to the sleep already under way.
+    Walker thread only, like _poll_config().
+    """
+    start = time.monotonic()
+    while not do_exit.is_set():
+        left = file_delay_ms / 1000.0 - (time.monotonic() - start)
+        if left <= 0:
+            return
+        time.sleep(min(left, FILE_DELAY_SLICE_S))
+        _poll_config()
 
 
 def process_paths(args, hard_links, executor, dir_layouts, roots):
@@ -3656,22 +4727,37 @@ def process_paths(args, hard_links, executor, dir_layouts, roots):
     path is re-stat'ed and re-checked exactly as the walker would, and a path
     that has since vanished is an expected outcome rather than an error.
     """
+    # The directory the producer is on, held so its files share a staging
+    # directory. Only under --target-pool.
+    held = [None]
+    try:
+        _process_paths(args, hard_links, executor, dir_layouts, roots, held)
+    finally:
+        _release_hold(held[0])
+
+
+def _process_paths(args, hard_links, executor, dir_layouts, roots, held):
     def _limit_reached():
         return args.max_files is not None and stats.files_submitted >= args.max_files
 
     last_progress = time.monotonic()
     outside_logged = 0
 
-    for filepath in _path_source(args, roots):
+    source = _path_source(args, roots)
+    # Grouping reads the whole list first, which a --max-files run would pay
+    # for in full to process a handful; those take the list as it comes.
+    if staging is not None and args.max_files is None:
+        source = group_by_directory(source, _group_spill_dir(args),
+                                    stop=do_exit.is_set)
+    for filepath in source:
         if do_exit.is_set() or _limit_reached():
             return
 
         if runtime_config is not None:
             runtime_config.poll(apply_config)
 
-        delay = file_delay_ms
-        if delay > 0:
-            time.sleep(delay / 1000.0)
+        if file_delay_ms > 0:
+            _file_delay()
 
         if time.monotonic() - last_progress > 60:
             stats.log_progress()
@@ -3694,6 +4780,24 @@ def process_paths(args, hard_links, executor, dir_layouts, roots):
                                 "logged individually")
             continue
 
+        # Ours, as in the walk: the shared journal or a run's checkpoint of
+        # it. A --paths-from list or a pool drain can name one, and replacing
+        # the shared journal by temp+rename would race another run's append.
+        if _is_journal_file(os.path.basename(filepath)):
+            logging.info("Skipping %s: the run journal", filepath)
+            continue
+
+        dirpath = os.path.dirname(filepath)
+        # A pool drain can list a copy in flight in another run's staging
+        # directory. It is not a candidate; it is about to replace one.
+        if STAGE_RE.match(os.path.basename(dirpath)):
+            logging.info("Skipping %s: inside a staging directory", filepath)
+            continue
+        if staging is not None and dirpath != held[0]:
+            _release_hold(held[0])
+            staging.hold(dirpath)
+            held[0] = dirpath
+
         try:
             st = os.stat(filepath, follow_symlinks=False)
             if run_journal is not None:
@@ -3715,16 +4819,24 @@ def process_paths(args, hard_links, executor, dir_layouts, roots):
                 logging.info(msg)
             continue
 
-        dirpath = os.path.dirname(filepath)
-        layout = dir_layouts.get(dirpath)
-        if layout is None:
-            layout = get_layout_walking_up(dirpath)
-            if layout is None:
+        dir_layout = dir_layouts.get(dirpath)
+        if dir_layout is None:
+            try:
+                dir_layout = get_layout_walking_up(dirpath)
+            except OSError as e:
+                if e.errno not in _VANISHED_ERRNOS:
+                    raise
+                with stats._lock:
+                    stats.files_vanished += 1
+                logging.info("Skipping %s: no longer exists", filepath)
+                continue
+            if dir_layout is None:
                 logging.error(f"Could not determine layout for {dirpath}, skipping")
                 with stats._lock:
                     stats.files_failed += 1
                 continue
-            dir_layouts[dirpath] = layout
+            dir_layouts[dirpath] = dir_layout
+        layout = target_layout(args, dir_layout)
 
         # Layout is checked BEFORE size here, the reverse of the walker. The
         # walker tests size first because that is the cheaper rejection: most of
@@ -3735,7 +4847,15 @@ def process_paths(args, hard_links, executor, dir_layouts, roots):
         # moved -- testing size first would log those as "below --min-size" and
         # conceal that they are already done, which is exactly how a previous
         # analysis came to overstate the remaining work.
-        file_layout = CephLayout.from_file(filepath)
+        try:
+            file_layout = CephLayout.from_file(filepath)
+        except OSError as e:
+            if e.errno not in _VANISHED_ERRNOS:
+                raise
+            with stats._lock:
+                stats.files_vanished += 1
+            logging.info("Skipping %s: no longer exists", filepath)
+            continue
         if file_layout is None:
             logging.error(f"Could not read layout for {filepath}, skipping")
             with stats._lock:
@@ -3790,7 +4910,8 @@ def process_paths(args, hard_links, executor, dir_layouts, roots):
             return
         try:
             future = executor.submit(
-                process_file, args, [filepath], st, layout, file_layout
+                process_file, args, [filepath], st, layout, file_layout,
+                layout.pool != dir_layout.pool
             )
             future.add_done_callback(handler)
         except Exception:
@@ -3799,6 +4920,18 @@ def process_paths(args, hard_links, executor, dir_layouts, roots):
 
 
 def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts):
+    # The directory the walk is on, held so its files share a staging
+    # directory. Only under --target-pool.
+    held = [None]
+    try:
+        _process_dir(args, start_dir, hard_links, executor, mountpoints,
+                     dir_layouts, held)
+    finally:
+        _release_hold(held[0])
+
+
+def _process_dir(args, start_dir, hard_links, executor, mountpoints,
+                 dir_layouts, held):
     def _limit_reached():
         return args.max_files is not None and stats.files_submitted >= args.max_files
 
@@ -3838,23 +4971,53 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
         if orphans:
             filenames[:] = [f for f in filenames if not TMP_RE.match(f)]
             if not args.stage_in_tmpdir:
-                _reclaim_named(dirpath, orphans)
+                # An unlink moves rctime too: capture the artifact before it,
+                # claim it after.
+                if run_journal is not None:
+                    run_journal.note_dir(dirpath)
+                if (_reclaim_named(dirpath, orphans)
+                        and run_journal is not None):
+                    run_journal.note_write(os.path.join(dirpath, orphans[0]))
         with _reclaimed_lock:
             _reclaimed_dirs.add(dirpath)
 
-        layout = dir_layouts.get(dirpath, None)
-        if layout is None:
-            layout = CephLayout.from_dir(dirpath)
+        try:
+            layout = dir_layouts.get(dirpath, None)
             if layout is None:
-                layout = dir_layouts.get(os.path.split(dirpath)[0])
+                layout = CephLayout.from_dir(dirpath)
+                if layout is None:
+                    layout = dir_layouts.get(os.path.split(dirpath)[0])
 
-        if layout is None:
-            layout = get_layout_walking_up(dirpath)
+            if layout is None:
+                layout = get_layout_walking_up(dirpath)
+        except OSError as e:
+            # Removed between os.walk listing it and this read: nothing under
+            # it to transcode, and no reason to end the run.
+            if e.errno not in _VANISHED_ERRNOS:
+                raise
+            logging.info(f"Skipping {dirpath}: no longer exists")
+            del dirnames[:]
+            continue
 
         if layout is None:
             logging.error(f"Could not determine layout for {dirpath}, skipping")
             del dirnames[:]
             continue
+
+        # Staging directories are ours, from this run or another, and are
+        # never walked whatever --prune-dir-regex says: a file inside one is
+        # a copy in flight. An aged one is a killed run's leftover.
+        stages = [d for d in dirnames if STAGE_RE.match(d)]
+        if stages:
+            dirnames[:] = [d for d in dirnames if not STAGE_RE.match(d)]
+            for d in stages:
+                if staging is not None and d == staging.name:
+                    continue
+                if run_journal is not None:
+                    run_journal.note_dir(dirpath)
+                if (reclaim_staging_orphan(os.path.join(dirpath, d))
+                        and run_journal is not None):
+                    run_journal.note_write(os.path.join(dirpath, d))
 
         dirnames.sort()
         filenames.sort()
@@ -3900,8 +5063,16 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             f"Scanning {dirpath} ({layout}): {len(dirnames)} dirs and {len(filenames)} files"
         )
         dir_layouts[dirpath] = layout
+        # dir_layouts keeps the directory's own layout, which is what its
+        # children inherit; from here on `layout` is where files go.
+        dir_layout = layout
+        layout = target_layout(args, dir_layout)
+        if staging is not None and dirpath != held[0]:
+            _release_hold(held[0])
+            staging.hold(dirpath)
+            held[0] = dirpath
 
-        def submit(filepaths, st, file_layout, _layout=layout):
+        def submit(filepaths, st, file_layout, stage, _layout=layout):
             if do_exit.is_set() or _limit_reached():
                 return
             if not thread_count.acquire(
@@ -3910,7 +5081,8 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
                 return
             try:
                 future = executor.submit(
-                    process_file, args, filepaths, st, _layout, file_layout
+                    process_file, args, filepaths, st, _layout, file_layout,
+                    stage
                 )
                 future.add_done_callback(handler)
             except Exception:
@@ -3928,16 +5100,25 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             if runtime_config is not None:
                 runtime_config.poll(apply_config)
 
-            delay = file_delay_ms
-            if delay > 0:
-                time.sleep(delay / 1000.0)
+            if file_delay_ms > 0:
+                _file_delay()
 
             if time.monotonic() - last_progress > 60:
                 stats.log_progress()
                 last_progress = time.monotonic()
 
             filepath = os.path.join(dirpath, filename)
-            st = os.stat(filepath, follow_symlinks=False)
+            # Listed by os.walk, gone by the stat: deleted under the walk.
+            # Expected on a live volume, as in process_paths(), not fatal.
+            try:
+                st = os.stat(filepath, follow_symlinks=False)
+            except OSError as e:
+                if e.errno not in _VANISHED_ERRNOS:
+                    raise
+                with stats._lock:
+                    stats.files_vanished += 1
+                logging.info("Skipping %s: no longer exists", filepath)
+                continue
             if run_journal is not None:
                 # Before any gating, and before anything here is modified: this
                 # is where the pre-transcode rctime is still recoverable.
@@ -3970,7 +5151,15 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
                 with stats._lock:
                     stats.files_skipped_recent += 1
                 continue
-            file_layout = CephLayout.from_file(filepath)
+            try:
+                file_layout = CephLayout.from_file(filepath)
+            except OSError as e:
+                if e.errno not in _VANISHED_ERRNOS:
+                    raise
+                with stats._lock:
+                    stats.files_vanished += 1
+                logging.info("Skipping %s: no longer exists", filepath)
+                continue
             if file_layout is None:
                 logging.error(f"Could not read layout for {filepath}, skipping")
                 with stats._lock:
@@ -3989,7 +5178,8 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
                     stats.files_skipped_source_pool += 1
                 continue
             if st.st_nlink == 1:
-                submit([filepath], st, file_layout)
+                submit([filepath], st, file_layout,
+                       layout.pool != dir_layout.pool)
             elif not args.process_hardlinks:
                 logging.info(
                     f"Skipping {filepath}: has {st.st_nlink} hard links (--skip-hardlinks)"
@@ -4000,14 +5190,18 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             else:
                 file_id = (st.st_dev, st.st_ino)
                 if file_id not in hard_links:
-                    hard_links[file_id] = ([filepath], [layout])
+                    hard_links[file_id] = ([filepath], [layout], [dir_layout])
                 else:
                     hard_links[file_id][0].append(filepath)
                     hard_links[file_id][1].append(layout)
+                    hard_links[file_id][2].append(dir_layout)
 
                 if len(hard_links[file_id][0]) == st.st_nlink:
                     filepaths = hard_links[file_id][0]
                     layouts = hard_links[file_id][1]
+                    # Staged by where the first name lives: that is the
+                    # directory the new inode is created and renamed into.
+                    stage = layouts[0].pool != hard_links[file_id][2][0].pool
                     del hard_links[file_id]
                     if not all(i == layouts[0] for i in layouts[1:]):
                         logging.error(
@@ -4032,7 +5226,7 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
                         with stats._lock:
                             stats.files_skipped_large += 1
                     else:
-                        submit(filepaths, st, file_layout)
+                        submit(filepaths, st, file_layout, stage)
                 else:
                     logging.info(
                         f"Deferring {filepath} due to hardlinks ({st.st_nlink - len(hard_links[file_id][0])} link(s) left)"
@@ -4040,9 +5234,14 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
 
 
 def cleanup_tmpdir(tmpdir):
-    """Remove any orphaned temp files left by previous interrupted runs."""
+    """Remove aged temp files left by previous interrupted runs.
+
+    Aged as reclaim_orphans() ages them: another job sharing tmpdir may be
+    copying into one right now, and unlinking it fails that job's rename.
+    """
     if not os.path.isdir(tmpdir):
         return
+    now = time.time()
     count = 0
     for entry in os.scandir(tmpdir):
         if entry.is_file(follow_symlinks=False):
@@ -4052,6 +5251,9 @@ def cleanup_tmpdir(tmpdir):
                 # --tmpdir happens to sit inside the tree being walked.
                 if not TMP_RE.match(entry.name):
                     uuid.UUID(entry.name)
+                if (now - entry.stat(follow_symlinks=False).st_ctime
+                        < TMP_ORPHAN_MIN_AGE_S):
+                    continue
                 os.unlink(entry.path)
                 count += 1
             except (ValueError, OSError):
@@ -4071,6 +5273,14 @@ def process_files(args):
     hard_links = {}
     dir_layouts = {}
     roots_seen = []
+
+    global staging
+    staging = None
+    if getattr(args, "target_pool", None) and not args.stage_in_tmpdir:
+        staging = StagingDirs(uuid.uuid4().hex[:16])
+        logging.info("--target-pool %s: files whose directory points elsewhere "
+                     "are staged in %s/ beside them", args.target_pool,
+                     staging.name)
 
     mountpoints = set()
     with open("/proc/self/mounts", "r") as f:
@@ -4154,6 +5364,13 @@ def process_files(args):
         # that died partway is exactly the one whose damage cannot be
         # reconstructed afterwards. SIGKILL, the OOM killer and power loss
         # never get here; the checkpoint covers those, one interval behind.
+        #
+        # The executor has joined by now, so no copy is in flight and any
+        # staging directory still made is one a hold or a failure left behind.
+        if staging is not None:
+            for d in staging.remove_all():
+                if run_journal is not None:
+                    run_journal.note_write(os.path.join(d, staging.name))
         if run_journal is not None:
             run_journal.write(roots_seen, args)
 
@@ -4221,14 +5438,24 @@ def _report_state(prefix="State"):
     _update_proctitle()
 
 
+# The signals _install_exit_handlers() routes to the clean exit.
+_EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
 def _exit_signal_handler(sig, frame):
     # The clean exit waits for in-flight copies. A second one of the same
     # signal escalates, as a plain kill did before SIGTERM had a handler;
     # otherwise kill -9 was the only way out, and it skips the journal write.
+    #
+    # The journal's checkpoint thread is not woken from here: an Event takes a
+    # plain Lock, and this runs on the main thread, which can be holding that
+    # lock itself. It polls do_exit every second instead (start_checkpoints).
     signal.signal(sig, signal.SIG_DFL)
     name = signal.Signals(sig).name
-    logging.error(f"{name} received, exiting cleanly (send it again to stop "
-                  "now)...")
+    n = thread_count.in_use if thread_count is not None else 0
+    logging.error(f"{name} received, exiting cleanly: draining {n} in-flight "
+                  f"cop{'y' if n == 1 else 'ies'} (send {name} again to stop "
+                  "immediately)...")
     do_exit.set()
 
 
@@ -4261,7 +5488,14 @@ def main():
             f" (min -1ms, floor {DELAY_MIN_MS}ms)\n"
             "  SIGRTMIN+2(36) increase min-age by 3 days\n"
             "  SIGRTMIN+3(37) decrease min-age by 3 days (min 1)\n"
-            "  SIGRTMIN+4(38) dump current state/tunables to the log"
+            "  SIGRTMIN+4(38) dump current state/tunables to the log\n\n"
+            "exit signals:\n"
+            "  SIGINT, SIGTERM and SIGHUP stop cleanly: in-flight copies\n"
+            "  finish and the run journal is written, which can take as\n"
+            "  long as the largest copy. A second one of the same signal\n"
+            "  stops at once. So under timeout(1), give -k, e.g.\n"
+            "  timeout -k 30m 24h %(prog)s ...  A SIGHUP inherited as\n"
+            "  ignored (nohup) stays ignored."
             "\n\n"
             "example --config file (every key at its default):\n\n"
             # argparse runs the epilog through `text % dict(prog=...)`, so any
@@ -4366,7 +5600,10 @@ def main():
         "--dry-run",
         "-n",
         action="store_true",
-        help="Perform transcode but do not replace files",
+        help="Perform transcode but do not replace files. Without "
+             "--stage-in-tmpdir each copy is still staged beside its target, "
+             "which moves the directory's rctime, so the run journal records "
+             "that pin.",
     )
     parser.add_argument(
         "--config",
@@ -4503,7 +5740,10 @@ def main():
     )
     parser.add_argument(
         "--regulate-quiet-ticks", type=int, default=REG_QUIET_TICKS_DEFAULT, metavar="N",
-        help="Consecutive clean samples before easing the delay (default 10).",
+        help="Consecutive clean samples before easing the delay. Also the nan "
+             "samples a regulator pause needs before it resumes at 1 thread; "
+             "a stalled MDS reads nan too (default %d)."
+             % REG_QUIET_TICKS_DEFAULT,
     )
     parser.add_argument(
         "--regulate-max-threads", type=int, default=REG_MAX_THREADS_DEFAULT,
@@ -4517,7 +5757,8 @@ def main():
         "--regulate-blind-resume-s", type=non_negative_int,
         default=REG_BLIND_RESUME_S_DEFAULT, metavar="SEC",
         help="If the regulator has paused the job and no usable sample arrives "
-             "for this long (Prometheus down, empty result), resume at 1 thread "
+             "for this long (Prometheus down, empty result, nan, or a mix), "
+             "resume at 1 thread "
              "rather than stay paused; the first usable sample restores the "
              "rest (default %d; 0 = stay paused until a sample arrives)."
              % REG_BLIND_RESUME_S_DEFAULT,
@@ -4529,6 +5770,34 @@ def main():
         help="Only transcode files whose CURRENT data pool is POOL. Without it, "
              "every file not already on the target pool is eligible. Use this to "
              "drain one pool into another without also sweeping the default pool.",
+    )
+    parser.add_argument(
+        "--target-pool",
+        default=None,
+        metavar="POOL",
+        help="Send eligible files to POOL instead of to their directory's "
+             "layout pool. Directory layouts are never changed: a file whose "
+             "directory points elsewhere is copied in a hidden staging "
+             "subdirectory created with POOL's layout and renamed up into "
+             "place, so new files keep landing where they always did. Needs a "
+             "size band: a replicated POOL takes only --max-size below %d, an "
+             "EC POOL only --min-size at or above its floor (at least %d). "
+             "Lets a small-file pass run while the volume root stays on EC. "
+             "With --paths-from or --paths-from-pool the list is read in full "
+             "and grouped by directory before anything moves, spilling about "
+             "100 bytes per path beside --log-file -- or, without one, in the "
+             "system temp directory, which is often RAM-backed."
+             % (YIELD_FLOOR_BYTES, YIELD_FLOOR_BYTES),
+    )
+    parser.add_argument(
+        "--target-pool-kind",
+        choices=("rep", "ec"),
+        default=None,
+        help="Whether --target-pool is replicated or EC, for hosts without a "
+             "usable ceph CLI. Without either, the pool's name must say: "
+             "*.ecK.M.* for EC, exactly cephfs.<fs>.data or cephfs.<fs>.rdata for "
+             "replicated; anything else is refused. Refused if it contradicts "
+             "the cluster.",
     )
     parser.add_argument(
         "--prune-small-subtrees",
@@ -4722,6 +5991,24 @@ def main():
 
     logging.info(f"Temporary directory is {args.tmpdir} with pool {layout.pool}")
 
+    # Decided once, before the config file is read, so that a config min_size
+    # below an EC target's floor is refused as it is applied (_apply_config).
+    args.target_kind = args.target_floor = None
+    if args.target_pool:
+        args.target_kind, _how = target_pool_kind(
+            args.target_pool, args.target_pool_kind,
+            {n for n in (_mds_namespace_for(d) for d in args.dirs) if n})
+        if args.target_kind is None:
+            logging.error("Refusing to start: %s", _how)
+            sys.exit(1)
+        if args.target_kind == "ec":
+            args.target_floor = target_pool_floor(
+                args.source_pool or layout.pool, args.target_pool)
+        logging.info(
+            "--target-pool %s: %s (decided by %s)%s", args.target_pool,
+            "replicated" if args.target_kind == "rep" else "EC", _how,
+            f", floor {args.target_floor} bytes" if args.target_floor else "")
+
     # State the effective prune set before any walking happens. When it is the
     # built-in default the operator has not chosen it, so name every directory
     # rather than printing an opaque regex -- this silently skips whole
@@ -4751,11 +6038,7 @@ def main():
     # EOFError and the job aborts -- so the check is done programmatically
     # instead. That works headless AND is stronger, because it cannot be
     # waved through by a human who is not reading carefully.
-    conflicts = []
-    for d in args.dirs:
-        target = get_layout_walking_up(d)
-        if target is not None and target.pool == layout.pool:
-            conflicts.append((d, target.pool))
+    conflicts = tmpdir_conflicts(args, layout.pool)
 
     if conflicts:
         for d, pool in conflicts:
@@ -4782,50 +6065,16 @@ def main():
     # overrides it so a pool-to-pool drain is judged against the right baseline.
     # Best-effort -- needs the ceph CLI, and stays silent without it.
     for _d in args.dirs:
-        _t = get_layout_walking_up(_d)
+        _t = target_layout(args, get_layout_walking_up(_d))
         if _t is None:
+            continue
+        # A replicated --target-pool wins only BELOW a size, and its band is
+        # enforced by target_pool_refusal(); this advisory is for EC targets.
+        if args.target_pool and args.target_kind == "rep":
             continue
         _msg = crossover_warning(args.source_pool or layout.pool, _t.pool, args.min_size)
         if _msg:
             logging.warning(_msg)
-
-    def sigtstp_handler(sig, frame):
-        old = thread_count.limit
-        if old != 1:
-            thread_count.set_limit(1)
-            logging.info(f"SIGTSTP received, thread limit: {old} -> 1")
-        else:
-            logging.info(f"SIGTSTP received, already at 1")
-        _report_state()
-
-    def sigusr1_handler(sig, frame):
-        old = thread_count.limit
-        new = min(old + 1, _EXECUTOR_MAX_WORKERS)
-        if new != old:
-            thread_count.set_limit(new)
-            if old == 0:
-                logging.info(f"SIGUSR1 received, processing resumed (thread limit: 0 -> {new})")
-            else:
-                logging.info(f"SIGUSR1 received, thread limit: {old} -> {new}")
-        else:
-            logging.warning(f"SIGUSR1 received, already at maximum ({_EXECUTOR_MAX_WORKERS})")
-        _report_state()
-
-    def sigusr2_handler(sig, frame):
-        old = thread_count.limit
-        new = max(old - 1, 0)
-        if new != old:
-            thread_count.set_limit(new)
-            if new == 0:
-                logging.info(
-                    f"SIGUSR2 received, thread limit: {old} -> 0 — "
-                    f"processing paused (in-flight copies will complete; send SIGUSR1 to resume)"
-                )
-            else:
-                logging.info(f"SIGUSR2 received, thread limit: {old} -> {new}")
-        else:
-            logging.warning(f"SIGUSR2 received, already paused (thread limit 0; send SIGUSR1 to resume)")
-        _report_state()
 
     global file_delay_ms, min_age_days
     if args.file_delay < 0:
@@ -4883,22 +6132,8 @@ def main():
             old_v = file_delay_ms
             file_delay_ms = cfg['file_delay_ms']
             logging.info("Config: file delay %dms -> %dms", old_v, file_delay_ms)
-        if 'threads' in cfg and cfg['threads'] != thread_count.limit:
-            old_v = thread_count.limit
-            thread_count.set_limit(cfg['threads'])
-            # Match the SIGUSR2/SIGUSR1 wording so a log scan finds a pause the
-            # same way regardless of which interface caused it.
-            if cfg['threads'] == 0:
-                logging.info(
-                    "Config: thread limit %d -> 0 — processing paused "
-                    "(in-flight copies will complete; set threads > 0 to resume)",
-                    old_v)
-            elif old_v == 0:
-                logging.info(
-                    "Config: processing resumed (thread limit: 0 -> %d)",
-                    cfg['threads'])
-            else:
-                logging.info("Config: thread limit %d -> %d", old_v, cfg['threads'])
+        if 'threads' in cfg:
+            _apply_config_threads(cfg['threads'])
         global DELAY_STEP_UP, DELAY_STEP_DOWN, DELAY_MIN_MS
         if 'delay_step_up' in cfg and cfg['delay_step_up'] != DELAY_STEP_UP:
             old_v = DELAY_STEP_UP
@@ -4916,6 +6151,16 @@ def main():
             old_v = min_age_days
             min_age_days = cfg['min_age_days']
             logging.info("Config: min-age %dd -> %dd", old_v, min_age_days)
+        # An EC --target-pool takes every eligible file regardless of where its
+        # directory points, so its floor holds at runtime too, not only at
+        # startup. The config wins over the CLI, which makes this the check.
+        if ('min_size' in cfg and getattr(args, "target_kind", None) == "ec"
+                and cfg['min_size'] < args.target_floor):
+            logging.error(
+                "Config: min-size %d refused: below the %d-byte floor for "
+                "--target-pool %s; keeping %d", cfg['min_size'],
+                args.target_floor, args.target_pool, args.min_size)
+            cfg = {k: v for k, v in cfg.items() if k != 'min_size'}
         if 'min_size' in cfg and cfg['min_size'] != args.min_size:
             old_v = args.min_size
             args.min_size = cfg['min_size']
@@ -4991,6 +6236,17 @@ def main():
     )
     # Prime the ps command line with the launch-time tunables.
     _update_proctitle()
+
+    # After the config's first read, since min_size may come from it.
+    if args.target_pool:
+        why = target_pool_refusal(args.target_kind, args.target_floor,
+                                  args.min_size, args.max_size, args.target_pool)
+        if why is None:
+            os.makedirs(args.tmpdir, exist_ok=True)
+            why = probe_target_pool(args.target_pool, args.tmpdir)
+        if why:
+            logging.error("Refusing to start: %s", why)
+            sys.exit(1)
 
     process_files(args)
 
