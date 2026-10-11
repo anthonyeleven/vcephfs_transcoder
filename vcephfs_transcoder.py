@@ -6322,6 +6322,8 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
 
         if layout is None:
             logging.error(f"Could not determine layout for {dirpath}, skipping")
+            with stats._lock:
+                stats.subtrees_skipped_layout_invalid += 1
             del dirnames[:]
             continue
 
@@ -6704,6 +6706,8 @@ def process_files(args):
                     continue
 
                 if layout is None:
+                    with stats._lock:
+                        stats.subtrees_skipped_layout_invalid += 1
                     logging.error(
                         f"Could not determine layout for {start_dir}, "
                         f"skipping. If no directory up to the volume root "
