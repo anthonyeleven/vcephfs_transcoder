@@ -5177,7 +5177,7 @@ def _ceph_connect_args(explicit, sample_path, mon_host=None):
         return "", {"mon_host": ",".join(mons)}
 
     raise SystemExit(
-        "--paths-from-pool: cannot reach the cluster. No --rados-conffile, no "
+        "Cannot reach the cluster over RADOS. No --rados-conffile, no "
         "CEPH_CONF, no /etc/ceph/ceph.conf, %d candidates in /etc/ceph (%s), and no "
         "monitor addresses in the mount source (%r -- cephadm-style sources do not "
         "carry them). Pass --rados-conffile, or --rados-mon-host." % (
@@ -6862,7 +6862,9 @@ def main():
         help="ceph.conf for --paths-from-pool. Default: $CEPH_CONF, then "
              "/etc/ceph/ceph.conf, then a single /etc/ceph/*.conf, then monitor "
              "addresses recovered from the mount. Containerized hosts often have "
-             "no ceph.conf at all, hence the fallbacks.")
+             "no ceph.conf at all, hence the fallbacks. With --rados-name and "
+             "--rados-keyring, this and --rados-mon-host also locate the cluster "
+             "for --target-pool's staging-removal session.")
     parser.add_argument(
         "--rados-mon-host", metavar="ADDRS",
         help="Comma-separated monitor addresses for --paths-from-pool, used "

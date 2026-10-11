@@ -325,7 +325,10 @@ options:
                         then /etc/ceph/ceph.conf, then a single
                         /etc/ceph/*.conf, then monitor addresses recovered
                         from the mount. Containerized hosts often have no
-                        ceph.conf at all, hence the fallbacks.
+                        ceph.conf at all, hence the fallbacks. With --rados-
+                        name and --rados-keyring, this and --rados-mon-host
+                        also locate the cluster for --target-pool's staging-
+                        removal session.
   --rados-mon-host ADDRS
                         Comma-separated monitor addresses for --paths-from-
                         pool, used instead of a conffile.
