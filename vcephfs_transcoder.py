@@ -4119,7 +4119,13 @@ def tmpdir_conflicts(args, tmpdir_pool):
         return []
     out = []
     for d in args.dirs:
-        target = target_layout(args, get_layout_walking_up(d))
+        try:
+            target = target_layout(args, get_layout_walking_up(d))
+        except InvalidLayout as e:
+            # Left out of the check, not fatal: the files under it read the
+            # layout again before anything is written to them.
+            logging.warning("No tmpdir check for %s: %s", d, e)
+            continue
         if target is not None and target.pool == tmpdir_pool:
             out.append((d, target.pool))
     return out
@@ -6558,6 +6564,8 @@ def process_files(args):
                     layout = get_layout_walking_up(start_dir)
                 except InvalidLayout as e:
                     logging.error(f"Skipping {start_dir}: {e}")
+                    with stats._lock:
+                        stats.subtrees_skipped_layout_invalid += 1
                     continue
 
                 if layout is None:
@@ -6723,11 +6731,7 @@ def _check_tmpdir_and_target(args):
     # would be rewritten for nothing, and a failed apply_file() would go
     # unnoticed, as the temp inherits the target pool. Refused, not prompted,
     # so a detached start cannot hang on it.
-    try:
-        conflicts = tmpdir_conflicts(args, layout.pool)
-    except InvalidLayout as e:
-        logging.error("Refusing to start: %s", e)
-        sys.exit(1)
+    conflicts = tmpdir_conflicts(args, layout.pool)
 
     if conflicts:
         for d, pool in conflicts:
@@ -6914,9 +6918,9 @@ def main():
         "-n",
         action="store_true",
         help="Perform transcode but do not replace files. Without "
-             "--stage-in-tmpdir each copy is still staged beside its target, "
-             "which moves the directory's rctime, so the run journal records "
-             "that pin.",
+             "--stage-in-tmpdir each copy is still staged, beside its target "
+             "or, with --target-pool, in a staging directory, which moves "
+             "that directory's rctime, so the run journal records that pin.",
     )
     parser.add_argument(
         "--config",

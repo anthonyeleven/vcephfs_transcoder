@@ -69,20 +69,20 @@ So:
 The example uses volume `myvol`, mounted at `/mnt/myvol`, with a new EC 4+2
 pool on SSDs.
 
-**1. Create and attach the pool.** Run the setup script on a mon, or any host with
-the admin keyring, with `--skip-layout`. It is a dry run unless given `--execute`,
-and it prints every command it would run.
+**1. Create and attach the pool.** Run the setup script with `--skip-layout` on a
+host with the admin keyring where the volume is mounted at the `--mount` path:
+under `--execute` it checks that path with `ls -l` and stops if it is missing. It
+is a dry run unless given `--execute`, and it prints every command it would run.
 
 ```
 vcephfs-transcode-setup.sh --mount /mnt/myvol --ec-k 4 --ec-m 2 \
     --crush-device-class ssd --pg-num 256 --skip-layout
 # review the commands, then the same again with --execute
-mkdir /mnt/myvol/tmp      # the transcoder's --tmpdir, on the root's pool
 ```
 
 It reuses or creates the profile `ec4.2ssd` and the rule `ec4.2-rule-ssd`, creates
 `cephfs.myvol.ec4.2.ssd.data` and adds it to the filesystem. With `--skip-layout`
-it touches no layout, but it still checks that the `--mount` path exists.
+it touches no layout.
 
 **2. Write the job's config file**, on local disk, never inside CephFS:
 
@@ -114,10 +114,14 @@ while the job runs.
 **3. Try it, then run it.** The transcode host needs the volume mounted as a CephX
 user with the `p` cap, and runs as root. `--target-pool` removes its staging
 directories through a second CephFS session, so it also needs `python3-cephfs`
-and that user's keyring at `/etc/ceph/<cluster>.client.<name>.keyring` (or
-`--rados-name` and `--rados-keyring`).
+and, in `/etc/ceph`, the cluster's conf file (the one whose fsid or mon addresses
+match the mount) with that user's keyring beside it as
+`<cluster>.client.<name>.keyring`. `--rados-name` and `--rados-keyring` name
+another user and keyring.
 
 ```
+mkdir /mnt/myvol/tmp      # the --tmpdir, on the root's replicated pool
+
 # a dry run on one subtree: copies and verifies, replaces nothing
 vcephfs_transcoder.py --config ~/tc_myvol.conf --tmpdir /mnt/myvol/tmp \
     --target-pool cephfs.myvol.ec4.2.ssd.data --source-pool cephfs.myvol.data \
@@ -131,10 +135,13 @@ systemd-run --unit tc-myvol -p TimeoutStopSec=1h \
     --log-file ~/tc.myvol.log --log-rotate-size 4 /mnt/myvol
 ```
 
-A dry run is not free of side effects: each copy is still staged next to its
-target, which moves the directory's `ceph.dir.rctime` (the run journal records
-it). `TimeoutStopSec` should be longer than the largest copy takes, so a stop lets
-in-flight copies finish instead of being killed.
+A dry run is not free of side effects. With `--target-pool` it creates staging
+directories (`.vcephfs-tc-stage-*`, under the mount root, the file's pin boundary
+or its quota realm), removes them at exit, and moves their base directory's
+`ceph.dir.rctime`. Without it, each copy is staged next to its target and moves
+that directory's rctime. The run journal records either. `TimeoutStopSec` should
+be longer than the largest copy takes, so a stop lets in-flight copies finish
+instead of being killed.
 
 **4. Watch it.** The log has a `Progress:` line every minute and a `Complete:` line
 at the end that counts what was transcoded, failed, already matched, too recent,
@@ -351,9 +358,10 @@ options:
                         --min-size). Omit for no upper limit.
   --threads THREADS     Number of threads for data copying
   --dry-run, -n         Perform transcode but do not replace files. Without
-                        --stage-in-tmpdir each copy is still staged beside its
-                        target, which moves the directory's rctime, so the run
-                        journal records that pin.
+                        --stage-in-tmpdir each copy is still staged, beside
+                        its target or, with --target-pool, in a staging
+                        directory, which moves that directory's rctime, so the
+                        run journal records that pin.
   --config PATH         key=value file of live tunables (file_delay_ms,
                         threads, min_age_days, min_size, prune_dir_regex), re-
                         read when its mtime changes. Keep it on local disk,

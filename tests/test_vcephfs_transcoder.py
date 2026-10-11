@@ -3630,6 +3630,28 @@ class ProcessFilesStartup(unittest.TestCase):
         self.assertEqual(len(started), 1,
                          "process_files() never started journal checkpoints")
 
+    def test_a_refused_walk_root_is_skipped_and_counted(self):
+        root = os.path.join(self.tmp, "root")
+        os.mkdir(root)
+        saved = (vct.get_layout_walking_up, vct.stats)
+
+        def restore():
+            vct.get_layout_walking_up, vct.stats = saved
+        self.addCleanup(restore)
+        vct.stats = vct.Stats()
+
+        def walk_up(p):
+            raise vct.InvalidLayout(f"ceph.dir.layout of {p} reads back as "
+                                    "stripe_unit=0 stripe_count=0 object_size=0 pool=-1")
+        vct.get_layout_walking_up = walk_up
+        with self.assertLogs(level="ERROR") as logs:
+            vct.process_files(Args(
+                tmpdir=os.path.join(self.tmp, "t"), dirs=[root], run_journal=False,
+                paths_from=None, paths_from_pool=None, stage_in_tmpdir=False))
+        self.assertIn(f"Skipping {root}:", "\n".join(logs.output))
+        self.assertEqual(vct.stats.subtrees_skipped_layout_invalid, 1)
+        self.assertEqual(vct.stats.files_failed, 0)
+
 
 
 # --- --target-pool ------------------------------------------------------------
@@ -5228,6 +5250,18 @@ class TmpdirConflictUnderTargetPool(unittest.TestCase):
                                               "cephfs.v.ec4.2.qlc.data"),
                          [("/v", "cephfs.v.ec4.2.qlc.data")])
         self.assertEqual(vct.tmpdir_conflicts(self._args(), "cephfs.v.data"), [])
+
+    def test_a_refused_root_is_left_out_not_fatal(self):
+        def walk_up(d):
+            if d == "/w":
+                raise vct.InvalidLayout("ceph.dir.layout of /w reads back as "
+                                        "stripe_unit=0 stripe_count=0 object_size=0 pool=-1")
+            return vct.CephLayout(_L)
+        vct.get_layout_walking_up = walk_up
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(vct.tmpdir_conflicts(self._args(dirs=["/w", "/v"]),
+                                                  "cephfs.v.ec4.2.qlc.data"),
+                             [("/v", "cephfs.v.ec4.2.qlc.data")])
 
 
 class TargetPoolKindFailsClosed(unittest.TestCase):
