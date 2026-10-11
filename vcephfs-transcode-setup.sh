@@ -54,7 +54,7 @@
 #   --compression-algorithm ALG
 #                          Compression algorithm (default: snappy)
 #                          (e.g. "snappy", "zstd", "lz4", "zlib")
-#   --min-age DAYS         Min file age in days (default: 1)
+#   --min-age DAYS         Min file age in days (default: 2)
 #   --min-size SIZE        Min file size (e.g. "1M", "300K")
 #   --subdir PATH           Subdirectory under mount to transcode
 #                          (e.g. "ethel/merman")
@@ -71,7 +71,7 @@ set -euo pipefail
 EC_PLUGIN="isa"
 COMPRESSION="aggressive"
 COMPRESSION_ALG="snappy"
-MIN_AGE=1
+MIN_AGE=2
 MIN_SIZE=""
 FASTEC=false
 DRY_RUN=true
@@ -93,7 +93,6 @@ PG_AUTOSCALE_MODE="off"
 # --- Helpers ----------------------------------------------------------------
 usage() {
     sed -n '/^# Usage:/,/^[^#]/{ /^#/s/^# \?//p }' "$0"
-    exit 0
 }
 
 log_info() { echo "[INFO]  $*"; }
@@ -226,7 +225,8 @@ require_arg() {
 
 # --- Parse arguments --------------------------------------------------------
 if [ $# -eq 0 ]; then
-    usage
+    usage >&2
+    exit 1
 fi
 
 while [ $# -gt 0 ]; do
@@ -251,7 +251,7 @@ while [ $# -gt 0 ]; do
         --skip-layout)       SKIP_LAYOUT=true;         shift   ;;
         --transcode)         SKIP_TRANSCODE=false;     shift   ;;
         --execute)           DRY_RUN=false;            shift   ;;
-        --help|-h)           usage ;;
+        --help|-h)           usage; exit 0 ;;
         *) log_err "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -303,27 +303,11 @@ if [ -z "$MIN_SIZE" ]; then
         MIN_SIZE="1M"
         log_info "Auto-selected --min-size=${MIN_SIZE} (replicated)"
     else
-        # Pre-FastEC recommendations from the plan:
-        #   EC 4+2 -> 300K (alloc unit 24 KiB)
-        #   EC 8+2 -> 600K (alloc unit 40 KiB)
-        # Post-FastEC:
-        #   EC 4+2 -> 256K (alloc unit 16 KiB)
-        #   EC 8+2 -> 180K (alloc unit 24 KiB, but doc suggests 256K)
-        STRIPE_WIDTH=$(( EC_K + EC_M ))
-        if [ "$FASTEC" = true ]; then
-            if [ "$STRIPE_WIDTH" -le 6 ]; then
-                MIN_SIZE="160K"
-            else
-                MIN_SIZE="256K"
-            fi
-        else
-            if [ "$STRIPE_WIDTH" -le 6 ]; then
-                MIN_SIZE="300K"
-            else
-                MIN_SIZE="600K"
-            fi
-        fi
-        log_info "Auto-selected --min-size=${MIN_SIZE} (k=${EC_K}, m=${EC_M}, fastec=${FASTEC})"
+        # The transcoder's own EC floor (YIELD_FLOOR_BYTES, 614400): below it
+        # the object-count cost of k+m shards plus the backtrace outweighs
+        # the bytes saved, whatever the profile. Override with --min-size.
+        MIN_SIZE="600K"
+        log_info "Auto-selected --min-size=${MIN_SIZE} (the EC yield floor)"
     fi
 fi
 
@@ -386,14 +370,13 @@ fi
 
 # --- Verify mount path exists ------------------------------------------------
 log_info "Checking mount path '${MOUNT}'"
-if [ "$DRY_RUN" = true ]; then
-    log_cmd "ls -l ${MOUNT}"
-    echo "         (dry-run, not executed)"
-else
-    if ! ls -l "${MOUNT}"; then
-        log_err "Mount path '${MOUNT}' does not exist or is not accessible"
-        exit 1
-    fi
+run ls -l "${MOUNT}" || { log_err "Mount path '${MOUNT}' does not exist or is not accessible"; exit 1; }
+# ls triggers an idle autofs mount, so mountpoint(1) then sees it. An existing
+# but unmounted directory would otherwise take the pool setup and a local
+# mkdir of ${MOUNT}/tmp that masks the real volume.
+if [ "$DRY_RUN" = false ] && ! mountpoint -q "${MOUNT}"; then
+    log_err "'${MOUNT}' exists but is not a mountpoint; refusing to set up a volume on the bare directory"
+    exit 1
 fi
 
 # --- Pool setup --------------------------------------------------------------
@@ -431,39 +414,37 @@ if [ "$SKIP_POOL_SETUP" = false ]; then
         else
             log_info "Pool 2: Create CRUSH rule '${CRUSH_RULE}'"
             run ceph osd crush rule create-erasure "${CRUSH_RULE}" "${EC_PROFILE}"
+        fi
 
         # Check the media before committing: stripe_unit and min_alloc are fixed
         # for the life of the pool, and they set the size below which EC costs
-        # more raw space than the replication it replaces.
+        # more raw space than the replication it replaces. Also on an existing
+        # rule; in a dry run the rule may not exist yet, and the survey says so.
         survey_min_alloc "${CRUSH_RULE}" || true
-        fi
 
         if pool_exists "${POOL_NAME}"; then
             log_info "Pool '${POOL_NAME}' already exists, skipping creation"
         else
-            log_info "Pool 3: Create EC data pool '${POOL_NAME}' (pg_num=${PG_NUM})"
-            run ceph osd pool create "${POOL_NAME}" "${PG_NUM}" "${PG_NUM}" erasure "${EC_PROFILE}"
+            log_info "Pool 3: Create EC data pool '${POOL_NAME}' (pg_num=${PG_NUM}, rule ${CRUSH_RULE})"
+            # Naming the rule at creation leaves no auto-created rule to swap
+            # out and remove afterwards.
+            run ceph osd pool create "${POOL_NAME}" "${PG_NUM}" "${PG_NUM}" erasure "${EC_PROFILE}" "${CRUSH_RULE}"
             run ceph osd pool set "${POOL_NAME}" pg_autoscale_mode "${PG_AUTOSCALE_MODE}"
-
-            log_info "Pool 4: Set pool CRUSH rule to '${CRUSH_RULE}' and remove auto-created rule"
-            run ceph osd pool set "${POOL_NAME}" crush_rule "${CRUSH_RULE}"
-            # The auto-created rule has the same name as the pool
-            run ceph osd crush rule rm "${POOL_NAME}" || true
         fi
 
         # These are safe to re-apply on an existing pool
-        log_info "Pool 5: Enable EC overwrites on '${POOL_NAME}'"
+        log_info "Pool 4: Enable EC overwrites on '${POOL_NAME}'"
         run ceph osd pool set "${POOL_NAME}" allow_ec_overwrites true
 
         if [ "$FASTEC" = true ]; then
-            log_info "Pool 5b: Enable EC optimizations (FastEC) on '${POOL_NAME}'"
+            log_info "Pool 4b: Enable EC optimizations (FastEC) on '${POOL_NAME}'"
             run ceph osd pool set "${POOL_NAME}" allow_ec_optimizations true
         fi
 
-        log_info "Pool 6: Add data pool to filesystem '${VOLUME}'"
+        log_info "Pool 5: Add data pool to filesystem '${VOLUME}'"
         run ceph fs add_data_pool "${VOLUME}" "${POOL_NAME}"
 
-        log_info "Pool 7: Set compression on '${POOL_NAME}'"
+        log_info "Pool 6: Set compression on '${POOL_NAME}'"
         run ceph osd pool set "${POOL_NAME}" compression_mode "${COMPRESSION}"
         run ceph osd pool set "${POOL_NAME}" compression_algorithm "${COMPRESSION_ALG}"
     fi
@@ -480,7 +461,7 @@ if [ "$SKIP_LAYOUT" = false ]; then
     # This matters for EC 4+2 -> EC 8+2 transcoding where the old pool
     # is not the conventional cephfs.<vol>.data.
     OLD_POOL=""
-    if command -v getfattr >/dev/null 2>&1 && [ "$DRY_RUN" = false ]; then
+    if command -v getfattr >/dev/null 2>&1; then
         OLD_POOL=$(getfattr -n ceph.dir.layout.pool --only-values "${MOUNT}" 2>/dev/null || true)
     fi
     if [ -z "$OLD_POOL" ]; then
@@ -488,6 +469,17 @@ if [ "$SKIP_LAYOUT" = false ]; then
         log_warn "Could not detect old pool; assuming '${OLD_POOL}'"
         log_warn "If this is wrong, manually run:"
         log_warn "  setfattr -n ceph.dir.layout.pool -v <OLD_POOL> ${TRANSCODE_TMPDIR}"
+    fi
+    if [ "$OLD_POOL" = "$POOL_NAME" ]; then
+        # A re-run: run 1 already pointed the root at the new pool, so the
+        # root no longer says where the old data lives. Pinning the tmpdir
+        # to what the root says now would pin it to the TARGET pool, which
+        # the transcoder refuses (a temp born in the target pool hides a
+        # failed layout application).
+        OLD_POOL="cephfs.${VOLUME}.data"
+        log_warn "Volume root already points at '${POOL_NAME}' (a re-run);"
+        log_warn "pinning the temp dir to '${OLD_POOL}' instead. If that is"
+        log_warn "not the default data pool, re-pin it by hand."
     fi
 
     log_info "Layout 1: Create temp directory and pin it to old pool '${OLD_POOL}'"
@@ -539,19 +531,7 @@ if [ "$SKIP_TRANSCODE" = false ]; then
     fi
 else
     log_info "Skipping transcoder invocation (pass --transcode to enable)"
-    TRANSCODER_ARGS=(/usr/local/sbin/vcephfs_transcoder.py
-        --min-age "${MIN_AGE}"
-        --min-size "${MIN_SIZE}")
-    if [ -n "$TRANSCODE_PATH" ]; then
-        TRANSCODER_ARGS+=("${TRANSCODE_PATH}")
-    else
-        TRANSCODER_ARGS+=("<path>")
-    fi
-    TRANSCODER_ARGS+=(--tmpdir "${TRANSCODE_TMPDIR}")
-    if [ -n "$LOG_FILE" ]; then
-        TRANSCODER_ARGS+=(--log-file "${LOG_FILE}")
-    fi
-    log_info "Would run: ${TRANSCODER_ARGS[*]}"
+    log_info "Would run: /usr/local/sbin/vcephfs_transcoder.py --min-age ${MIN_AGE} --min-size ${MIN_SIZE} ${TRANSCODE_PATH:-<path>} --tmpdir ${TRANSCODE_TMPDIR}${LOG_FILE:+ --log-file ${LOG_FILE}}"
     log_info "Note: the mount path on the client system may differ."
 fi
 

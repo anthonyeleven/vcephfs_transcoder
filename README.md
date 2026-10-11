@@ -28,71 +28,249 @@ Two scripts are provided:
   be performed first, and because often enough the two scripts will need
   to be run on different systems.
 
-  The new pool is set to be the _dir layout` for the specified subdirectory,
-  which may or may not be the root of the CephFS mount. Migration can
-  be specified for subtrees, potentially to different volumes.
-
-
+  Unless given `--skip-layout`, it also sets the new pool as the directory
+  layout of the volume root, so new files land there; the normal first pass
+  below skips that and keeps the root replicated. Migration can be specified
+  for subtrees, potentially to different volumes.
 
 * `vcephfs_transcoder.py` performs the actual migration.
 
-Note that both require a CephX client user with the `p` [capability flag](https://docs.ceph.com/en/latest/cephfs/client-auth/).
+Note that the transcoder, and the setup script's layout step, require a CephX client user with the `p` [capability flag](https://docs.ceph.com/en/latest/cephfs/client-auth/).
 
 Some feel that what this utility accomplishes does not qualify as transcoding.
 Tough. Marcan42 called it that, and so it remains.
 
-Usage:
+`--help` on either script prints every option. What follows is a normal
+first pass, the alternative of pointing the whole volume at the new pool, the
+options most runs never need, and the full `--help` of both.
+
+## A normal first pass: the root stays replicated
+
+A small file on EC 4+2 costs 9 RADOS objects (6 shards plus its 3-replica
+backtrace in the first data pool) against 3 on a replicated pool, so small files
+belong on the replicated pool and only large files are worth moving to EC. Every
+file's backtrace lives in the first data pool, and setting a file's pool after it
+is created would strand its backtrace there; the transcoder instead writes a new
+inode in a staging directory that carries the target layout and renames it into
+place.
+
+So:
+
+* The volume root keeps its layout on the replicated first data pool.
+* The EC pool is created and added to the filesystem, but the root is not pointed
+  at it.
+* The first pass moves files of 600 KiB and up to the EC pool with `--target-pool`
+  and `--source-pool`.
+* EC directory layouts go only on exception subtrees whose new files are mostly
+  large, so those land on EC directly.
+* A recurring sweep, the same invocation, moves the large files that keep landing
+  on the replicated pool.
+
+The example uses volume `myvol`, mounted at `/mnt/myvol`, with a new EC 4+2
+pool on SSDs.
+
+**1. Create and attach the pool.** Run the setup script with `--skip-layout` on a
+host with the admin keyring where the volume is mounted at the `--mount` path:
+under `--execute` it checks that path is a mountpoint and stops if it is not. It
+is a dry run unless given `--execute`, and it prints every command it would run.
 
 ```
-Usage:
-  vcephfs-transcode-setup.sh [OPTIONS]
-
-Options:
-  --mount PATH           Mount point for the volume
-                         (e.g. /shared/cephlab/howie)
-                         Volume name is derived from the last path
-                         component (e.g. "howie").
-  --ec-k INT             EC data chunks
-  --ec-m INT             EC parity chunks
-  --ec-plugin NAME       EC plugin (default: isa)
-  --crush-device-class CLASS
-                         Device class: ssd or hdd
-  --replicated           Transcode to a replicated pool instead of EC.
-                         Pool name: cephfs.<vol>.rdata
-                         Incompatible with --ec-k and --ec-m.
-
-  EC profile, CRUSH rule, and pool name are derived automatically:
-    profile:  ec<k>.<m><class>       e.g. ec8.2hdd
-    rule:     ec<k>.<m>-rule-<class> e.g. ec8.2-rule-hdd
-    pool:     cephfs.<vol>.ec<k>.<m>.<class>.data
-  --pg-num INT           PG count for new pool (default: 128)
-  --tmpdir PATH          Temp dir for transcoder (default: mount/tmp)
-  --fastec               Enable allow_ec_optimizations (FastEC)
-  --compression MODE     Compression mode for new pool (default: aggressive)
-                         (e.g. "aggressive", "force", "passive", "none")
-  --compression-algorithm ALG
-                         Compression algorithm (default: snappy)
-                         (e.g. "snappy", "zstd", "lz4", "zlib")
-  --min-age DAYS         Min file age in days (default: 1)
-  --min-size SIZE        Min file size (e.g. "1M", "300K")
-  --subdir PATH           Subdirectory under mount to transcode
-                         (e.g. "ethel/merman")
-  --log-file PATH        Log file for transcoder
-  --skip-pool-setup      Skip pool creation (already done)
-  --skip-layout          Skip layout / setfattr steps
-  --transcode            Run the transcoder (off by default)
-  --execute              Actually run commands (default: dry-run)
-  --help                 Show this help
-
+vcephfs-transcode-setup.sh --mount /mnt/myvol --ec-k 4 --ec-m 2 \
+    --crush-device-class ssd --pg-num 256 --skip-layout
+# review the commands, then the same again with --execute
 ```
 
+It reuses or creates the profile `ec4.2ssd` and the rule `ec4.2-rule-ssd`, creates
+`cephfs.myvol.ec4.2.ssd.data` and adds it to the filesystem. With `--skip-layout`
+it touches no layout.
 
+The volume root must already carry an explicit layout naming its default pool
+(`getfattr -n ceph.dir.layout /shared/ceph/myvol`; if it shows none, set it:
+`setfattr -n ceph.dir.layout.pool -v cephfs.myvol.data /shared/ceph/myvol`,
+which changes where no file lands). With no explicit layout anywhere, the
+transcoder cannot resolve a directory's layout and refuses to start.
+
+**2. Write the job's config file**, on local disk, never inside CephFS:
+
+```
+vcephfs_transcoder.py --print-config-example myvol > ~/tc_myvol.conf
+```
+
+Then set at least these keys (the query assumes the Ceph exporter's MDS
+metrics; any PromQL that returns one value in milliseconds works):
+
+```
+min_age_days    = 2
+min_size        = 614400
+threads         = 2
+regulate_prometheus_url = https://prometheus.example.com/api/v1/query
+regulate_query  = 1e3 * sum(increase(ceph_mds_reply_latency_sum{ceph_daemon=~"mds\\.{volume}\\..*"}[5m])) / sum(increase(ceph_mds_reply_latency_count{ceph_daemon=~"mds\\.{volume}\\..*"}[5m]))
+regulate_pause_ms = 30
+regulate_slo_ms   = 15
+```
+
+`min_size = 614400` keeps small files off EC. The regulator pauses the job while
+the volume's MDS reply latency is above `regulate_pause_ms`. Every key in the file
+is applied at startup, over the command line, and again whenever you change it.
+The same settings exist as options; the file is the one you can edit while the
+job runs.
+
+**3. Try it, then run it.** The transcode host needs the volume mounted as a CephX
+user with the `p` cap, and runs as root. `--target-pool` removes its staging
+directories through a second CephFS session, so it also needs `python3-cephfs`
+and, in `/etc/ceph`, the cluster's conf file (the one whose fsid or mon addresses
+match the mount) with that user's keyring beside it as
+`<cluster>.client.<name>.keyring`. `--rados-name` and `--rados-keyring` name
+another user and keyring.
+
+```
+mkdir /mnt/myvol/tmp      # the --tmpdir, on the root's replicated pool
+
+# a dry run on one subtree: copies and verifies, replaces nothing
+vcephfs_transcoder.py --config ~/tc_myvol.conf --tmpdir /mnt/myvol/tmp \
+    --target-pool cephfs.myvol.ec4.2.ssd.data --source-pool cephfs.myvol.data \
+    --dry-run --max-files 1000 /mnt/myvol/some/dir
+
+# the pass
+systemd-run --unit tc-myvol -p TimeoutStopSec=1h \
+    /usr/local/sbin/vcephfs_transcoder.py \
+    --config ~/tc_myvol.conf --tmpdir /mnt/myvol/tmp \
+    --target-pool cephfs.myvol.ec4.2.ssd.data --source-pool cephfs.myvol.data \
+    --log-file ~/tc.myvol.log --log-rotate-size 4 /mnt/myvol
+```
+
+A dry run is not free of side effects. With `--target-pool` it creates staging
+directories (`.vcephfs-tc-stage-*`, under the mount root, the file's pin boundary
+or its quota realm), removes them at exit, and moves their base directory's
+`ceph.dir.rctime`. Without it, each copy is staged next to its target and moves
+that directory's rctime. The run journal records either. `TimeoutStopSec` should
+be longer than the largest copy takes, so a stop lets in-flight copies finish
+instead of being killed.
+
+**4. Watch it.** The log has a `Progress:` line every minute and a `Complete:` line
+at the end that counts what was transcoded, failed, already matched, too recent,
+and so on. Change the pace by editing the config file, or with the signals listed
+in `--help`. `systemctl stop tc-myvol` sends SIGTERM, which lets in-flight copies
+finish; `systemctl kill -s SIGTERM tc-myvol` sends a second one, which stops at
+once.
+
+A file whose directory layout reads back invalid (all zeros, `pool=-1`) is
+skipped and counted as `invalid layout`; in a walk, the directory's whole subtree
+is skipped and counted in the `(+N subtrees)` beside it. If the same paths are
+skipped pass after pass, look at the directory by hand
+(`getfattr -n ceph.dir.layout DIR`). A path whose layout cannot be resolved at
+all is counted as `no layout` instead; the fix is the root `setfattr` from
+step 1, not `getfattr` archaeology.
+
+**5. Add EC layouts on exception subtrees.** Where a subtree's new files are
+mostly large, point it at the EC pool so they land there directly:
+
+```
+setfattr -n ceph.dir.layout.pool -v cephfs.myvol.ec4.2.ssd.data /mnt/myvol/sims
+```
+
+New small files under it land on EC too, so pick only subtrees whose large-file
+bytes outweigh that.
+
+**6. Sweep.** Run the same `--target-pool` invocation again as a recurring job, one
+pass after another and never two at once on a volume. With `min_age_days = 2` it
+moves the large files that landed on the replicated pool since the last pass. A
+pass is idempotent: files already moved count as "already matched", and files
+skipped as too recent, open or locked, open for write elsewhere, changed during
+the copy, or with an invalid layout are picked up by the next pass.
+
+## Alternative: point the volume root at the new pool
+
+Run the setup script without `--skip-layout`. It also makes
+`/mnt/myvol/tmp` on the old pool and points the root's layout at the new
+pool, so every new file, small ones included, lands there. That needs the volume
+mounted on the setup host as a CephX user with the `p` cap, besides the admin
+keyring. The transcoder then moves files to their directories' layouts, with no
+`--target-pool`:
+
+```
+systemd-run --unit tc-myvol -p TimeoutStopSec=1h \
+    /usr/local/sbin/vcephfs_transcoder.py \
+    --config ~/tc_myvol.conf --tmpdir /mnt/myvol/tmp \
+    --log-file ~/tc.myvol.log --log-rotate-size 4 /mnt/myvol
+```
+
+This suits a volume whose new files are nearly all large, or a move between two
+replicated pools.
+
+## Files held open for writing
+
+Before the copy and again right before the swap, the transcoder reads its own
+client's caps on the file (`ceph.caps`). No `Fc` means another client has it open
+for write; `Fw` means a process on this host does. Either way the file is skipped
+and counted as "open for write elsewhere", and a later pass retries it. The
+mtime/ctime/size re-check before the swap catches a write during the copy; a
+writer that opens the path between that check and the rename -- a window a few
+MDS round trips wide -- is missed. Neither
+check sees a writer that keeps the file open and sits idle: the kernel client drops
+its wanted caps on an open file left idle for about a minute. When that writer
+writes again, it writes to the replaced, unlinked inode, and those writes never
+reach the path. `--min-age` stays the main guard: keep it at 2 (the default) or
+more, and keep the transcoder off trees whose writers hold files open for days, such
+as long-lived logs and databases. If the kernel cannot report `ceph.caps`, the
+transcoder says so once at startup and runs without the check.
+
+## Advanced options
+
+For special cases a first pass is unlikely to hit. `--help` describes each.
+
+Setup script: `--replicated` targets a replicated pool instead of EC;
+`--ec-plugin`, `--fastec`, `--compression`, `--compression-algorithm` and
+`--pg-autoscale-mode` change pool properties; `--skip-pool-setup` redoes only
+the layout step; `--subdir` with `--transcode` has it launch the transcoder
+itself. The generated help below glosses each.
+
+Transcoder:
+
+* Choosing files without a walk: `--paths-from FILE` (a list, e.g. from an earlier
+  run's log) and `--paths-from-pool POOL` (read the pool itself to drain it), with
+  `--lookupino-rate`, `--rados-conffile`, `--rados-mon-host`, `--rados-keyring` and
+  `--rados-name`.
+* `--target-pool-kind`: say whether `--target-pool` is replicated or EC on a host
+  without the ceph CLI, when the pool's name doesn't.
+* `--reap-staging`, `--reap-staging-min-age`: remove staging directories a killed
+  `--target-pool` run left behind.
+* `--max-size`: an upper size bound; a replicated `--target-pool` needs one.
+* `--process-hardlinks`: move multiply-linked files, which are skipped by default.
+  Every link has to be under the directories given.
+* `--stage-in-tmpdir`, `--force-tmpdir-pool`: escape hatches, slow or unsafe for
+  routine use.
+* Walk pruning: `--prune-dir-regex` (replace the default set of pruned directory
+  names), `--prune-small-subtrees`, `--prune-subtree-max-bytes`,
+  `--prune-budget-bytes`.
+* `--copy-file-range`, `--no-copy-file-range`: server-side copy, off by default.
+* Regulator tuning: `--regulate-period-s`, `--regulate-floor-ms`,
+  `--regulate-quiet-ticks`, `--regulate-max-threads`, `--regulate-blind-resume-s`,
+  `--regulate-blind-throttle-s`, `--regulate-blind-delay-ms`; `--no-regulate` runs
+  unregulated on purpose.
+* Logs and limits: `--log-rotate-lines`, `--log-rotate-time`,
+  `--log-rotate-size`, `--max-files`,
+  `--config-poll-seconds`, `--debug`, `--no-run-journal`.
+
+## Full option reference
+
+Generated from the scripts themselves; regenerate both blocks whenever an option
+changes:
+
+```
+COLUMNS=80 NO_COLOR=1 HOME=/root vcephfs_transcoder.py --help
+vcephfs-transcode-setup.sh --help
+```
+
+### `vcephfs_transcoder.py --help`
+
+<!-- BEGIN vcephfs_transcoder.py --help -->
 ```
 usage: vcephfs_transcoder.py [-h] [--version] [--paths-from-pool POOL]
-                             [--rados-conffile PATH] [--rados-mon-host ADDRS]
-                             [--rados-keyring PATH] [--rados-name NAME]
-                             [--paths-from FILE] [--tmpdir TMPDIR]
-                             [--process-hardlinks] [--debug]
+                             [--lookupino-rate N] [--rados-conffile PATH]
+                             [--rados-mon-host ADDRS] [--rados-keyring PATH]
+                             [--rados-name NAME] [--paths-from FILE]
+                             [--tmpdir TMPDIR] [--process-hardlinks] [--debug]
                              [--min-age MIN_AGE] [--min-size SIZE]
                              [--max-size SIZE] [--threads THREADS] [--dry-run]
                              [--config PATH] [--print-config-example [VOLUME]]
@@ -111,7 +289,10 @@ usage: vcephfs_transcoder.py [-h] [--version] [--paths-from-pool POOL]
                              [--regulate-quiet-ticks N]
                              [--regulate-max-threads N]
                              [--regulate-blind-resume-s SEC]
+                             [--regulate-blind-throttle-s SEC]
+                             [--regulate-blind-delay-ms MS]
                              [--source-pool POOL] [--target-pool POOL]
+                             [--reap-staging] [--reap-staging-min-age SEC]
                              [--target-pool-kind {rep,ec}]
                              [--prune-small-subtrees]
                              [--prune-subtree-max-bytes BYTES]
@@ -125,54 +306,56 @@ Transcode cephfs files to their directory layout
 positional arguments:
   dirs                  Directories to scan
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   --version             show program's version number and exit
   --paths-from-pool POOL
-                        Transcode exactly the files that are currently in
-                        POOL, discovered by reading the pool itself instead of
-                        walking the tree. Costs no MDS walk and is
-                        proportional to what is left in the pool rather than
-                        to the size of the filesystem. POOL must no longer be
-                        the default write target of the directories given, or
-                        the set keeps growing and the drain cannot converge;
-                        that is checked and refused. Needs the RADOS Python
-                        bindings. Mutually exclusive with --paths-from. NOTE:
-                        a file renamed after the listing keeps its old
-                        backtrace until the MDS trims the log segment holding
-                        the rename, so it is read at a stale path and counted
-                        vanished while still occupying the pool. One pass is
-                        therefore not final: re-run to converge, and 'ceph
-                        tell mds.<daemon> flush journal' forces the backtrace
-                        writes instead of waiting for them.
+                        Transcode exactly the files in POOL, read from the
+                        pool instead of walking the tree. POOL must not be the
+                        default write target of the directories given
+                        (refused). Needs the RADOS Python bindings; not with
+                        --paths-from. A file under a renamed directory is
+                        found again by inode (as root; each parent checked
+                        once, held by a pause and paced by --file-delay and
+                        --lookupino-rate, only under the directories given); a
+                        replaced or gone one is skipped and a live one it
+                        cannot locate is reported. Gone is not deletion
+                        evidence: a file moved out just before its directory
+                        was deleted is skipped until a re-run sees its new
+                        backtrace. A recently renamed file itself is read at
+                        its old path and counted vanished, so re-run to
+                        converge ('ceph tell mds.<daemon> flush journal'
+                        speeds that up).
+  --lookupino-rate N    MDS inode lookups per second for --paths-from-pool
+                        (default 20; 0 turns them off).
   --rados-conffile PATH
                         ceph.conf for --paths-from-pool. Default: $CEPH_CONF,
                         then /etc/ceph/ceph.conf, then a single
                         /etc/ceph/*.conf, then monitor addresses recovered
                         from the mount. Containerized hosts often have no
-                        ceph.conf at all, hence the fallbacks.
+                        ceph.conf at all, hence the fallbacks. With --rados-
+                        name and --rados-keyring, this and --rados-mon-host
+                        also locate the cluster for --target-pool's staging-
+                        removal session.
   --rados-mon-host ADDRS
                         Comma-separated monitor addresses for --paths-from-
                         pool, used instead of a conffile.
   --rados-keyring PATH  Keyring for --paths-from-pool. Default: whatever the
-                        conffile says.
+                        conffile says. Given with --rados-name, also the
+                        keyring of --target-pool's staging-removal session.
   --rados-name NAME     RADOS client name for --paths-from-pool (default
                         client.admin). Needs read access to the pool and to
-                        its objects' xattrs.
+                        its objects' xattrs. Given with --rados-keyring, also
+                        the user of --target-pool's staging-removal session,
+                        which otherwise is the mount's name=.
   --paths-from FILE     Transcode exactly the files listed in FILE ('-' for
-                        stdin) instead of walking the directories. NUL- or
-                        newline-delimited, detected from the content. The
-                        directories still have to be given: they bound what
-                        the list is allowed to touch, and a listed path
-                        outside them is refused. Every path is re-stat'ed and
-                        re-checked, so a list that has gone stale is safe --
-                        vanished files are counted and logged, not treated as
-                        errors. Multiply-linked files are declined in this
-                        mode because a list cannot promise it holds every
-                        link. Intended for a second pass whose candidates are
-                        already known from an earlier run's log, where walking
-                        the whole tree again to rediscover them is the
-                        expensive part.
+                        stdin; NUL- or newline-delimited; a NUL list is read
+                        byte-exact) instead of walking. A path outside the
+                        given directories is refused, as is one reached
+                        through a symlinked directory under them or on another
+                        filesystem (the walk never follows a symlink either).
+                        Every path is re-checked, so a stale list is safe;
+                        multiply-linked files are declined.
   --tmpdir TMPDIR       Temporary directory to which to copy files. Important:
                         This directory should have its layout set to the
                         *default* data pool for the FS, to avoid excess
@@ -181,32 +364,33 @@ optional arguments:
                         dangerous
   --debug, -d
   --min-age MIN_AGE     Minimum age of file before transcoding, in days
-                        (adjustable at runtime via SIGRTMIN+2/SIGRTMIN+3)
+                        (adjustable at runtime via SIGRTMIN+2/SIGRTMIN+3). The
+                        main guard against files held open for writing; see
+                        below
   --min-size SIZE       Skip files smaller than this size. Suffix B/K/M/G
                         (binary); plain number means bytes. 0 disables.
   --max-size SIZE       Skip files larger than this size (same format as
                         --min-size). Omit for no upper limit.
   --threads THREADS     Number of threads for data copying
   --dry-run, -n         Perform transcode but do not replace files. Without
-                        --stage-in-tmpdir each copy is still staged beside its
-                        target, which moves the directory's rctime, so the run
-                        journal records that pin.
-  --config PATH         key=value file of live tunables (file_delay_ms,
-                        threads, min_age_days, min_size, prune_dir_regex), re-
-                        read when its mtime changes. Keep it on local disk,
-                        NOT in the CephFS volume: a stat there is an MDS round
-                        trip.
+                        --stage-in-tmpdir each copy is still staged, beside
+                        its target or, with --target-pool, in a staging
+                        directory, which moves that directory's rctime, so the
+                        run journal records that pin.
+  --config PATH         key=value file of live tunables, re-read when its
+                        mtime changes; the example at the end of this help
+                        lists every key. Keep it on local disk, NOT in the
+                        CephFS volume: a stat there is an MDS round trip.
   --print-config-example [VOLUME]
                         print a fully-populated --config file for VOLUME and
                         exit
   --config-poll-seconds SEC
                         how often to stat --config for changes (default: 10)
   --stage-in-tmpdir     Stage temp copies in --tmpdir instead of beside their
-                        target. This is the pre-2026-09 behavior and it is
-                        slow: staging elsewhere makes every replace a cross-
-                        rank distributed rename (mean 1266 ms, tail to 14.9 s)
-                        instead of an intra-directory one (mean 0.26 ms).
-                        Escape hatch only.
+                        target. It is slow: staging elsewhere makes every
+                        replace a cross-rank distributed rename (mean 1266 ms,
+                        tail to 14.9 s) instead of an intra-directory one
+                        (mean 0.26 ms). Escape hatch only.
   --no-regulate         run unregulated, deliberately. Without this, starting
                         with no regulate_prometheus_url logs at WARNING rather
                         than INFO, because an omitted --config is otherwise
@@ -225,32 +409,20 @@ optional arguments:
                         Rotate the log file when it reaches this size in GiB
                         (requires --log-file)
   --no-copy-file-range  Disable use of copy_file_range and always use
-                        userspace copy. DEFAULT since 2026-09-05: a 15-thread
-                        A/B measured copy_file_range no faster overall (154.0
-                        vs 170.1 MiB/s) and 1.3-2.1x SLOWER for files under 1
-                        MiB, which is the size range these jobs now work in.
+                        userspace copy. The DEFAULT: in a 15-thread A/B
+                        copy_file_range is no faster overall (154.0 vs 170.1
+                        MiB/s) and 1.3-2.1x SLOWER for files under 1 MiB,
+                        which is the size range these jobs work in.
   --copy-file-range     Opt back in to copy_file_range (server-side copy when
                         CephFS supports it). Off by default; see --no-copy-
                         file-range.
   --regulate-prometheus-url URL
                         Prometheus /api/v1/query endpoint for self-regulation.
-                        Unset (the default) disables regulation entirely and
-                        the job simply runs at --file-delay and --threads --
-                        and says so at WARNING, since an accidental omission
-                        looks exactly like a deliberate one. Pass --no-
-                        regulate to declare it deliberate and quiet.
-                        Credentials in the URL are NOT supported: urllib does
-                        not use URL userinfo for authentication, so a
-                        user:password@ URL is refused rather than failing on
-                        every sample -- use an HTTPBasicAuthHandler if the
-                        endpoint needs basic auth. A credential passed here is
-                        ALSO exposed in `ps`, which log scrubbing cannot undo:
-                        the title is only rewritten from the first retitle
-                        onward, so the original argv is visible until then --
-                        and if python3-setproctitle is not installed the title
-                        is never rewritten at all and the credential stays
-                        visible for the whole run. Do not put a credential on
-                        the command line.
+                        Unset, the job runs at --file-delay and --threads and
+                        says so at WARNING (--no-regulate makes that
+                        deliberate and quiet). A user:password@ URL is
+                        refused: urllib ignores URL userinfo. Never put a
+                        credential on the command line; ps shows it.
   --regulate-query PROMQL
                         A complete PromQL expression returning ONE value in
                         MILLISECONDS for the latency to protect. {volume} is
@@ -286,25 +458,46 @@ optional arguments:
                         stay paused; the first usable sample restores the rest
                         (default 1800; 0 = stay paused until a sample
                         arrives).
+  --regulate-blind-throttle-s SEC
+                        If the job is running (not paused) and no usable
+                        sample arrives for this long, throttle it to 1 thread
+                        and at least --regulate-blind-delay-ms per file until
+                        one does, rather than keep whatever settings it had
+                        earned with nothing watching the MDS (default 600; 0 =
+                        hold the last settings indefinitely).
+  --regulate-blind-delay-ms MS
+                        File delay a blind throttle raises the job to (default
+                        20).
   --source-pool POOL    Only transcode files whose CURRENT data pool is POOL.
                         Without it, every file not already on the target pool
                         is eligible. Use this to drain one pool into another
                         without also sweeping the default pool.
-  --target-pool POOL    Send eligible files to POOL instead of to their
-                        directory's layout pool. Directory layouts are never
-                        changed: a file whose directory points elsewhere is
-                        copied in a hidden staging subdirectory created with
-                        POOL's layout and renamed up into place, so new files
-                        keep landing where they always did. Needs a size band:
-                        a replicated POOL takes only --max-size below 614400,
-                        an EC POOL only --min-size at or above its floor (at
-                        least 614400). Lets a small-file pass run while the
-                        volume root stays on EC. With --paths-from or --paths-
-                        from-pool the list is read in full and grouped by
-                        directory before anything moves, spilling about 100
-                        bytes per path beside --log-file -- or, without one,
-                        in the system temp directory, which is often RAM-
-                        backed.
+  --target-pool POOL    Send eligible files to POOL instead of their
+                        directory's layout pool, without changing any
+                        directory layout: the copy is made in a hidden staging
+                        directory with POOL's layout (under the mount root,
+                        the file's pin boundary or its quota realm) and
+                        renamed into place; staging directories are removed
+                        when the run ends. Needs a size band: a replicated
+                        POOL --max-size below 614400, an EC POOL --min-size at
+                        or above its floor (at least 614400). With --paths-
+                        from or --paths-from-pool the list is grouped by
+                        directory first, spilling ~100 bytes per path beside
+                        --log-file (else in the system temp directory).
+  --reap-staging        Instead of transcoding, remove leftover staging
+                        directories (.vcephfs-tc-stage-<id>) through a
+                        separate CephFS session: each untouched for --reap-
+                        staging-min-age, with its aged temps; anything else is
+                        reported and left. --paths-from FILE lists directories
+                        to check without a walk. Paced like a walk (--file-
+                        delay, --config threads, the regulator); the first
+                        SIGINT, SIGTERM or SIGHUP stops it.
+  --reap-staging-min-age SEC
+                        With --reap-staging, take a staging directory only
+                        once its ctime, and each temp's mtime and ctime, are
+                        this old (default 3600). Running jobs refresh theirs
+                        every quarter of the default, so a lower value can
+                        take a live job's directory.
   --target-pool-kind {rep,ec}
                         Whether --target-pool is replicated or EC, for hosts
                         without a usable ceph CLI. Without either, the pool's
@@ -313,14 +506,10 @@ optional arguments:
                         anything else is refused. Refused if it contradicts
                         the cluster.
   --prune-small-subtrees
-                        Skip whole subtrees whose recursive size makes them
-                        not worth walking, using the MDS's own
-                        ceph.dir.rbytes/rfiles (one getfattr per directory, no
-                        walk). OFF by default: it changes what the pass
-                        covers, which should always be deliberate. INERT
-                        without --min-size, since the mean-size test compares
-                        against min-size/8; a warning is logged at startup if
-                        you pass this with --min-size 0.
+                        Skip subtrees whose ceph.dir.rbytes/rfiles make them
+                        not worth walking (one getfattr per directory). Off by
+                        default, since it changes what a pass covers. Inert
+                        with --min-size 0 (warned).
   --prune-subtree-max-bytes BYTES
                         With --prune-small-subtrees, only prune a subtree
                         whose TOTAL recursive bytes are below this (default 1
@@ -338,28 +527,31 @@ optional arguments:
   --file-delay MS       Delay in milliseconds before statting each new file
                         (adjustable at runtime via SIGRTMIN/SIGRTMIN+1)
   --prune-dir-regex REGEX
-                        Regular expression (unanchored, via re.search) matched
-                        against directory NAMES; any name containing a match
-                        is pruned from the walk entirely (not descended into
-                        or statted). Anchor with ^ / $ for exact names, e.g.
-                        '\.runfiles$' to skip Bazel runfiles symlink farms.
-                        Overrides the built-in default set (see
-                        DEFAULT_PRUNE_DIRS); pass an empty string to disable
-                        pruning entirely.
+                        Regex (re.search) matched against directory NAMES; a
+                        match is pruned, not descended into. Anchor with ^ /
+                        $, e.g. '\.runfiles$'. Replaces the default set
+                        (DEFAULT_PRUNE_DIRS); '' disables pruning.
   --no-run-journal      Do not write .vcephfs-transcode-runs.jsonl at each
-                        volume root. The journal records, per artifact, the
-                        ceph.dir.rctime and newest file mtime seen BEFORE this
-                        run modified anything, because transcoding pins rctime
-                        at the time we ran and a directory that is never
-                        written again stays pinned forever -- so retention
-                        reads transcoded data as fresh and stops expiring it.
-                        rctime cannot be restored (it is monotonic and not
-                        settable), so preserving the answer is the only
-                        option. Costs one getxattr per artifact root. A run
-                        that does not exit cleanly leaves its last checkpoint,
-                        at most 5 minutes old, in .vcephfs-transcode-
-                        runs.jsonl.<run>.partial. Disable only if nothing
-                        consumes rctime.
+                        volume root. It keeps each artifact's ceph.dir.rctime
+                        and newest file mtime from before the run, since a
+                        transcode pins rctime and retention would read the
+                        data as new. One getxattr per artifact root; an
+                        unclean exit leaves a checkpoint at most 5 minutes old
+                        in .vcephfs-transcode-runs.jsonl.<run>.partial.
+
+files held open for writing:
+  Before the copy and again right before the swap, the tool reads
+  its own client's caps on the file (ceph.caps). No Fc means
+  another client has it open for write; Fw means a process on
+  this host does. Either way the file is skipped, counted as
+  "open for write elsewhere", and a later pass retries it. The
+  kernel client drops its wanted caps on an open file left idle
+  for about a minute, so a writer that keeps a file open, sits
+  idle past --min-age and then writes again is invisible to this
+  check; its writes go to the replaced, unlinked inode. --min-age
+  stays the main guard: use 2 or more, and keep the tool off
+  trees whose writers hold files open for days (long-lived logs,
+  databases).
 
 runtime signals:
   SIGUSR1  (10)  increase thread count by 1 (resumes from pause)
@@ -382,7 +574,7 @@ exit signals:
 example --config file (every key at its default):
 
     # vcephfs_transcoder runtime config -- VOLUME
-    # Conventional path: /home/USER/tc_VOLUME.conf
+    # Conventional path: /root/tc_VOLUME.conf
     #
     # Re-read when this file's mtime changes (--config-poll-seconds,
     # default 10s). Only keys whose value CHANGED in the file are applied,
@@ -403,7 +595,7 @@ example --config file (every key at its default):
     
     # Concurrent copies. Bounds the copier, not the walker. 0 pauses the job
     # (in-flight copies finish); set > 0 to resume.
-    threads         = 1
+    threads         = 4
     
     # --- how the delay signals move ---------------------------------------
     # SIGRTMIN multiplies the delay, SIGRTMIN+1 divides it. Separate rates
@@ -419,7 +611,7 @@ example --config file (every key at its default):
     
     # --- what counts as eligible ------------------------------------------
     # Skip files modified within this many days.
-    min_age_days    = 1
+    min_age_days    = 2
     
     # Skip files smaller than this many bytes. Pre-Tentacle, EC pads small
     # objects to a whole stripe, which is why this is not lower.
@@ -488,272 +680,63 @@ example --config file (every key at its default):
     # of holding 0 forever; the first usable sample restores the rest.
     # 0 holds until a sample arrives.
     regulate_blind_resume_s = 1800
+    
+    # A running job with no usable sample for this long throttles
+    # itself to 1 thread and at least regulate_blind_delay_ms per file,
+    # instead of holding whatever it had earned while nothing watches the
+    # MDS. A usable sample hands control back. 0 holds forever.
+    regulate_blind_throttle_s = 600
+    regulate_blind_delay_ms = 20
 
-    redirect it to disk with:  vcephfs_transcoder.py --print-config-example > /home/USER/tc_VOLUME.conf
+    redirect it to disk with:  vcephfs_transcoder.py --print-config-example > /root/tc_VOLUME.conf
 ```
+<!-- END vcephfs_transcoder.py --help -->
 
+### `vcephfs-transcode-setup.sh --help`
 
-
-Example invocations:
+<!-- BEGIN vcephfs-transcode-setup.sh --help -->
 ```
-/usr/local/sbin/vcephfs-transcode-setup.sh --mount /shared/ceph/ethel --ec-k 6 --ec-m 3 --crush-device-class ssd --subdir /merman
+Usage:
+  vcephfs-transcode-setup.sh [OPTIONS]
 
-/usr/local/sbin/vcephfs_transcoder.py --min-age 1 --min-size 500k /shared/ceph/ethel/merman --tmpdir /shared/ceph/ethel/merman/tmp --log-file ~/ethel/transcode.log --dry-run
+Options:
+  --mount PATH           Mount point for the volume
+                         (e.g. /shared/cephlab/howie)
+                         Volume name is derived from the last path
+                         component (e.g. "howie").
+  --ec-k INT             EC data chunks
+  --ec-m INT             EC parity chunks
+  --ec-plugin NAME       EC plugin (default: isa)
+  --crush-device-class CLASS
+                         Device class: ssd or hdd
+  --replicated           Transcode to a replicated pool instead of EC.
+                         Pool name: cephfs.<vol>.rdata
+                         Incompatible with --ec-k and --ec-m.
 
+  EC profile, CRUSH rule, and pool name are derived automatically:
+    profile:  ec<k>.<m><class>       e.g. ec8.2hdd
+    rule:     ec<k>.<m>-rule-<class> e.g. ec8.2-rule-hdd
+    pool:     cephfs.<vol>.ec<k>.<m>.<class>.data
+  --pg-num INT           PG count for new pool (default: 128)
+  --pg-autoscale-mode MODE
+                         PG autoscale mode for new pool (default: off)
+                         (e.g. "off", "on", "warn")
+  --tmpdir PATH          Temp dir for transcoder (default: mount/tmp)
+  --fastec               Enable allow_ec_optimizations (FastEC)
+  --compression MODE     Compression mode for new pool (default: aggressive)
+                         (e.g. "aggressive", "force", "passive", "none")
+  --compression-algorithm ALG
+                         Compression algorithm (default: snappy)
+                         (e.g. "snappy", "zstd", "lz4", "zlib")
+  --min-age DAYS         Min file age in days (default: 2)
+  --min-size SIZE        Min file size (e.g. "1M", "300K")
+  --subdir PATH           Subdirectory under mount to transcode
+                         (e.g. "ethel/merman")
+  --log-file PATH        Log file for transcoder
+  --skip-pool-setup      Skip pool creation (already done)
+  --skip-layout          Skip layout / setfattr steps
+  --transcode            Run the transcoder (off by default)
+  --execute              Actually run commands (default: dry-run)
+  --help                 Show this help
 ```
-
-
-
-This was presented at Ceph Day Seattle 2026, and based on a script posted
-to Reddit by `marcan42`.
-
-
-### When `--copy-file-range` may still be the right choice
-
-The default here is off, on measurements taken with clients well connected to the
-cluster. That is not everyone's situation, and the reasoning behind the default does
-not transfer to all of them.
-
-`copy_file_range` on CephFS can become an OSD-to-OSD copy, in which case the data
-never traverses the client's link at all. Where a client reaches the cluster over a
-slower or higher-latency path than the cluster's own interconnect, that matters far
-more than any per-call overhead: a userspace copy moves the file across that link
-twice, once in and once out.
-
-**In this deployment that offload does not appear to happen.** Measured on a 1 GiB
-cross-pool copy, counting the client's own interfaces:
-
-```
-  method         secs     MiB/s    client rx    client tx   wire/filesize
-  cfr            1.13     905.9        1034Mi       1033Mi          2.02x
-  userspace      1.17     874.9        1034Mi       1033Mi          2.02x
-```
-
-Both methods put the whole file across the client link in each direction. Whatever
-`copy_file_range` is doing here, it is not keeping the data off the wire, which is
-why it shows up in our numbers as pure overhead.
-
-Two honest limits on that result. It is one configuration — the copies are
-**cross-pool** (replicated to erasure-coded), which is this tool's entire purpose and
-a plausible reason the fast path declines, but we did not isolate the cause. And
-counting bytes at the client says nothing about what the fabric beyond that hop
-carried, or what a differently-connected client would experience.
-
-So: if your clients are remote, or you have reason to believe the OSD-side copy
-engages in your setup, measure it before accepting the default. Compare the client's
-interface counters across an identical copy done each way — if `copy_file_range`
-moves markedly less data across the client link than a userspace copy does, the
-offload is working for you and `--copy-file-range` is likely worth enabling
-regardless of what the per-call overhead costs.
-
-## Second passes: `--paths-from`
-
-A second pass at a lower `--min-size` usually already knows its candidates. The
-previous run logged every file it skipped and why, so the list of files that were
-"below --min-size" *is* the candidate set for the next threshold.
-
-Rediscovering them by walking is the expensive part. `file_delay` sleeps once per
-file **encountered**, in the single-threaded producer loop, before the `stat` — so
-a pass costs roughly `rfiles × file_delay` no matter how few files qualify. On one
-production volume that meant visiting 195M paths to reach 8.7M candidates: about
-45 days of walking to do 2 days of work.
-
-```
-# extract the candidates from the previous run's log
-grep -a 'below --min-size' prev.log \
-  | sed -E 's/.*Skipping (.*): size [0-9]+ below --min-size [0-9]+$/\1/' \
-  > candidates.txt
-
-vcephfs_transcoder.py --min-size 131072 /vol/data \
-    --tmpdir /vol/data/tmp-transcode --paths-from candidates.txt
-```
-
-The directories still have to be given. They are not scanned; they bound what the
-list is allowed to touch, and a listed path outside them is refused and counted.
-A list is easy to generate against the wrong volume and the damage would be quiet
-and large.
-
-The file is NUL- or newline-delimited, detected from its content, so both
-`find -print0` and a line-oriented scrape work without a flag. It is read in
-chunks rather than slurped — these lists run to tens of millions of lines.
-
-### The list is a snapshot, and it decays
-
-Nothing here trusts the list. Every path is re-`stat`ed and its layout re-read,
-exactly as the walker would, so a stale list is safe rather than dangerous. What
-it costs you is coverage, and that can go fast. Measured on two volumes six days
-after the logs were written:
-
-| | still exists | of those, still needing the move |
-|---|---|---|
-| volume A | 36.7% | 60.6% |
-| volume B | 100.0% | 98.2% |
-
-On volume A only 22% of the list was still worth acting on. So regenerate the list
-close to when you use it, and read `vanished` in the completion line as the measure
-of how stale it was:
-
-```
-Complete: 0 transcoded, 0 failed, 20 already matched, 0 wrong source pool,
-          20 vanished, ...
-```
-
-A path that has disappeared is logged at INFO and counted. It is an expected
-outcome of a list that has aged, not an error, and it never aborts the run.
-
-### What this mode deliberately does not do
-
-- **It does not discover.** A list cannot contain files created after the log was
-  written, or files the earlier run never reached. Use it to re-process known
-  candidates cheaply; keep a full walk for finding new work.
-- **It declines multiply-linked files.** Every link has to be in hand before any
-  of them can be replaced, and a list cannot promise it holds them all.
-  Transcoding a partial set would break the link relationship, so this mode skips
-  them regardless of `--process-hardlinks`. Walk for those.
-- **`--prune-dir-regex` and `--prune-small-subtrees` have no effect,** and say so
-  at startup. They prune the walk; here the list has replaced the walk.
-
-### One deliberate difference from the walker
-
-This mode checks the file's **layout before its size**; the walker does the
-reverse. The walker is right for its case: most of what it encounters is tiny, a
-`stat` alone rejects it, and reading a layout for every file would add an MDS
-round trip to the common path.
-
-A list is already filtered to plausible candidates, and its stalest entries are
-exactly the ones an earlier pass has since moved. Testing size first would log
-those as "below --min-size" and hide the fact that they are already done — which
-is not hypothetical: it is how one analysis came to overstate its remaining work,
-by counting already-converted files as outstanding candidates.
-
-## Runtime configuration
-
-Long passes need retuning while they run. A pass over a large volume takes weeks,
-the filesystem underneath it does not hold still for that long, and restarting to
-change a setting throws away the walk position — there is no checkpoint, so a
-restart re-walks from the top.
-
-So the tunables live in a `key = value` file, re-read whenever its mtime changes:
-
-```
-vcephfs_transcoder.py --print-config-example > ~/tc_myvolume.conf
-vcephfs_transcoder.py --config ~/tc_myvolume.conf /mnt/cephfs/myvolume ...
-```
-
-Edit the file and the running job picks it up within `--config-poll-seconds`
-(default 10). No restart, no signals, no lost position. `--print-config-example`
-emits every key at its default with the reasoning for each inline, so the file is
-its own documentation; the same example is reproduced in `--help`.
-
-Currently settable at runtime: `file_delay_ms`, `threads`, `min_age_days`,
-`min_size`, `prune_dir_regex`, `prune_subtree_max_bytes`, `prune_budget_bytes`,
-and the delay-stepping controls `delay_step_up` / `delay_step_down` /
-`delay_min_ms`.
-
-### The trap: every edit re-applies every key
-
-An edit to the file re-applies **all** the keys it contains, not just the one you
-changed. So any key left present in the file is silently reasserted whenever you
-touch anything else.
-
-This is not hypothetical. Lowering `min_size` on a running job reset its thread
-count from 15 back to 1, because `threads` was still set in the file from an
-earlier session, and the job crawled until somebody noticed.
-
-If an external controller owns a tunable, **comment that key out**:
-
-```
-# threads and file_delay_ms are owned by the controller. Leaving them set here
-# means any unrelated edit to this file resets them.
-# threads         = 1
-# file_delay_ms   = 100
-min_age_days    = 33
-min_size        = 131072
-```
-
-A key that is absent is not applied. A key that is present is applied on every
-reload, whether or not you meant to change it.
-
-### Notes
-
-- One file per volume. The jobs are independent and their sensible settings
-  differ by orders of magnitude — a volume of 4 MiB files and a volume of 30 KiB
-  files want nothing in common.
-- Comments are stripped at `#`, and keys split on the first `=`, so values may
-  contain `=` but not `#`.
-- Unknown keys are rejected with an error naming the line, rather than ignored —
-  a typo in a tuning edit should not read as success.
-
-## Why a file-level transcoder, and not RADOS-layer pool migration
-
-Ceph has an in-flight alternative: transparent pool migration at the RADOS layer,
-below the filesystem — see ceph/ceph
-[#65746 "Pool Migration"](https://github.com/ceph/ceph/pull/65746) and
-[#69112 "Pool Migration 2"](https://github.com/ceph/ceph/pull/69112) by `jamiepryde`.
-It uses the redirect/manifest shape: the source pool keeps a small redirect object per
-migrated object and clients are forwarded transparently.
-
-The two approaches trade off in opposite directions, and which one you want depends
-almost entirely on whether you need the source pool to go away.
-
-| | This transcoder | RADOS-layer redirect |
-|---|---|---|
-| Layer | File, MDS-mediated | Object, below the filesystem |
-| Residue in the source pool | A zero-byte backtrace object, and only in the filesystem's **first** data pool | A redirect object per migrated object, in **every** source pool |
-| Can the source pool be deleted afterwards? | **Yes**, for any pool that is not the filesystem's first data pool | **No** — the redirects are load-bearing |
-| Client transparency | Each replacement is an atomic rename, but it is per-file work | Fully transparent; no walk at all |
-| Cost model | One full tree walk plus per-file MDS operations | No walk, but a permanent indirection on every read |
-| Reversible mid-flight? | Yes — stop the job; whatever moved has moved | Bounded by the redirect layer's own lifecycle |
-
-The short version: this tool pays an enormous one-time walk and in exchange leaves a
-source pool that is genuinely empty and can be dropped. The redirect model skips the
-walk entirely, and in exchange you carry the source pool and an extra hop forever.
-
-### What "empty" actually means
-
-Verified on a production cluster rather than inferred:
-
-- A transcode does not move a file. It creates a **new inode**, copies into it, then
-  renames over the original — which unlinks the old inode completely. After a journal
-  flush the old inode's objects are absent from every pool, so a non-first source pool
-  really does reach zero and can be deleted.
-- Every inode keeps a backtrace in the filesystem's **first** data pool
-  (`data_pools[0]`), regardless of where its data lives. That pool can never be
-  emptied, and it is not the same thing as a directory's *default* pool
-  (`ceph.dir.layout.pool`), which is freely settable and is how a transcode target is
-  chosen. Pointing the volume root at an EC pool changes where new files land; it does
-  not change the first data pool.
-- A file whose data is outside the first pool therefore costs **two** objects: its data
-  object, plus a zero-byte object in the first pool holding only the backtrace —
-  measured at size 0, a 305-355 byte `parent` xattr, zero omap entries.
-
-That last point is the price of using a non-first pool, **not** a price of transcoding:
-a file created directly on the EC pool carries exactly the same two objects.
-
-### The cost is object count, not capacity
-
-Across 980 OSDs holding 17.4 PiB, with the BlueStore DB colocated on the block device
-on every OSD:
-
-```
-    raw size         23512.7 TiB
-    used total       17403.0 TiB
-      of which data  17332.3 TiB
-      of which META     63.4 TiB   <- RocksDB/BlueFS
-      of which omap      7.4 TiB
-    META as % of used: 0.36%
-```
-
-Metadata is 0.36% of used space, so capacity is not the concern. Object count is: it
-drives scrub duration, recovery granularity, peering cost and onode cache pressure.
-Per-GB is the wrong denominator; per-OSD and per-PG are the right ones.
-
-This is the mechanism behind "bytes leave, objects stay" — a fully transcoded volume
-keeps one zero-byte object per file in its first pool forever, so its object count does
-not fall even as its stored bytes approach zero. Size pools for the object count they
-will retain, not the bytes they will shed.
-
-A corollary if you are widening an EC profile rather than migrating from replication:
-4+2 to 8+2 raises shards per object from 6 to 10, so object count rises with it. On a
-cluster whose DB lives on a separate device rather than colocated, that is the case to
-size for before starting.
+<!-- END vcephfs-transcode-setup.sh --help -->

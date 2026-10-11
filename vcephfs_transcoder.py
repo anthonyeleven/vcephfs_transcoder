@@ -10,14 +10,14 @@
 import errno, json, shlex, urllib.parse, urllib.request
 import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
-import threading, uuid, argparse, heapq, tempfile
+import threading, uuid, argparse, heapq, tempfile, hashlib, select, subprocess
 
 _VERSION = "2112"
 
 # Replacing a file must be serialized against another worker replacing the
-# SAME file -- that is the only invariant here. A single global lock also
-# serialized every *unrelated* file, which capped effective concurrency at one
-# regardless of --threads (measured 0.96 on a 15-thread job). Stripe by a hash
+# SAME file -- that is the only invariant here. A single global lock would
+# serialize every *unrelated* file too, capping effective concurrency at one
+# regardless of --threads (0.96 on a 15-thread job). Stripe by a hash
 # of the path: equal paths always map to the same stripe, so the per-path
 # guarantee holds, while unrelated paths proceed in parallel.
 _REPLACE_LOCK_STRIPES = 64
@@ -30,122 +30,47 @@ do_exit = threading.Event()
 run_journal = None
 thread_count = None
 file_delay_ms = 0
-min_age_days = 1
+MIN_AGE_DAYS = 2
+min_age_days = MIN_AGE_DAYS
+THREADS_DEFAULT = 4
 
 # --- staging: the temp copy goes beside its target, not in a shared tmpdir ---
 #
-# Renaming the finished temp file into place is where nearly all per-file wall
-# time used to go. Controlled A/B/C, one client, same file size, 12 trials each
-# (2026-09-05):
+# Where the temp is made sets the cost of the final rename (one client, same
+# file size, 12 trials each):
 #
 #     A. same directory (deep in the tree)     mean    0.3 ms  p50 0.3  max     0.4
-#     B. tmpdir -> deep dir (the old default)  mean 1266.7 ms  p50 8.2  max 14914.7
+#     B. tmpdir -> deep dir                    mean 1266.7 ms  p50 8.2  max 14914.7
 #     C. sibling dir -> deep dir               mean  387.9 ms  p50 0.3  max  4637.0
 #
-# B is bimodal: its median is a healthy 8.2 ms, but the mean is set by a tail
-# reaching fifteen seconds, and a stalled worker blocks everything queued behind
-# it. The cause is a cross-rank distributed rename -- with `distributed=1` export
-# pinning, a shared tmpdir and a deep destination hash to different MDS ranks, so
-# every replace needs a two-phase commit between two MDSs.
-#
-# So the temp file is now created in the SAME directory as its target, making
-# every replace an intra-directory rename. Re-measured 2026-09-08 on 62 real
-# files, straced: 62/62 intra-directory, mean 0.26 ms, p50 0.21 ms, max 1.27 ms.
-# That is case A, not C -- a true sibling, not a sibling directory.
-#
-# Two objections stood in the way; both were checked before this landed.
-#
-#   1. Detectability. The old --tmpdir had to sit on the default data pool so a
-#      failed layout.apply_file() left the file somewhere visibly wrong. A
-#      sibling temp file inherits the target directory's layout, which would mask
-#      that. Answered by _apply_and_verify_layout(): apply the layout, then READ
-#      IT BACK and compare, before any data is copied. That verifies the property
-#      we care about instead of inferring it from where the file happens to live.
-#
-#   2. "Excess backtrace objects", per the old --tmpdir help. Measured, and
-#      neutral: backtrace placement depends on the file's FINAL layout, not on
-#      where the temp copy was staged. A file outside the first data pool costs
-#      two objects either way. The only case that adds a third is switching a
-#      file's layout after creation, which puts an entry in old_pools -- and a
-#      sibling temp created directly in a target-pool directory performs no
-#      switch at all.
-#
-# --stage-in-tmpdir restores the old behavior. Keep the A/B/C above as this
-# change's regression test.
+# B's tail is a cross-rank rename: with distributed=1 export pinning the tmpdir
+# and the destination hash to different MDS ranks, so every replace is a
+# two-phase commit. So the temp goes in its target's own directory (case A);
+# since it then inherits the target's layout, _apply_and_verify_layout() reads
+# the layout back to catch a failed apply_file(). --stage-in-tmpdir is case B.
 
 # --- what transcoding costs in objects, and where it lands -------------------
 #
-# Measured on a 980-OSD production cluster, 2026-09-05. All figures from live
-# probes rather than from the documentation, because several of them are not
-# what the documentation implies.
+# The FIRST data pool (data_pools[0]) is fixed when the fs is created; a
+# directory's DEFAULT pool is its ceph.dir.layout.pool, settable anywhere.
+# Pointing the root at an EC pool changes where new files land, not the first
+# pool. --target-pool overrides the target per run (see below).
 #
-# FIRST vs DEFAULT. These are different things and conflating them is the easy
-# mistake here:
-#   - The filesystem's FIRST data pool is data_pools[0], fixed when the fs is
-#     created. It cannot be changed and it cannot be removed.
-#   - A directory's DEFAULT pool is whatever ceph.dir.layout.pool says for that
-#     directory. It is freely settable, including on the volume root, which is
-#     how a transcode target is chosen.
-# Pointing the root layout at an EC pool changes where NEW files land. It does
-# NOT change the first data pool. --target-pool overrides the target per run
-# without touching any directory's layout; see "--target-pool: stage in a
-# subdirectory" below.
+# A backtrace object lives in the first pool, the file's current pool, and every
+# pool in its old_pools, so switching a file's layout after creation leaves one
+# behind in the old pool for good. A file outside the first pool costs two
+# objects: its data, and a zero-byte object in the first pool (a ~300-byte
+# `parent` xattr, no omap). A transcode makes a new inode and renames it over
+# the old one, so a non-first source pool can be emptied; the first never can.
 #
-# BACKTRACES. Every inode carries a backtrace -- the path from the inode to the
-# root, used for hard-link resolution, for path lookup when the inode is not in
-# the MDS cache, and by cephfs-data-scan to rebuild a lost metadata pool from
-# the data pools alone. Verified placement:
-#   - always in the FIRST data pool, whatever the file's layout;
-#   - also in the file's CURRENT pool, when that differs from the first;
-#   - also in every pool in the inode's old_pools, i.e. any pool its layout has
-#     ever pointed at. Switching a file's layout after creation therefore leaves
-#     a permanent backtrace behind in the old pool.
-#
-# So a file whose data lives outside the first pool costs TWO objects, not one:
-# its data object, plus a zero-byte object in the first pool holding only the
-# backtrace. Measured on real transcoded files: size 0, a 305-355 byte `parent`
-# xattr, and zero omap entries. It is an xattr on a RADOS object, not omap --
-# the data pools report 0 B of omap; all omap lives in the metadata pool.
-#
-# This is the price of using a non-first pool, NOT a price of transcoding. A
-# file created directly on the EC pool carries exactly the same two objects.
-# Transcoding only moves files into that state sooner. Once the volume root
-# points at an EC pool, every new file pays it too.
-#
-# The old inode is genuinely gone. A transcode does not move a file: it creates
-# a new inode, copies into it, and renames over the original, which unlinks the
-# old inode completely -- verified absent from all pools after a journal flush.
-# So a non-first source pool really can be emptied and deleted. The FIRST pool
-# never can be: it keeps a backtrace for every inode in the filesystem.
-#
-# WHAT IT COSTS. Not capacity. Across 980 OSDs holding 17.4 PiB, BlueStore
-# metadata (RocksDB/BlueFS) totalled 63.4 TiB, or 0.36% of used space, with the
-# DB colocated on the block device on every OSD. The cost is OBJECT COUNT, which
-# drives scrub duration, recovery granularity, peering cost and onode cache
-# pressure. Per-GB is the wrong denominator; per-OSD and per-PG are the right
-# ones. This is the mechanism behind "bytes leave, objects stay": a fully
-# transcoded volume keeps one zero-byte object per file in its first pool
-# forever, so the pool's object count does not fall even as its stored bytes
-# approach zero.
-#
-# Corollary for widening an EC profile, e.g. 4+2 -> 8+2: shard count per object
-# rises from 6 to 10, so object count rises with it. On a cluster where the DB
-# is on a separate device rather than colocated, that is the case to size for
-# before starting.
+# The cost is object count, not capacity (BlueStore metadata is 0.36% of used
+# space across 980 OSDs): it drives scrub, recovery, peering and onode cache
+# pressure. Widening EC from 4+2 to 8+2 takes shards per object from 6 to 10.
 
 # --- multiplicative delay stepping -------------------------------------------
-# The delay knob is hyperbolic: +100ms at 2000ms is a 5% rate change, at 100ms
-# it is a 100x change. A fixed additive step therefore cannot serve both ends of
-# the range. A constant ratio gives even ~25% granularity everywhere, so
-# 2100ms -> 0 is 30 steps instead of being unreachable below 100ms.
-# Stays INTEGER milliseconds: 1ms is already ~1000 files/s, at or above what the
-# walker can stat at, so sub-ms would control nothing -- and keeping it integral
-# leaves the log line format unchanged for anything already parsing it.
-# Multiplicative step for the delay signals, separately settable per direction
-# so backing off can be coarser than recovering. "Back off fast, speed up
-# slowly" then lives in the step size as well as in whatever cadence an external
-# controller uses. Both default to 1.25 (a ~25%/20% rate change per step);
-# raise delay_step_up alone to make SIGRTMIN retreat harder.
+# The delay knob is hyperbolic (+100ms is 5% at 2000ms, 100x at 100ms), so the
+# signals step it by a ratio, set separately per direction so backing off can
+# be coarser than recovering. Integer ms: 1ms is already ~1000 files/s.
 DELAY_STEP_UP = 1.25
 DELAY_STEP_DOWN = 1.25
 DELAY_MAX_MS = 600000
@@ -165,8 +90,17 @@ REG_MAX_THREADS_DEFAULT = 0
 # blind at one thread. 0 holds the pause until a sample arrives, which on a
 # Prometheus outage is forever.
 REG_BLIND_RESUME_S_DEFAULT = 1800
-# Floor for the DOWN direction. 0 keeps the historical behavior of allowing a
-# step to unthrottled; set it in the config to guarantee the signal path can
+# How long the regulator may run a job (not paused) with no usable sample
+# before it throttles the job itself. Holding the last settings is right for a
+# short monitoring blip, but a Prometheus outage can last hours, and a job left
+# at whatever it had earned -- as many threads as its ceiling -- runs with
+# nothing watching MDS latency. 0 holds the last settings forever.
+REG_BLIND_THROTTLE_S_DEFAULT = 600
+# The file delay a blind throttle raises the job to (threads drop to 1). The
+# walker sleeps this per file encountered, so it bounds the stat rate too.
+REG_BLIND_DELAY_MS_DEFAULT = 20
+# Floor for the DOWN direction. 0 allows a step all the way to unthrottled;
+# set it in the config to guarantee the signal path can
 # never produce an unbounded stat rate on a live filesystem.
 DELAY_MIN_MS = 0
 
@@ -174,23 +108,11 @@ DELAY_MIN_MS = 0
 # CephFS volume being walked.
 CONFIG_DIR = os.path.expanduser("~")
 
-# Directory names pruned from the walk unless --prune-dir-regex says otherwise.
-#
-# Every entry is machine-generated, reproducible from a manifest, and composed
-# almost entirely of files below any plausible --min-size, so walking one costs
-# MDS stats and returns nothing. This is a DEFAULT, not a policy: pass
-# --prune-dir-regex to replace the set, or --prune-dir-regex '' to disable
-# pruning entirely. The effective pattern is logged at startup either way.
-#
-# Measured in production: 86.5% of files under the two largest volumes sit inside
-# virtualenvs, and the largest of 585,309 of them is 503,423 bytes -- below the
-# 512,000 byte threshold, so nothing eligible is lost. csa spent 22 days at
-# 1.17% of its volume grinding a Bazel .runfiles tree carrying a pip
-# site-packages copy of the awscli examples directory. gard4's zero-yield
-# stretch was inside renv/packrat R package libraries.
-#
-# Anchored to whole names: 'venv' prunes a directory called venv, not one
-# called conventions.
+# Directory names pruned from the walk unless --prune-dir-regex says otherwise
+# ('' disables). Each is machine-generated and almost all files below any
+# plausible --min-size, so walking one costs MDS stats and finds nothing (on
+# production the largest of 585,309 virtualenv files is 503,423 bytes).
+# Anchored to whole names: 'venv' prunes venv, not conventions.
 DEFAULT_PRUNE_DIRS = (
     ".runfiles",        # Bazel symlink farms
     "site-packages",    # pip
@@ -246,7 +168,7 @@ def config_example(volume="VOLUME"):
         "",
         "# Concurrent copies. Bounds the copier, not the walker. 0 pauses the job",
         "# (in-flight copies finish); set > 0 to resume.",
-        "threads         = 1",
+        "threads         = %d" % THREADS_DEFAULT,
         "",
         "# --- how the delay signals move ---------------------------------------",
         "# SIGRTMIN multiplies the delay, SIGRTMIN+1 divides it. Separate rates",
@@ -262,7 +184,7 @@ def config_example(volume="VOLUME"):
         "",
         "# --- what counts as eligible ------------------------------------------",
         "# Skip files modified within this many days.",
-        "min_age_days    = 1",
+        "min_age_days    = %d" % MIN_AGE_DAYS,
         "",
         "# Skip files smaller than this many bytes. Pre-Tentacle, EC pads small",
         "# objects to a whole stripe, which is why this is not lower.",
@@ -332,6 +254,13 @@ def config_example(volume="VOLUME"):
         "# 0 holds until a sample arrives.",
         "regulate_blind_resume_s = %d" % REG_BLIND_RESUME_S_DEFAULT,
         "",
+        "# A running job with no usable sample for this long throttles",
+        "# itself to 1 thread and at least regulate_blind_delay_ms per file,",
+        "# instead of holding whatever it had earned while nothing watches the",
+        "# MDS. A usable sample hands control back. 0 holds forever.",
+        "regulate_blind_throttle_s = %d" % REG_BLIND_THROTTLE_S_DEFAULT,
+        "regulate_blind_delay_ms = %d" % REG_BLIND_DELAY_MS_DEFAULT,
+        "",
     ))
 
 
@@ -356,8 +285,6 @@ def _delay_up(old):
 def _delay_down(old):
     """One step faster. Stops at DELAY_MIN_MS, which is 0 (unthrottled) unless
     the config raises it. Same minimum-movement guard."""
-    if old <= DELAY_MIN_MS:
-        return DELAY_MIN_MS
     if old <= max(1, DELAY_MIN_MS):
         return DELAY_MIN_MS
     return max(min(int(old / DELAY_STEP_DOWN), old - 1), DELAY_MIN_MS)
@@ -366,37 +293,26 @@ def _delay_down(old):
 class RuntimeConfig:
     """Live tunables from a key=value file, re-read when its mtime changes.
 
-    Applied on mtime change only, so a signal-driven adjustment persists until
-    the file is next edited -- otherwise the two interfaces fight every poll.
-
-    A bad value is rejected and the previous one kept, loudly: a typo must never
-    stop a running job or silently set the delay to zero.
-
-    Keep the file on LOCAL disk, not in the CephFS volume. A stat there is an
-    MDS round trip, which is exactly the load this whole mechanism exists to
-    bound.
+    Applied only on a change, so a signal's adjustment lasts until the next
+    edit. A bad value is rejected and the previous one kept. Keep the file on
+    local disk: a stat on CephFS is the MDS load this exists to bound.
     """
 
-    # Live tunables are read from two different places at runtime, so a new key
-    # must be applied to whichever one its reader uses or it is silently
-    # ignored. Current split, as applied by _apply_config():
-    #     file_delay_ms   -> module global   (read by the walker loop)
-    #     min_age_days    -> module global   (read by the per-file age test)
-    #     threads         -> thread_count.set_limit()
-    #     min_size        -> args.min_size
-    #     prune_dir_regex -> args.prune_re   (compiled, not the raw string)
-    #     prune_subtree_max_bytes -> args.prune_subtree_max_bytes
-    #     prune_budget_bytes      -> args.prune_budget_bytes
-    #     delay_step_up   -> module global   (read by _delay_up)
-    #     delay_step_down -> module global   (read by _delay_down)
-    #     delay_min_ms    -> module global   (read by _delay_up/_delay_down)
+    # Where _apply_config() puts each live tunable; a new key must go where its
+    # reader looks, or it is silently ignored:
+    #     file_delay_ms, min_age_days, delay_step_up, delay_step_down,
+    #     delay_min_ms           -> module globals
+    #     threads                -> thread_count.set_limit()
+    #     min_size, prune_subtree_max_bytes, prune_budget_bytes -> args
+    #     prune_dir_regex        -> args.prune_re (compiled)
     KEYS = ('file_delay_ms', 'threads', 'min_age_days', 'min_size',
             'prune_dir_regex', 'delay_step_up', 'delay_step_down',
             'delay_min_ms', 'prune_subtree_max_bytes', 'prune_budget_bytes',
             'regulate_prometheus_url', 'regulate_query', 'regulate_pause_ms',
             'regulate_slo_ms', 'regulate_period_s', 'regulate_quiet_ticks',
             'regulate_floor_ms', 'regulate_max_threads',
-            'regulate_blind_resume_s')
+            'regulate_blind_resume_s', 'regulate_blind_throttle_s',
+            'regulate_blind_delay_ms')
 
     def __init__(self, path, poll_seconds=10.0):
         self.path = path
@@ -406,10 +322,14 @@ class RuntimeConfig:
         # Last values seen IN THE FILE, so an edit only re-applies the keys it
         # actually changed. Without this, editing any one key re-asserts every
         # other key in the file and silently reverts whatever a signal had set
-        # in the meantime. Observed 2026-08-30: adding prune_dir_regex to a
-        # running job reset file_delay_ms from 20ms back to the 100ms still
-        # written in the file, discarding four hours of adaptive easing.
+        # in the meantime: adding prune_dir_regex to a running job would reset
+        # a file_delay_ms eased to 20ms back to the 100ms still written in the
+        # file.
         self._seen = {}
+        # The walker polls between files and a config-poller thread polls on
+        # its own clock (see _start_config_poller); this keeps them from
+        # applying one edit twice.
+        self._poll_lock = threading.Lock()
 
     @staticmethod
     def _comparable(v):
@@ -417,6 +337,14 @@ class RuntimeConfig:
         return v.pattern if hasattr(v, 'pattern') else v
 
     def poll(self, apply_cb):
+        if not self._poll_lock.acquire(blocking=False):
+            return
+        try:
+            self._poll(apply_cb)
+        finally:
+            self._poll_lock.release()
+
+    def _poll(self, apply_cb):
         now = time.monotonic()
         if now < self._next:
             return
@@ -521,7 +449,8 @@ class RuntimeConfig:
                     if iv < 1:
                         raise ValueError("must be >= 1")
                     out[k] = iv
-                elif k in ('regulate_max_threads', 'regulate_blind_resume_s'):
+                elif k in ('regulate_max_threads', 'regulate_blind_resume_s',
+                           'regulate_blind_throttle_s', 'regulate_blind_delay_ms'):
                     iv = int(v)
                     if iv < 0:
                         raise ValueError("must be >= 0 (0 disables)")
@@ -586,17 +515,10 @@ class DynamicSemaphore:
     def acquire(self, cancel=None, tick=None):
         """Acquire a permit, blocking until one is available.
 
-        If *cancel* is a callable, it is checked each iteration; when it
-        returns True the acquire is abandoned and this method returns False.
-        A bounded wait (0.5 s) guarantees that signals (SIGINT, etc.) and the
-        cancel callback are always serviced promptly, even when no other
-        thread calls release() or set_limit().
-
-        If *tick* is a callable, it runs between waits with the lock released.
-        The walker passes its config poll here. It is the only thread that
-        reads --config, and a threads=0 pause parks it right here, so without
-        this the edit that would undo the pause was never read -- nor was any
-        other edit, for as long as any pause lasted.
+        cancel, if given, is checked every 0.5 s wait; True abandons the
+        acquire and returns False. tick runs between waits with the lock
+        released: the walker's config poll, so a threads=0 pause can still read
+        the edit that ends it.
         """
         while True:
             with self._cond:
@@ -948,10 +870,15 @@ class Stats:
     files_skipped_layout_match: int = 0
     files_skipped_hardlink: int = 0
     files_skipped_open: int = 0
+    files_skipped_open_elsewhere: int = 0
     files_skipped_small: int = 0
     files_skipped_symlink: int = 0
     files_skipped_large: int = 0
     files_skipped_source_pool: int = 0
+    files_skipped_layout_invalid: int = 0
+    subtrees_skipped_layout_invalid: int = 0
+    files_skipped_layout_missing: int = 0
+    subtrees_skipped_layout_missing: int = 0
     files_vanished: int = 0
     files_outside_root: int = 0
     dirs_pruned: int = 0
@@ -1038,6 +965,39 @@ class Stats:
 stats = Stats()
 
 
+class InvalidLayout(RuntimeError):
+    """A layout no file or directory can have was read, or was about to be
+    applied. The file is skipped, not failed: a later pass retries it."""
+
+
+# A kernel client has been seen to answer a ceph.dir.layout read with
+# "stripe_unit=0 stripe_count=0 object_size=0 pool=-1" instead of ENODATA.
+# Taken at its word, --target-pool keeps the zeros and swaps in a pool, and
+# setting stripe_unit=0 fails with EINVAL; walking past it to the parent
+# could pick an ancestor's pool for a directory that has one of its own. So
+# such a read is retried after these pauses, then refused and the file
+# skipped. The same paths skipped pass after pass mean the read is not
+# transient, and the directory needs a look by hand.
+_LAYOUT_REREAD_DELAYS_S = (0.1, 0.5, 2.0)
+
+
+def _read_layout(path, xattr):
+    """path's layout from xattr; None if it has none (ENODATA)."""
+    for delay in _LAYOUT_REREAD_DELAYS_S + (None,):
+        try:
+            layout = CephLayout(
+                os.getxattr(path, xattr, follow_symlinks=False).decode("utf-8"))
+        except OSError as e:
+            if e.errno == ENODATA:
+                return None
+            raise  # Re-raise unexpected errors (EACCES, EIO, etc.)
+        if layout.valid:
+            return layout
+        if delay is None:
+            raise InvalidLayout(f"{xattr} of {path} reads back as {layout}")
+        time.sleep(delay)
+
+
 class CephLayout:
     def __init__(self, layout):
         vals = {}
@@ -1069,33 +1029,22 @@ class CephLayout:
             s += f" pool_namespace={self.pool_namespace}"
         return CephLayout(s)
 
+    @property
+    def valid(self):
+        return (self.stripe_unit > 0 and self.stripe_count > 0
+                and self.object_size > 0 and self.pool not in ("", "-1"))
+
     @classmethod
     def from_dir(cls, path):
-        try:
-            return CephLayout(
-                os.getxattr(path, "ceph.dir.layout", follow_symlinks=False).decode(
-                    "utf-8"
-                )
-            )
-        except OSError as e:
-            if e.errno == ENODATA:
-                return None
-            raise  # Re-raise unexpected errors (EACCES, EIO, etc.)
+        return _read_layout(path, "ceph.dir.layout")
 
     @classmethod
     def from_file(cls, path):
-        try:
-            return CephLayout(
-                os.getxattr(path, "ceph.file.layout", follow_symlinks=False).decode(
-                    "utf-8"
-                )
-            )
-        except OSError as e:
-            if e.errno == ENODATA:
-                return None
-            raise
+        return _read_layout(path, "ceph.file.layout")
 
     def apply_file(self, path):
+        if not self.valid:
+            raise InvalidLayout(f"refusing to apply {self} to {path}")
         # Set layout fields individually for compatibility with el9 kernel client
         for attr in ("stripe_unit", "stripe_count", "object_size", "pool"):
             os.setxattr(
@@ -1130,11 +1079,21 @@ class CephLayout:
 
 
 def get_layout_walking_up(path):
-    layout = CephLayout.from_dir(path)
-    parent = path
-    while layout is None and parent != "/":
-        parent = os.path.split(parent)[0]
-        layout = CephLayout.from_dir(parent)
+    try:
+        layout = CephLayout.from_dir(path)
+        parent = path
+        while layout is None and parent != "/":
+            parent = os.path.split(parent)[0]
+            layout = CephLayout.from_dir(parent)
+    except OSError as e:
+        if e.errno != errno.EOPNOTSUPP:
+            raise
+        # The walk left CephFS: a volume root with no explicit layout reads
+        # ENODATA and the walk climbs past it onto the autofs parent, whose
+        # getxattr answers EOPNOTSUPP. That is "no layout to be found" --
+        # callers handle None -- not a crash. Give the root an explicit
+        # layout (setfattr ceph.dir.layout.pool) for such a volume to run.
+        return None
     return layout
 
 
@@ -1153,8 +1112,8 @@ def target_layout(args, dir_layout):
 
 # Shard-object yield floor. Every file moved to EC 4+2 goes from 3 pieces to
 # k+m+3 = 9 whatever its size; below ~600 KiB the bytes saved per extra piece
-# collapse (0.10-0.15 TB raw per million added pieces, against 13.2 above it,
-# measured 2026-09-18). So a replicated target takes only files below this, and
+# collapse (0.10-0.15 TB raw per million added pieces, against 13.2 above
+# it). So a replicated target takes only files below this, and
 # an EC target only files at or above it.
 YIELD_FLOOR_BYTES = 614400
 
@@ -1351,29 +1310,11 @@ def _prune_inert_warning(args):
 
 
 # --- self-regulation ---------------------------------------------------------
-# Throttle this job against a latency signal the job itself cannot see. Its own
-# stat latency is the wrong measure: it reports what the transcoder experiences,
-# while the thing worth protecting is what the filesystem's real clients
-# experience. That lives in monitoring, so we ask monitoring.
-#
-# This was a separate process (tc_governor.py) driving the job over SIGUSR1/
-# SIGUSR2/SIGRTMIN and then grepping this log to discover whether each signal had
-# landed. Roughly 150 lines of that existed only because it was a second process:
-# PID discovery, signal-coalescing workarounds, a static per-host table of which
-# volume lives where, and re-reading the job's own hit rate back out of its log.
-# In-process those are an attribute read and an assignment. The separate process
-# also died twice without anyone noticing, once leaving a job paused for four
-# days; a thread that raises logs into this file, where it is visible.
-#
-# Everything is optional. With no regulate_prometheus_url the thread never starts
-# and the job runs at whatever file_delay_ms and threads say -- the tool has to be
-# fully usable by anyone who does not have these metrics, or indeed any Prometheus.
-# Every regulate_* key in RuntimeConfig.KEYS must appear here, or it parses,
-# validates, and is then discarded. That is exactly what happened to
-# regulate_prometheus_url and regulate_query: a fully configured file still
-# started with "Self-regulation disabled (no regulate_prometheus_url)", because
-# only the four tuning keys below were ever copied onto args. Tested as an
-# invariant rather than trusted to review.
+# Throttle against what the filesystem's other clients see (MDS latency, from
+# Prometheus), not this job's own stat latency. A thread in the job, so its
+# failures log here. Optional: with no regulate_prometheus_url it never starts.
+# Every regulate_* key in RuntimeConfig.KEYS must be listed here, or it is
+# parsed and then discarded (a test holds this).
 REGULATE_APPLY = (
     ('regulate_prometheus_url', 'regulate Prometheus URL'),
     ('regulate_query', 'regulate query'),
@@ -1384,6 +1325,8 @@ REGULATE_APPLY = (
     ('regulate_floor_ms', 'regulate delay floor'),
     ('regulate_max_threads', 'regulate max threads'),
     ('regulate_blind_resume_s', 'regulate blind resume'),
+    ('regulate_blind_throttle_s', 'regulate blind throttle'),
+    ('regulate_blind_delay_ms', 'regulate blind delay'),
 )
 
 REG_DEFAULTS = {
@@ -1396,6 +1339,8 @@ REG_DEFAULTS = {
     'regulate_quiet_ticks': REG_QUIET_TICKS_DEFAULT,
     'regulate_max_threads': REG_MAX_THREADS_DEFAULT,
     'regulate_blind_resume_s': REG_BLIND_RESUME_S_DEFAULT,
+    'regulate_blind_throttle_s': REG_BLIND_THROTTLE_S_DEFAULT,
+    'regulate_blind_delay_ms': REG_BLIND_DELAY_MS_DEFAULT,
 }
 # Raise the delay floor after repeated pauses: pausing repeatedly means the delay
 # is set lower than this filesystem will sustain, and recovering within a tick is
@@ -1417,8 +1362,8 @@ def _mds_namespace_for(path):
 
     Read from mds_namespace in /proc/mounts rather than guessed from the path.
     The path is not a safe substitute. A directory's last path component often
-    differs from the filesystem it lives on -- observed in production, where two
-    similarly named directories resolved to entirely different filesystems -- and
+    differs from the filesystem it lives on -- two similarly named directories
+    can sit on entirely different filesystems -- and
     querying the wrong one would regulate against a volume this job is not
     touching, with nothing to indicate it.
     """
@@ -1457,15 +1402,8 @@ def _mds_namespace_for(path):
 def _promql_regex_literal(name):
     """Escape a name for use as a regex INSIDE a PromQL double-quoted string.
 
-    Two layers, and missing the second one is a hard parse error rather than a
-    wrong match. re.escape() turns a dot into \\. , but PromQL string literals
-    use Go escaping, where \\. is not a valid escape sequence:
-
-        ceph_daemon=~"mds\\.myvol\\..*"   ->  HTTP 400
-          parse error: unknown escape sequence U+002E '.'
-
-    The backslash therefore has to survive the string layer as well, so every
-    one re.escape() produces is doubled.
+    re.escape() gives \\. , which PromQL's Go string escaping rejects (HTTP
+    400, "unknown escape sequence"), so every backslash it produces is doubled.
     """
     return re.escape(name).replace("\\", "\\\\")
 
@@ -1518,6 +1456,14 @@ class Regulator(threading.Thread):
         # while it has one. nan counts as unusable here too, so nan and
         # errors cannot keep resetting each other's clocks.
         self._blind_since = None
+        # Monotonic time a RUNNING job last had a usable sample (None while it
+        # has one), and whether _throttle_blind() has acted on it since.
+        self._blind_run_since = None
+        self._blind_throttled = False
+        # stats.files_transcoded at a running job's last nan sample, and how
+        # many nan samples in a row it kept finishing files; see _nan_running().
+        self._nan_run_done = None
+        self._nan_run_ticks = 0
         # nan samples during a regulator pause since the last usable sample;
         # see _nan_while_paused(). Errors do not reset it.
         self._nan_ticks = 0
@@ -1554,12 +1500,11 @@ class Regulator(threading.Thread):
         base = self.args.regulate_prometheus_url
         if not base:
             # regulate_prometheus_url is a live tunable, so it can be cleared
-            # under a running regulator. Concatenating it raised TypeError,
-            # which run()'s hold path did log, but only as a bare
+            # under a running regulator. Concatenating None would raise a bare
             # "unsupported operand type(s) for +: 'NoneType' and 'str'" --
             # nothing pointing at a config the operator had just emptied.
-            # Raise the specific reason and let the same rate-limited hold
-            # path report it.
+            # Raise the specific reason and let the rate-limited hold path
+            # report it.
             raise ValueError(
                 "regulate_prometheus_url is empty -- it was cleared in "
                 "--config after this regulator started")
@@ -1587,22 +1532,9 @@ class Regulator(threading.Thread):
     def _thread_ceiling(self):
         """Current ceiling, or 0 when thread adaptivity is switched off.
 
-        regulate_max_threads is a live tunable, and it used to be a one-way
-        one: this clamped the ceiling DOWN toward it and never up, so raising
-        it on a job that had already climbed to its ceiling did nothing at all
-        and gave no hint why. Measured on a drain sitting at 6 threads
-        with MDS reply latency at 0.3 ms against a 51 ms target -- there was
-        two orders of magnitude of headroom and no supported way to use it
-        short of SIGUSR1.
-
-        An operator moving the configured maximum is an explicit instruction,
-        so it wins over a ceiling this regulator earned by pausing. Pause
-        evidence is still respected between such changes.
-
-        This is the single reconciliation point for regulate_max_threads.
-        _lower_ceiling() reads the raw option to decide whether adaptivity is
-        on at all, but the ceiling itself is only ever moved here, so a live
-        change is noticed exactly once however many callers observe it.
+        A change to regulate_max_threads, up or down, wins over a ceiling
+        earned by pausing; pause evidence still applies between changes. The
+        ceiling only moves here, so a live change is applied exactly once.
         """
         mx = int(getattr(self.args, "regulate_max_threads", 0) or 0)
         if mx <= 0:
@@ -1642,20 +1574,11 @@ class Regulator(threading.Thread):
                 cur, new, level)
 
     def _maybe_raise_threads(self, lat):
-        """Add one thread, but only once the cheaper knob is exhausted.
+        """Add one thread, but only once the file delay is at its floor.
 
-        Ordering matters. File delay and thread count both change MDS load, so
-        moving both in the same interval makes the next sample unattributable.
-        The delay is eased first and this runs only when the delay has already
-        reached its floor -- the point at which the regulator otherwise has no
-        way left to turn spare headroom into throughput.
-
-        Raising is deliberately slower to decide than shedding, because the two
-        are not symmetric in effect: DynamicSemaphore hands out a new permit to
-        a waiting worker within its 0.5 s poll, while a REDUCTION only takes
-        hold as workers finish their current file and fail to re-acquire. Acting
-        late on the way up costs one quiet interval; acting late on the way down
-        costs however long the in-flight copies run.
+        One knob per interval keeps the next sample attributable. Raising is
+        slower to decide than shedding: a new permit takes effect at once, a
+        reduction only as in-flight copies finish.
         """
         ceil = self._thread_ceiling()
         if not ceil:
@@ -1737,16 +1660,10 @@ class Regulator(threading.Thread):
     def _probing(self):
         """True while a no-evidence resume's probe still owes threads.
 
-        It starts at 1, and a soft-band sample may raise it to --threads.
-
-        nan and a Prometheus outage both resume a regulator pause without any
-        evidence the filesystem has recovered, so they bring back 1 thread,
-        not the pause's full count. The rest is owed, and the first usable
-        sample under the pause line pays it through _resume(). Without the
-        debt, a job with thread adaptivity off (the default) stayed at 1
-        thread for good. As with _paused_by_me(), an operator write to the
-        thread count forgets it -- including SIGTSTP or "threads = 1", which
-        leave the value at 1.
+        A resume on nan or a Prometheus outage brings back 1 thread (a
+        soft-band sample may raise it to --threads); the rest is owed until the
+        first usable sample under the pause line pays it through _resume(). An
+        operator write to the thread count forgets the debt.
         """
         self._operator_took_over()
         return bool(self._probe_owed)
@@ -1781,7 +1698,7 @@ class Regulator(threading.Thread):
         _update_proctitle()
         return was
 
-    def _resume(self, pay_probe=True):
+    def _resume(self, pay_probe=True, why=None):
         """End a regulator pause, or pay back what a 1-thread probe owes.
 
         pay_probe=False is a soft-band sample: evidence the filesystem answers,
@@ -1801,7 +1718,7 @@ class Regulator(threading.Thread):
                 if cur >= base:
                     return
                 if want > base:
-                    self._pay_to_base(cur, base)
+                    self._pay_to_base(cur, base, why)
                     return
                 # Owed no more than --threads: the whole debt, as below.
         else:
@@ -1819,7 +1736,7 @@ class Regulator(threading.Thread):
         else:
             logging.info("Regulator: resumed, threads %d -> %d", cur, want)
 
-    def _pay_to_base(self, cur, base):
+    def _pay_to_base(self, cur, base, why=None):
         """Raise a probe to --threads, keeping the rest of its debt owed."""
         g = thread_count.set_limit_if(self._own_gen, base)
         if g is None:
@@ -1828,9 +1745,10 @@ class Regulator(threading.Thread):
         self._own_gen = g
         _update_proctitle()
         logging.info(
-            "Regulator: over the target but under the pause line, threads "
-            "%d -> %d (--threads); the other %d wait for a sample under the "
-            "target", cur, base, self._probe_owed - base)
+            "Regulator: %s, threads %d -> %d (--threads); the other %d wait "
+            "for a sample under the target",
+            why or "over the target but under the pause line", cur, base,
+            self._probe_owed - base)
 
     def _ease(self):
         global file_delay_ms
@@ -1847,26 +1765,11 @@ class Regulator(threading.Thread):
     def _tighten(self, lat):
         """Give a step back while latency sits above the soft target.
 
-        Mirror of _ease(). The cheap knob moves first -- raise the file delay
-        -- and concurrency is only surrendered once the delay has climbed back
-        to what the operator configured OR to REG_TIGHTEN_CAP_MS, whichever is
-        lower, so a brief excursion does not cost a thread that takes
-        quiet_ticks periods to earn back. With a configured delay above the cap
-        the delay stops at the cap and shedding starts there; it is a bound on
-        how long this will sit on the cheap knob, not a promise to restore an
-        arbitrarily large delay first.
-
-        A job configured with no file delay and no floor has want == 0, so
-        there is no cheap knob to exhaust and the first soft-band tick sheds a
-        thread. That is intended.
-
-        A floor at or above REG_TIGHTEN_CAP_MS collapses the cheap-knob phase
-        the same way. _note_pause() ratchets the floor up on repeated pauses,
-        as far as REG_FLOOR_CAP_MS, and _ease() will not take the delay below
-        it -- so a job that has been pausing enough to walk its floor past the
-        cap arrives here already above the climb guard and sheds on the first
-        soft-band tick. Also intended: the delay is at its floor, the cheap
-        knob really is exhausted, and concurrency is the only lever left.
+        Mirror of _ease(): raise the file delay first, and shed a thread only
+        once the delay is back at the configured value or REG_TIGHTEN_CAP_MS,
+        whichever is lower. With no delay and no floor, or a floor already at
+        the cap, there is no cheap knob left and the first soft-band tick
+        sheds a thread.
         """
         global file_delay_ms
         # Soft-band ticks are evidence too, including the ones that shed
@@ -1930,24 +1833,10 @@ class Regulator(threading.Thread):
     def _maybe_decay_ceiling(self):
         """Give back one step of learned thread ceiling after sustained quiet.
 
-        REG_FLOOR_DECAY_S already carries the argument for why a ratchet needs
-        a release: one bad night walks the limit down step by step and it never
-        comes back, so the job stays throttled long after the cause has gone.
-        The delay floor got that release. The thread ceiling did not, and it is
-        the more expensive of the two to lose.
-
-        Observed 2026-09-23 on a drain, started --threads 1. It paused
-        once at two threads, which set the ceiling to max(2 - 1, base) = 1, and
-        then ran single-threaded for three and a half hours while its MDS
-        reported 5.2 ms against a 51 ms target. Nothing short of an operator
-        editing regulate_max_threads could free it, and there was no line in
-        the log saying why it was slow.
-
-        One step per quiet interval, the same shape as the floor's decay, so a
-        ceiling earned by several pauses is handed back no faster than it was
-        taken. Every tick that observes pressure resets the clock, so this only
-        acts on quiet that has actually persisted -- see _pause() and
-        _tighten().
+        Like the floor's decay: without it, one pause at two threads leaves a
+        --threads 1 job at a ceiling of 1 for good. One step per
+        REG_FLOOR_DECAY_S of quiet; a tick with pressure resets the clock
+        (_pause(), _tighten()).
         """
         mx = int(getattr(self.args, "regulate_max_threads", 0) or 0)
         if mx <= 0 or self._ceiling is None or self._ceiling >= mx:
@@ -1966,25 +1855,31 @@ class Regulator(threading.Thread):
     def _hold(self, why):
         """No usable sample: hold, unless holding means paused forever.
 
-        A monitoring outage is not evidence about the filesystem, and acting on
-        absent data is worse than not acting -- EXCEPT when this regulator is
-        the one holding threads at 0. Then "hold" is a pause with no exit: only
-        a usable sample resumes it, and a Prometheus outage never sends one.
-        So a regulator pause gets regulate_blind_resume_s of blindness, then
-        resumes at 1 thread. The rest waits for a usable sample (_probing()),
-        so that is as far as it goes blind.
-
-        nan is blind here too (_nan_while_paused() starts the same clock), so
-        a Prometheus alternating nan and errors still reaches the bound. The
-        clock is monotonic: a wall-clock step must not end or stretch it.
+        Absent data is no evidence, so hold -- except in a pause of our own,
+        which only a usable sample ends. That gets regulate_blind_resume_s
+        (nan counts; monotonic clock), then 1 thread back, the rest waiting for
+        a usable sample. The running-job clock: see _not_running().
         """
         now = time.monotonic()
         if not self._paused_by_me():
             self._blind_since = None
-            if now - self._last_err > REG_ERR_QUIET_S:
+            if thread_count.limit <= 0:
+                self._not_running(why)
+                return
+            if self._blind_run_since is None:
+                self._blind_run_since = now
+            lim = int(getattr(self.args, "regulate_blind_throttle_s", 0) or 0)
+            if (lim and not self._blind_throttled
+                    and now - self._blind_run_since >= lim):
+                self._throttle_blind(now - self._blind_run_since, why)
+                self._last_err = now
+            elif now - self._last_err > REG_ERR_QUIET_S:
                 logging.warning(
                     "Regulator: no usable sample (%s) -- holding current "
-                    "settings, not adjusting", why)
+                    "settings, not adjusting%s", why,
+                    " (throttled blind)" if self._blind_throttled else
+                    " (throttles in %ds if it persists)"
+                    % max(0, lim - (now - self._blind_run_since)) if lim else "")
                 self._last_err = now
             return
         limit = int(getattr(self.args, "regulate_blind_resume_s", 0) or 0)
@@ -2006,6 +1901,86 @@ class Regulator(threading.Thread):
                             "blind for %ds", why, blind)
             self._last_err = now
 
+    def _not_running(self, why):
+        """No usable sample while someone else holds the job at 0 threads.
+
+        An operator pause (threads = 0, SIGUSR2) leaves no threads to take,
+        and a paused job sends the MDS nothing, so a quiet volume reads nan for
+        as long as it stays paused. Counted as running blind, that would log a
+        false "running BLIND" ERROR and raise the file delay the operator's
+        resume starts from.
+        The clock restarts when the job runs again.
+        """
+        self._blind_run_since = None
+        self._blind_throttled = False
+        self._nan_run_done = None
+        self._nan_run_ticks = 0
+        now = time.monotonic()
+        if now - self._last_err > REG_ERR_QUIET_S:
+            logging.info("Regulator: no usable sample (%s) while the job is "
+                         "paused -- nothing to throttle", why)
+            self._last_err = now
+
+    def _nan_running(self):
+        """nan while the job runs: blind only if the job has stalled as well.
+
+        nan means no MDS request completed: a stalled MDS, or a query window
+        too short for a slow job. Every finished file is MDS work done, so nan
+        counts toward the blind throttle only when no file finished since the
+        previous nan sample (an error resets the baseline). While files keep
+        finishing, regulate_quiet_ticks such samples pay a throttle's debt
+        back as far as --threads.
+        """
+        if thread_count.limit <= 0:
+            self._not_running("query returned nan")
+            return
+        done = stats.files_transcoded
+        moved = self._nan_run_done is not None and done > self._nan_run_done
+        self._nan_run_done = done
+        if not moved:
+            self._nan_run_ticks = 0
+            self._hold("query returned nan")
+            return
+        self._blind_run_since = None
+        self._blind_throttled = False
+        self._nan_run_ticks += 1
+        if self._nan_run_ticks >= max(1, int(self.args.regulate_quiet_ticks)):
+            self._nan_run_ticks = 0
+            self._resume(pay_probe=False,
+                         why="query returned nan, but the job keeps finishing "
+                             "files")
+
+    def _throttle_blind(self, blind, why):
+        """Running blind too long: drop to 1 thread and a safe file delay.
+
+        After regulate_blind_throttle_s with no usable sample, take the job to
+        one thread and at least regulate_blind_delay_ms. The threads are owed
+        like a blind resume's probe and paid back by the first usable sample (a
+        soft-band one as far as --threads); an operator write in between wins
+        and forgets the debt.
+        """
+        global file_delay_ms
+        self._blind_throttled = True
+        want = int(getattr(self.args, "regulate_blind_delay_ms", 0) or 0)
+        old_d = file_delay_ms
+        if want and file_delay_ms < want:
+            file_delay_ms = min(want, DELAY_MAX_MS)
+        self._operator_took_over()          # a stale claim must not be re-owed
+        cur, gen = thread_count.snapshot()
+        new_t = cur
+        if cur > 1:
+            g = thread_count.set_limit_if(gen, 1)
+            if g is not None:
+                new_t = 1
+                self._own_gen = g
+                self._probe_owed = max(cur, self._probe_owed or 0)
+        _update_proctitle()
+        logging.error(
+            "Regulator: no usable sample for %ds (%s) -- running BLIND, so "
+            "throttling: threads %d -> %d, file delay %dms -> %dms until a "
+            "usable sample arrives (regulate_blind_throttle_s)",
+            blind, why, cur, new_t, old_d, file_delay_ms)
+
     def _resume_blind(self, blind, why):
         was = self._resume_one()
         if was is None:
@@ -2020,18 +1995,11 @@ class Regulator(threading.Thread):
     def _nan_while_paused(self):
         """nan during our own pause: quiet, once it has lasted.
 
-        A latency ratio goes 0/0 when no MDS request completed in the query
-        window, which our own pause makes likely on a quiet volume, and
-        holding on it was a pause that never ended. But an MDS that is
-        stalled, or in replay/rejoin after a failover, completes nothing
-        either, and that is what the pause is for. So it takes
-        regulate_quiet_ticks nan samples, the same evidence a quiet volume
-        needs before easing, and then only 1 thread comes back.
-
-        Counted since the last usable sample: an error in between neither
-        counts nor resets the streak, and nan does not reset the blind clock
-        either. When they reset each other, a Prometheus alternating nan and
-        errors reached neither bound and the pause held forever.
+        Our pause makes nan likely on a quiet volume, but a stalled or
+        recovering MDS reads nan too, so it takes regulate_quiet_ticks nan
+        samples to bring back 1 thread. An error neither counts nor resets the
+        streak, and nan does not reset the blind clock, so alternating nan and
+        errors still reaches a bound.
         """
         now = time.monotonic()
         if self._blind_since is None:
@@ -2058,8 +2026,7 @@ class Regulator(threading.Thread):
             return
         logging.warning(
             "Regulator: nan for %d samples while paused -- threads 0 -> 1 "
-            "(paused at %d); the rest waits for a usable sample, since a "
-            "stalled MDS reads nan too", need, was)
+            "(paused at %d); the rest waits for a usable sample", need, was)
 
     def run(self):
         while not do_exit.is_set():
@@ -2074,25 +2041,42 @@ class Regulator(threading.Thread):
                     self._nan_while_paused()
                 else:
                     self._nan_ticks = 0
-                    self._hold("query returned nan")
+                    self._nan_running()
                 do_exit.wait(period)
                 continue
             except Exception as e:
                 # No reset of _nan_ticks: an error is no evidence either way.
+                # The running-job progress baseline does reset: "files
+                # finished since the previous sample" must not span an error
+                # stretch, or one nan with progress after hours of errors
+                # would restart the blind clock and the throttle never fire.
+                self._nan_run_done = None
+                self._nan_run_ticks = 0
                 self._hold(_redact_text(e, self.args.regulate_prometheus_url))
                 do_exit.wait(period)
                 continue
             self._blind_since = None
             self._nan_ticks = 0
+            self._nan_run_done = None
+            self._nan_run_ticks = 0
+            if self._blind_run_since is not None:
+                if self._blind_throttled:
+                    logging.warning(
+                        "Regulator: usable sample again (%.1f ms) after %ds "
+                        "blind -- regulating normally from threads %d, file "
+                        "delay %dms", lat,
+                        time.monotonic() - self._blind_run_since,
+                        thread_count.limit, file_delay_ms)
+                self._blind_run_since = None
+                self._blind_throttled = False
             if lat >= self.args.regulate_pause_ms:
                 self._quiet = 0
                 self._pause(lat)
             elif lat >= self.args.regulate_slo_ms:
-                # Between the soft target and the pause line the regulator had
-                # nothing to say. Worse, "not paused" counted as quiet, so it
-                # kept easing the delay DOWN while latency was already past
-                # the target it is supposed to defend, and the only protection
-                # left was the pause cliff. Back off a step instead.
+                # Between the soft target and the pause line. Not quiet: that
+                # would ease the delay DOWN while latency is already past the
+                # target the regulator defends, leaving only the pause cliff.
+                # Back off a step instead.
                 self._quiet = 0
                 self._resume(pay_probe=False)
                 self._tighten(lat)
@@ -2113,22 +2097,10 @@ class Regulator(threading.Thread):
 def _url_userinfo(url):
     """The raw "user:password" substring of url, or "" -- WITHOUT urlsplit().
 
-    Scheme-less values ARE covered: with no "://" the whole string is searched,
-    so "bob:pw@host" counts as credentialed. A percent-encoded "@" counts too
-    when no literal one is present.
-
-    urlsplit() RAISES on an unbalanced "[" in the netloc (and, on recent
-    CPython, on a bracketed host that is not an IP literal), while
-    urllib.request does NOT validate the host at all: Request._parse() splits
-    it with _splithost() and the request goes out regardless. Deriving the
-    credentials from urlsplit() therefore failed OPEN -- on
-    "http://bob:pw@[prom/api/v1/query" it returned nothing, so both rejection
-    layers admitted the URL and _redact_text() had nothing to scrub, and the
-    password reached the "first sample failed" / "no usable sample" WARNINGs.
-    Parse it by hand instead: any non-empty userinfo counts as credentialed,
-    so an unparseable URL fails CLOSED. The boundary matters as much as the
-    parser -- see the comment below on why it is the last "@", not urllib's
-    host boundary.
+    By hand, because urlsplit() raises on netlocs urllib.request still sends
+    (an unbalanced "["), which would fail open. Scheme-less values count
+    ("bob:pw@host"), as does a percent-encoded "@" with no literal one. Any
+    non-empty userinfo is credentialed.
     """
     return _url_userinfo_split(url)[1]
 
@@ -2136,30 +2108,16 @@ def _url_userinfo(url):
 def _url_userinfo_split(url):
     """(scheme_sep, userinfo, remainder) from the ORIGINAL string.
 
-    ONE boundary, shared by _url_userinfo() and _loggable_url(). They used to
-    compute it separately and a disagreement is the worst outcome available: a
-    URL detected as credentialed by one and emitted intact by the other.
-    Deriving both from this function makes drift impossible rather than
-    merely unlikely.
-
-    Everything is measured on the string the operator supplied, never on a
-    decoded copy, so _loggable_url() can rebuild their URL minus the secret
-    instead of logging a rewritten one.
+    The one boundary _url_userinfo() and _loggable_url() share, so a URL is
+    never detected as credentialed by one and logged intact by the other.
     """
     s = str(url or "")
     _, sep, rest = s.partition("://")
     if not sep:
         rest = s
-    # Deliberately NOT urllib's host boundary. Cutting at the first of "/?#"
-    # BEFORE looking for "@" failed OPEN: in "http://bob:pa/ss@prom/api/v1/query"
-    # the "@" falls past the cut, so the URL read as credential-free, neither
-    # refusal layer fired, and the full password reached the startup "Config:"
-    # line, the --no-regulate warning, Starting:/Finished:, every
-    # _report_state() line and the process title. The secret to protect is what
-    # the operator typed, not what urllib would transmit, so take the userinfo
-    # from the LAST "@" anywhere after "://". A Prometheus base URL has no
-    # legitimate reason to carry an "@", so over-refusing one costs nothing and
-    # this fails CLOSED.
+    # The LAST "@" after "://", not urllib's host boundary: cutting at the first
+    # "/?#" would miss the "@" in "http://bob:pa/ss@prom/..." and fail open. A
+    # Prometheus URL has no reason to carry an "@", so failing closed is free.
     idx = rest.rfind("@")
     width = 1
     if idx < 0:
@@ -2209,11 +2167,10 @@ def _loggable_url(url):
     """url with any user:password@ userinfo replaced, for logging.
 
     All string work, no urlsplit(): this function must never be the thing
-    that raises. It used to call .port, which raises ValueError on a
-    non-numeric port while urlsplit() does not -- the raise landed outside
-    the try, propagated through _apply_regulate_keys -> _apply_config ->
-    RuntimeConfig.poll(), and killed the job at startup or mid-walk. Keeping
-    it purely textual also preserves IPv6 brackets and the original host case.
+    that raises. urlsplit().port raises ValueError on a non-numeric port, and
+    a raise here propagates through _apply_regulate_keys -> _apply_config ->
+    RuntimeConfig.poll() and kills the job at startup or mid-walk. Keeping it
+    purely textual also preserves IPv6 brackets and the original host case.
     """
     if not url:
         return url
@@ -2233,15 +2190,9 @@ def _loggable_url(url):
 def _redact_text(text, url):
     """text with every credential substring from url replaced.
 
-    urllib.request.urlopen() does not use URL userinfo for authentication: it
-    hands "user:pw@host" to http.client as the HOSTNAME. A credentialed URL
-    with no explicit port therefore dies in _get_hostport() with
-    InvalidURL("nonnumeric port: 'pw@host'"), and with a port it fails DNS on
-    the same string -- so the exception text carries the PASSWORD, not a
-    "user:pw@" pair a shape-matching regex would find. Scrub against the
-    credentials the URL is known to hold instead of trusting the error's
-    shape. Basic auth, if it is ever wanted, belongs in an
-    HTTPBasicAuthHandler.
+    urllib hands "user:pw@host" to http.client as the hostname, so the error
+    text carries the bare password, not a "user:pw@" a regex would find:
+    scrub the substrings the URL is known to hold.
     """
     # LONGEST FIRST. Replacing the username before the password leaves part
     # of the password behind when one contains the other: user "bob" with
@@ -2272,52 +2223,15 @@ def _url_has_userinfo(url):
 def _redact_argv(argv):
     """argv with any credentialed URL token replaced, BEFORE shlex.join().
 
-    Refusing a credentialed URL does not keep it out of the log: main() logs
-    the whole command line in its Starting:/Finished: lines, and
-    _report_state() logs _amended_cmdline() on every signal and every "Config
-    reloaded", which also feeds setproctitle().
+    The command line reaches Starting:/Finished:, every _report_state() line
+    and the process title. Per token, not on the joined string, so an
+    abbreviated flag ("--regulate-prom"), another token sharing the
+    credential's text, and shlex quoting cannot defeat it.
 
-    Redacting TOKENS rather than the joined string, because the joined-string
-    version this replaces was wrong three separate ways:
-      - It matched only the full "--regulate-prometheus-url" spelling, but
-        main()'s parser is built WITHOUT allow_abbrev=False, so argparse takes
-        any unique prefix. "--regulate-prom http://u:pw@host" set the value
-        while the scrubber saw nothing, and the password went to the log and
-        the process title. Per-token redaction cannot care how a flag was
-        spelled.
-      - Scrubbing the credential substrings across the whole joined line hit
-        every OTHER occurrence too: username "data" rewrote an unrelated
-        "--tmpdir /data/tmp" as "/<redacted>/tmp".
-      - shlex.join() quotes first, so a password containing an apostrophe
-        came back as '"'"' and the raw-substring replace no longer matched.
-
-    _loggable_url() handles the --flag=URL form unchanged, because the "://"
-    split leaves "--flag=http" in its head.
-
-    SCHEME-LESS values are covered too. Gating on "://" was NARROWER than
-    _url_has_userinfo(), which matches a value with no scheme at all: so
-    "--regulate-prometheus-url bob:pw@prom:9090/api" was refused by
-    start_regulator() while the token still went unredacted into
-    Starting:/Finished:, every _report_state() line and the process title.
-    Detection and redaction accept the same inputs for tokens holding "://";
-    for scheme-less tokens redaction stays narrower on purpose, and a
-    username-only value like "tok@prom:9090/api" is refused but not redacted.
-
-    A token containing "://" is unambiguously a URL, so it is redacted
-    whenever it carries userinfo at all -- the same inputs _url_has_userinfo()
-    refuses. That covers a username-only credential ("http://TOKEN@prom/...",
-    a common way to pass a token) and an encoded separator
-    ("http://bob%3Apw@prom/..."), both of which a ":" test misses.
-
-    The ":" test survives only for SCHEME-LESS tokens, where it is what keeps
-    ordinary arguments intact, and it is a deliberate trade-off rather than a
-    shape anyone should tighten casually. Userinfo worth hiding is
-    "user:password"; a lone "user@host" has no secret in it. So "/data/tmp"
-    (no "@"), "/data/x@y" and an address like "bob@example.com" (an "@", but
-    no ":" before it) are all returned untouched, while "bob:pw@host" is
-    redacted. It tests the DECODED userinfo, so "bob%3Apw@host" is caught too.
-    A path that genuinely contains both -- "/a:b@c" -- is over-redacted; that
-    is the side the trade-off errs on.
+    A token with "://" is redacted whenever it has userinfo, the inputs
+    _url_has_userinfo() refuses. A scheme-less one only with a ":" before the
+    "@" (in the decoded userinfo), so "/data/x@y" and "bob@example.com" pass
+    and "/a:b@c" is over-redacted.
     """
     def _split_flag(tok):
         """("--flag=", value) for a joined flag assignment, else ("", tok).
@@ -2337,28 +2251,10 @@ def _redact_argv(argv):
     def _authority_like(user, host):
         """Whether a SCHEME-LESS token looks like a real URL authority.
 
-        PromQL reaches here: --regulate-query goes through the same argv
-        redaction, and a query carrying an "@" modifier with any ":" before it
-        matched the ":"-in-userinfo guard. Recording-rule names
-        ("job:metric:p99") and subqueries ("[1h:5m]") both hold a ":", so
-        "max_over_time(x[1h:5m] @ end())" was logged as "<redacted>@ end())".
-        That is not a leak, but it destroys output the operator reads, and
-        start_regulator() logs the query in full elsewhere regardless.
-
-        None of these characters is legal in an RFC 3986 userinfo or host, so
-        their presence means the token is not an authority at all. Brackets
-        stay legal in the HOST, because an IPv6 literal needs them: without
-        that exemption "bob:pw@[::1]:9090/api" would stop being redacted,
-        which is the failure direction that actually matters.
-
-        Tested on the USERNAME and the host only, never the password: a
-        password is opaque and may hold anything. Testing the whole userinfo
-        let "bob:p(w@prom:9090/api" through -- refused by start_regulator(),
-        then logged whole in Starting:/Finished: and ps. Most PromQL still
-        fails here, on the part before its first ":" or on what follows the
-        "@". Not all: "job:m:p99[5m]@1700000000" has a clean user and host,
-        and is logged as "<redacted>@1700000000". That errs the safe way,
-        costs only readability, and is pinned by a test.
+        Keeps PromQL ("x[1h:5m] @ end()") from being redacted: a character
+        illegal in an RFC 3986 username or host means it is not one. Brackets
+        stay legal in the host, for IPv6. The password is not tested; it may
+        hold anything.
         """
         bad_user = set(' \t\n()[]{}"\',<>')
         bad_host = set(' \t\n(){}"\',<>')
@@ -2396,32 +2292,11 @@ def _redact_argv(argv):
 def _regulator_decline_reasons(args, first_only=False):
     """Every precondition start_regulator() would decline for, in its order.
 
-    A list of (code, reason); empty means it would start. first_only=True
-    returns as soon as one is found, which is what the single-reason wrapper
-    below wants and, more importantly, preserves the original SHORT-CIRCUIT:
-    with no URL configured the query is never resolved, so a job that never
-    asked for a regulator still pays no scandir at startup.
-
-    The late-change caller wants them ALL. Returning only the first meant that
-    on an unregulated run missing both the URL and the query, a late change
-    named just the URL -- the operator set it, reloaded, and only then heard
-    about the query.
-
-    ONE copy of the preconditions, shared by start_regulator() and the
-    late-change warning in _apply_regulate_keys(). That warning used to
-    promise a restart would help whenever a URL and a query were both
-    present, which is wrong when slo >= pause or {volume} cannot resolve:
-    the restart comes back unregulated with the same complaint. Callers map
-    the code to their own wording, so the CONDITIONS live here only once.
-
-    --no-regulate is deliberately not checked: it is not a misconfiguration,
-    and both callers word that case differently.
-
-    This calls _resolve_query(), which scandirs the volume root and reads
-    /proc/self/mounts when the query uses {volume}. That cost is accepted on
-    purpose -- it is only paid when a config reload actually changed a
-    regulate_* key, which is rare, and advice a restart cannot satisfy is
-    worse than one scandir.
+    A list of (code, reason); empty means it would start. first_only stops at
+    the first, so with no URL the query (and its scandir) is never resolved.
+    The one copy of these conditions, for start_regulator() and the
+    late-change warning in _apply_regulate_keys(), which wants them all.
+    --no-regulate is not checked here.
     """
     out = []
     url = getattr(args, "regulate_prometheus_url", None)
@@ -2462,29 +2337,11 @@ def _regulator_decline_reason(args):
 def _apply_regulate_keys(args, cfg):
     """Apply the REGULATE_APPLY keys from a parsed config dict to args.
 
-    Split out of main()'s _apply_config so the late-change warning is testable.
-
-    What a late change does depends on the key and on whether a regulator is
-    actually running:
-
-      - regulate_prometheus_url on a RUNNING regulator is live. sample()
-        rebuilds the URL from args every tick and this function mutates that
-        same namespace, so the next poll uses it. Advising a restart here
-        would be wrong. Clearing it is the exception worth warning about.
-      - regulate_query is frozen into Regulator.query at construction, so a
-        change to it really does need a restart.
-      - With no regulator running, no REGULATE_APPLY key takes effect,
-        because the regulator is only ever started at startup -- whether it
-        was never configured, was declined (e.g. slo_ms >= pause_ms), or was
-        suppressed by --no-regulate, in which case the restart has to drop
-        that flag too. Clearing a key there is the exception: nothing is
-        waiting to take effect, so the plain INFO line is accurate.
-      - The other tunables are read from args on every tick (or, for
-        regulate_floor_ms, pushed through set_floor_base), so the INFO line
-        is accurate for them on a running regulator.
-
-    The bare setattr logs an INFO line that reads like success either way, so
-    the cases that change nothing have to warn.
+    A late change warns when it changes nothing: regulate_query is fixed at
+    construction, and with no regulator running (never configured, declined,
+    or --no-regulate) no key takes effect. On a running regulator the URL and
+    the tunables are read from args every tick, so they apply; clearing the
+    URL warns.
     """
     _changed = []                      # [(key, label, cleared)] actually applied
     for _k, _label in REGULATE_APPLY:
@@ -2493,23 +2350,12 @@ def _apply_regulate_keys(args, cfg):
         _old = getattr(args, _k, None)
         if (_k == 'regulate_prometheus_url' and regulator_started
                 and _url_has_userinfo(cfg[_k])):
-            # Refuse a LATE credentialed URL only. A running regulator
-            # rebuilds the URL from args every tick, so storing this would
-            # break every subsequent sample and keep the credential in play.
-            #
-            # At STARTUP (regulator_started False) it is stored and
-            # start_regulator() does the refusing, via
-            # _regulator_decline_reason(). Refusing here too would take the
-            # decision away from the one function that owns it, and -- worse
-            # -- leave args.regulate_prometheus_url None, so start_regulator()
-            # fell through to its "no regulate_prometheus_url" branch and
-            # announced that a --config file which plainly HAS one does not.
-            # The secret never reaches the network either way: that function
-            # returns before sample().
+            # Refuse a LATE credentialed URL only: a running regulator rebuilds
+            # the URL from args every tick. At startup it is stored, and
+            # start_regulator() refuses it, before any sample().
             logging.warning(
-                "Config: %s carries embedded credentials (%s) and was NOT "
-                "applied -- urllib does not use URL userinfo for auth, so it "
-                "would fail on every sample. Keeping the previous value.",
+                "Config: %s has embedded credentials (%s), which urllib "
+                "ignores; NOT applied, keeping the previous value.",
                 _label, _loggable_url(cfg[_k]))
             continue
         setattr(args, _k, cfg[_k])
@@ -2541,10 +2387,8 @@ def _apply_regulate_keys(args, cfg):
         _labels = ", ".join(_pending)
         if getattr(args, "no_regulate", False):
             logging.warning(
-                "Config: %s changed, but this run is unregulated because of "
-                "--no-regulate and the regulator is only started at startup "
-                "-- restart the job WITHOUT --no-regulate for this to take "
-                "effect", _labels)
+                "Config: %s changed, but this run has --no-regulate; restart "
+                "without it to apply", _labels)
             return
         _whys = _regulator_decline_reasons(args)
         if _whys:
@@ -2557,9 +2401,8 @@ def _apply_regulate_keys(args, cfg):
                 "; ".join(_r for _c, _r in _whys))
         else:
             logging.warning(
-                "Config: %s changed, but this run started unregulated and the "
-                "regulator is only started at startup -- restart the job for "
-                "this to take effect", _labels)
+                "Config: %s changed, but this run started unregulated; restart "
+                "the job to apply", _labels)
         return
 
     # A regulator IS running: what takes effect depends on the key.
@@ -2575,10 +2418,9 @@ def _apply_regulate_keys(args, cfg):
             ", ".join(_restart))
     if _clearedurl:
         logging.warning(
-            "Config: %s was cleared while the regulator is running -- every "
-            "sample will now fail and it will hold its current settings. Set "
-            "a URL, or restart with --no-regulate if the run should be "
-            "unregulated.", ", ".join(_clearedurl))
+            "Config: %s cleared under a running regulator; it holds its "
+            "settings until a URL is set (or restart with --no-regulate).",
+            ", ".join(_clearedurl))
     if _liveurl:
         logging.info(
             "Config: %s is re-read on every sample -- the running regulator "
@@ -2598,10 +2440,9 @@ def start_regulator(args):
     if getattr(args, "no_regulate", False):
         if url:
             logging.warning(
-                "Self-regulation disabled by --no-regulate, which overrides the "
-                "configured regulate_prometheus_url (%s) and regulate_query -- "
-                "both ignored for this run. Running at file_delay=%dms "
-                "threads=%d.",
+                "Self-regulation disabled by --no-regulate; "
+                "regulate_prometheus_url (%s) and regulate_query ignored. "
+                "Running at file_delay=%dms threads=%d.",
                 _loggable_url(url), file_delay_ms, thread_count.limit)
         else:
             logging.info("Self-regulation disabled by --no-regulate; "
@@ -2611,26 +2452,16 @@ def start_regulator(args):
     # ONE evaluation of the preconditions, shared with the late-change warning
     # in _apply_regulate_keys() via _regulator_decline_reason(). Only the
     # WORDING lives here; the conditions do not, so the two callers cannot
-    # drift apart the way they had (that warning promised a restart would help
-    # whenever a URL and query were both set, which is false for an inverted
-    # soft band or an unresolvable {volume}).
+    # drift apart (a restart does not help an inverted soft band or an
+    # unresolvable {volume}, whatever URL and query are set).
     _decline = _regulator_decline_reason(args)
     if _decline:
         _code, _reason = _decline
         if _code == "no_url":
-            # Of the ways this function declines to start, an omitted --config
-            # is the likeliest, and it was the only one logged below WARNING
-            # while the others warn. That made the common accident the
-            # quietest, and indistinguishable from a normal start in a
-            # multi-gigabyte log. A run that means to go unregulated says so
-            # with --no-regulate and stays quiet; an omission is greppable.
-            #
-            # Name the --config path when there is one: RuntimeConfig.poll() is
-            # silent on FileNotFoundError for its first read (_mtime is None),
-            # so a --config pointing at a file that does not exist arrives here
-            # having logged nothing at all, and "set the keys in --config"
-            # would otherwise be advice about a file the operator thinks they
-            # already wrote. The file is on local disk, so say which it is.
+            # Warns like the other declines: an omitted --config is the
+            # likeliest, and at INFO it would be invisible. RuntimeConfig.poll()
+            # is silent about a missing file, so name a --config that is not
+            # there.
             cfg = getattr(args, "config", None)
             if cfg and not os.path.exists(cfg):
                 where = ("in --config %s, which does not exist, or with "
@@ -2645,8 +2476,7 @@ def start_regulator(args):
             logging.warning(
                 "Self-regulation disabled (no regulate_prometheus_url); running "
                 "at file_delay=%dms threads=%d. Set the URL and query %s, or "
-                "pass --no-regulate to declare that this run is meant to be "
-                "unregulated.", file_delay_ms, thread_count.limit, where)
+                "pass --no-regulate.", file_delay_ms, thread_count.limit, where)
         elif _code == "userinfo":
             # Reached for a CLI URL and for one from --config alike: the
             # apply-time path deliberately stores a credentialed URL at
@@ -2654,12 +2484,9 @@ def start_regulator(args):
             # message -- the one that explains the remedy -- is what the
             # operator sees. Nothing has sampled it; we return before that.
             logging.warning(
-                "Self-regulation disabled: regulate_prometheus_url carries "
-                "embedded credentials (%s), which urllib does not use for "
-                "authentication -- it would fail on every sample. Remove the "
-                "user:password@ from the URL; if the endpoint needs basic "
-                "auth, it has to go through an HTTPBasicAuthHandler. Running "
-                "at file_delay=%dms threads=%d.",
+                "Self-regulation disabled: regulate_prometheus_url has "
+                "embedded credentials (%s), which urllib ignores; remove the "
+                "user:password@. Running at file_delay=%dms threads=%d.",
                 _loggable_url(url), file_delay_ms, thread_count.limit)
         elif _code == "band":
             logging.warning(
@@ -2676,27 +2503,12 @@ def start_regulator(args):
     try:
         lat = reg.sample()
     except Exception as e:
-        # START ANYWAY. A failed FIRST sample is not evidence the query is
-        # wrong, and this path used to disable self-regulation permanently
-        # for the life of the job with no way back -- strictly less tolerant
-        # than the poll loop it gates, which already holds settings and
-        # retries on exactly this error.
-        #
-        # Three real causes, none of them permanent:
-        #   * nan, because the query window is shorter than the volume's
-        #     request interval: 0 requests / 0 requests. The quietest
-        #     filesystems -- the safest ones to regulate -- were the ones
-        #     that ended up with no regulator at all. Measured: two volumes
-        #     sat at 1 thread and a 20ms delay for nearly seven hours,
-        #     35-80x slower than their siblings, because of this.
-        #   * Prometheus transiently down, 503, or slow at the moment this
-        #     job happens to start.
-        #   * a new volume with no MDS traffic yet.
+        # Start anyway: a failed first sample (nan from a too-short window, a
+        # Prometheus blip, a volume with no MDS traffic yet) is transient, and
+        # the poll loop holds and retries on it.
         logging.warning(
-            "Regulator: first sample failed (%s) -- starting anyway and will "
-            "retry every %ds. If that error is 'nan', the query window is "
-            "probably shorter than this volume's request interval; widen it. "
-            "Query: %s",
+            "Regulator: first sample failed (%s); starting anyway, retrying "
+            "every %ds ('nan': widen the query window). Query: %s",
             _redact_text(e, url), max(5, int(args.regulate_period_s)), query)
         logging.info(
             "Regulator: enabled, holding file_delay=%dms threads=%d until a "
@@ -2755,16 +2567,10 @@ TMP_ORPHAN_MIN_AGE_S = 24 * 3600
 _reclaimed_dirs = set()
 _reclaimed_lock = threading.Lock()
 
-# One journal per volume root records what this run did to rctime.
-#
-# ceph.dir.rctime is a monotonic high-water mark, so transcoding pins every
-# ancestor directory's rctime at the moment we ran, and a directory that is
-# never written again stays pinned forever. Retention reads rctime as the
-# answer rather than a hint (classify_retention.get_artifact_mtime, whose
-# docstring forbids walking the tree instead), so a transcoded artifact reads
-# as modified today and stops aging out. rctime cannot be restored: it is not
-# settable, there is no ceph.dir.rmtime, and it only climbs. Preserving the
-# answer before we destroy it is the only option left.
+# One journal per volume root records what this run did to rctime. rctime is a
+# monotonic high-water mark that cannot be set, and retention reads it as an
+# artifact's age, so a transcode makes untouched data look new; the journal
+# keeps the pre-transcode value.
 RUN_JOURNAL_NAME = ".vcephfs-transcode-runs.jsonl"
 # The final write only happens if Python gets to unwind, so a run also keeps a
 # per-run checkpoint beside each journal, rewritten this often or after this
@@ -2799,46 +2605,16 @@ def read_rctime(path):
 class RunJournal:
     """Per-artifact record of the rctime this run is about to destroy.
 
-    note_file() must run BEFORE anything under an artifact is modified, because
-    the first sighting is what captures the pre-transcode rctime. Both call
-    sites stat every file ahead of any gating, so that ordering holds for the
-    walk and for --paths-from alike.
+    note_file() runs BEFORE anything under an artifact changes, to capture
+    pre_rctime; note_write() runs AFTER each change, so pinned_at is the write
+    the MDS stamped into rctime.
 
-    note_write() must run AFTER each change beneath an artifact -- a replace,
-    and also a temp file created and removed by one that did not go through --
-    because what the consumer needs is the timestamp of the write whose value
-    the MDS then stamped into rctime.
-    Only that identifies which write an rctime is showing. The run's own
-    start/end cannot: a run lasts days, so an rctime somewhere inside the window
-    is as likely to be an owner write that landed mid-run as it is to be ours,
-    and a consumer that treats it as ours discards real activity.
-
-    WHAT A MATCH OBLIGES THE CONSUMER TO DO. If an artifact's current rctime
-    matches its pinned_at, that rctime is ours and carries no information about
-    owner activity -- but pre_rctime and max_file_mtime are NOT a substitute for
-    it. Both are captured before or during the walk, so neither can see a write
-    that landed after we stat'd a file and before our last replace beneath the
-    artifact: a file created after the walk passed its directory is never
-    note_file()'d at all, and one modified after we stat'd it keeps its old
-    mtime here. That window is the whole time the run spends in the subtree,
-    which is hours to days. So a match means RESCAN -- walk the artifact for a
-    real max mtime. It does not mean "fall back to pre_rctime", which would
-    silently date the artifact to before an owner write we never saw. Treat
-    pre_rctime and max_file_mtime as a floor, not an answer.
-
-    Consuming this requires a matching change in the retention scripts; without
-    that the journal is written but nothing reads it.
-
-    ROWS ARE KEYED BY (run, artifact): one per artifact per run. A reader must
-    skip blank lines and, defensively, lines that do not parse (an append that
-    ran unlocked because a lock holder hung). A reader that
-    also reads the per-run .partial checkpoints must dedupe on that key and
-    prefer the row without "partial": a live run's checkpoint and its later
-    final rows share a run id, and a final append that fails after writing
-    some rows leaves them in both. That reader belongs to retention, not to a
-    later transcoder run folding stale checkpoints in: a live run that makes
-    no record changes never rewrites its checkpoint, so a checkpoint's age
-    does not say whether its run is still alive.
+    For a consumer: an rctime equal to pinned_at is ours and says nothing
+    about the owner. pre_rctime and max_file_mtime are a floor, not an answer
+    (a write after we passed is not seen), so a match means rescan the
+    artifact. Rows are keyed by (run, artifact); skip blank or unparseable
+    lines, and when also reading .partial checkpoints, dedupe on that key and
+    prefer the row without "partial".
     """
 
     def __init__(self, enabled, stop_at=()):
@@ -2950,19 +2726,10 @@ class RunJournal:
     def note_write(self, filepath):
         """Record that we have just changed filepath's directory.
 
-        The last of these is the write rctime ends up showing, which is what
-        lets the consumer tell our pin from an owner write. Called after the
-        last change, whether that was a replace or a temp file created and
-        removed again by a replace that did not happen: both move rctime. An
-        artifact this run only READ keeps pinned_at null, because its rctime is
-        still the owner's and must go on being trusted.
-
-        Sampled and compared under the lock, and only ever moved forward. Two
-        workers replacing different files under one artifact take different
-        stripe locks, so nothing orders them against each other: sampling the
-        clock first and assigning unconditionally lets the earlier of two
-        interleaved writes land last and leave pinned_at BEHIND the write the
-        MDS actually stamped. The consumer then fails to recognise its own pin.
+        Called after the last change (a replace, or a temp made and removed),
+        so pinned_at is the write rctime shows; an artifact only read keeps
+        pinned_at null. Sampled and compared under the lock and only moved
+        forward, since workers on one artifact are not otherwise ordered.
         """
         if not self.enabled:
             return
@@ -3023,15 +2790,9 @@ class RunJournal:
     def checkpoint(self, roots, args):
         """Rewrite this run's snapshot beside each journal, atomically.
 
-        write() needs Python to unwind, so SIGKILL, the OOM killer or a power
-        loss used to lose every record of the run -- and a run that died
-        partway is the one whose damage most needs them. The snapshot is
-        per-run, so no other run's rows are ever rewritten, and temp+rename
-        means a reader sees one whole checkpoint or the one before it.
-
-        write() supersedes and removes it. One left behind is a run that did
-        not exit cleanly: the same rows plus "partial": true, with "end" the
-        time of its last checkpoint.
+        Covers SIGKILL, the OOM killer and power loss, which write() never
+        sees. Per-run and temp+rename; write() removes it. One left behind is
+        the same rows plus "partial": true, "end" its last checkpoint time.
         """
         if not self.enabled:
             return
@@ -3106,22 +2867,11 @@ class RunJournal:
                           pin_debounce_s=RUN_JOURNAL_PIN_DEBOUNCE_S):
         """Checkpoint in the background until write() runs.
 
-        A thread, not a hook in the walk: a threads=0 pause parks the walker,
-        and the drain after SIGTERM runs with no walker at all, while
-        in-flight copies keep moving pinned_at.
-
-        An artifact's first pin wakes it too. Its rctime is pinned from that
-        moment, and a kill before the next periodic checkpoint lost the only
-        pre_rctime it will ever have -- the record this whole thing exists
-        to keep.
-
-        It polls every poll_s so a SIGTERM checkpoints within about a second:
-        the exit log invites a second signal, which kills outright.
-
-        Every trigger but the interval and do_exit waits until the last
-        checkpoint is RUN_JOURNAL_PIN_SPACING times its own duration old.
-        Each one rewrites every row, so on a volume with many artifacts an
-        unspaced change trigger rewrote roughly N^2/every_changes rows.
+        A thread, since a pause parks the walker and the SIGTERM drain has
+        none. It checkpoints on the interval, on do_exit (polled every poll_s)
+        and on an artifact's first pin; triggers but the interval and do_exit
+        wait until the last checkpoint is RUN_JOURNAL_PIN_SPACING times its
+        own duration old, since each rewrites every row.
         """
         if not self.enabled or self._ckpt_thread is not None:
             return
@@ -3172,17 +2922,10 @@ class RunJournal:
     def write(self, roots, args):
         """Append this run's records to a journal at each volume root.
 
-        Under an exclusive flock on the journal, which CephFS enforces across
-        clients through the MDS: O_APPEND alone orders appends within one
-        kernel, and runs on other hosts append to the same volume root. The
-        lock also covers the mid-line check, so a run appending between the
-        check and the write cannot leave a stray blank line.
-
-        If an earlier append died partway, the journal ends mid-line; a newline
-        goes first, or the fragment and this run's first row fuse into one line
-        no reader can parse. A lock not granted within RUN_JOURNAL_LOCK_WAIT_S
-        (a hung holder) is logged and the append goes ahead unlocked: losing
-        the record is worse than risking an interleave.
+        Under an exclusive flock (CephFS enforces it across clients), with a
+        newline first if an earlier append died mid-line. A lock not granted
+        within RUN_JOURNAL_LOCK_WAIT_S is logged and the append goes ahead
+        unlocked: losing the record is worse.
         """
         if not self.enabled:
             return
@@ -3310,7 +3053,7 @@ def reclaim_orphans(dirpath):
     """Unlink aged `.<hex>.vcephfs-tc-tmp` orphans in dirpath, once per directory.
 
     Sibling staging puts the temp file beside its target, so cleanup_tmpdir --
-    which only scans --tmpdir -- can no longer see it. Without this a SIGKILL
+    which only scans --tmpdir -- cannot see it. Without this a SIGKILL
     mid-copy strands hidden objects on exactly the pools this tool exists to keep
     object counts down on.
     """
@@ -3341,160 +3084,1031 @@ def reclaim_orphans(dirpath):
     return count
 
 
-# --- --target-pool: stage in a subdirectory, never switch a file's pool ------
+# --- --target-pool: stage in per-job directories, never switch a file's pool
 #
-# --target-pool sends a file to a pool its directory does not point at. The
-# obvious way -- create the sibling temp as usual, then set its
-# ceph.file.layout.pool -- leaves a permanent object behind. Setting a file's
-# layout records the pool it had in old_pools (Server.cc handle_set_vxattr ->
-# add_old_pool), and the MDS writes the file's backtrace into every old pool
-# for as long as the file exists. A small file swept from QLC to replicated
-# would leave a zero-byte 4+2 object (six shards) in QLC, so the sweep would
-# not lower QLC's object count at all.
+# Setting a file's layout after creation records its old pool in old_pools, and
+# the MDS keeps a backtrace object there for good. So a --target-pool temp is
+# born in a hidden staging directory, `.vcephfs-tc-stage-<id>`, whose
+# ceph.dir.layout.pool is the target (one per distinct target layout), and is
+# renamed across into place. User directories' layouts are never written.
 #
-# So the temp is CREATED where it already inherits the target: a hidden staging
-# subdirectory of the file's own directory, `.vcephfs-tc-stage-<run>`, made with
-# ceph.dir.layout.pool set to the target. Setting only the pool keeps the
-# directory's inherited stripe settings (the MDS starts from the inherited
-# layout). The finished copy is renamed up into the parent, so the user's
-# directory layouts are never written and new files there keep landing where
-# they always did. The staging directory is shared by every file of its
-# directory in flight, and removed when the last one finishes.
+# The staging base is the deepest of the mount root; the file's pin boundary (a
+# directory with ceph.dir.pin, or a child of one with ceph.dir.pin.distributed),
+# which keeps the rename on one rank; and, after an EXDEV, its quota-realm root,
+# where the copy is retried once.
+#
+# Nothing is removed mid-run: an rmdir of a directory the copier's kernel client
+# is renaming out of waits on a cap recall that can hang and stall the rank's
+# journal trimming. The end-of-run removal is bounded; a hang leaves the
+# directory for --reap-staging.
 STAGE_PREFIX = ".vcephfs-tc-stage-"
 STAGE_RE = re.compile(r"^" + re.escape(STAGE_PREFIX) + r"[0-9a-f]{16}$")
+STAGE_RMDIR_TIMEOUT_S = 60
+# --reap-staging leaves a staging directory alone until nothing has been
+# created, renamed or unlinked in it for this long (its ctime), so it cannot
+# take a live job's directory; a temp in it is left until its own mtime and
+# ctime are that old too, since writing a copy moves neither of the directory's.
+# A running job refreshes its directories' ctime every quarter of that, so a
+# paused one is not taken either.
+REAP_STAGING_MIN_AGE_S = 3600
 
 
-class StagingDirs:
-    """Reference-counted staging subdirectories, one per directory touched.
+def _int_xattr(path, name, default):
+    """An integer CephFS vxattr of path, or default when it cannot be read."""
+    try:
+        return int(os.getxattr(path, name, follow_symlinks=False)
+                   .decode("utf-8").strip())
+    except (OSError, ValueError, AttributeError):   # no os.getxattr: macOS
+        return default
 
-    A reference is held by each file in flight and, for the directory the
-    producer is currently on, by the producer itself -- so a directory's files
-    share one staging directory instead of making and removing one each. It is
-    created lazily on the first file that needs it, and removed when the count
-    returns to zero.
+
+def _has_quota(path):
+    """Does path itself carry a CephFS quota (ceph.quota.max_bytes/max_files)?"""
+    for attr in ("ceph.quota.max_bytes", "ceph.quota.max_files"):
+        try:
+            v = os.getxattr(path, attr, follow_symlinks=False)
+        except OSError:
+            continue
+        try:
+            if int(v.decode("utf-8").strip() or 0) > 0:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+class JobStaging:
+    """The run's staging directories, one per (base, target layout).
+
+    base is the deepest of the mount root, a pin boundary (_pin_base()) and a
+    quota-realm root an EXDEV led to. A directory is made on first use -- the
+    startup probe makes the mount root's -- and is never removed while the run
+    lasts; remove_all() removes them all at the end.
     """
 
-    def __init__(self, run_id):
-        self.name = STAGE_PREFIX + run_id
+    def __init__(self, run_id, root, session=None,
+                 rmdir_timeout_s=STAGE_RMDIR_TIMEOUT_S):
+        self.run_id = run_id
+        self.root = os.path.abspath(root)
+        # Removals go through session (a RemovalSession), never the kernel
+        # mount; without one (off CephFS, in tests) os.rmdir is used.
+        self.session = session
+        self.rmdir_timeout_s = rmdir_timeout_s
         self._lock = threading.Lock()
-        self._refs = {}
-        self._made = {}
-        self._stripes = [threading.Lock() for _ in range(_REPLACE_LOCK_STRIPES)]
+        self._make_lock = threading.Lock()
+        self._made = {}            # (base, layout) -> staging path
+        self._paths = []           # every staging path this run made, in order
+        self._realms = []          # quota-realm roots, deepest first
+        self._pin_cache = {}       # path -> (ceph.dir.pin, .pin.distributed)
+        self._aborted = None       # the session a hung removal aborted
+        self._keepalive_stop = threading.Event()
+        self._keepalive = None
 
-    def _stripe(self, dirpath):
-        return self._stripes[hash(dirpath) % len(self._stripes)]
+    def name_for(self, layout):
+        """The staging directory's name for a target layout: STAGE_RE's shape,
+        the run id's first 8 hex then 8 of the layout's hash, so each target
+        layout of a run gets its own directory."""
+        h = hashlib.sha256(repr(layout._fields()).encode("utf-8")).hexdigest()
+        return STAGE_PREFIX + self.run_id[:8] + h[:8]
 
-    def hold(self, dirpath):
+    def base_for(self, dirpath):
+        """Where dirpath's files are staged: the deepest of the mount root, a
+        quota-realm root an EXDEV found above it, and its pin boundary."""
+        best = self.root
         with self._lock:
-            self._refs[dirpath] = self._refs.get(dirpath, 0) + 1
+            for r in self._realms:
+                if _under_roots(dirpath, [r]):
+                    best = r
+                    break
+        pinned = self._pin_base(dirpath)
+        if pinned is not None and len(pinned) > len(best):
+            best = pinned
+        return best
 
-    def acquire(self, dirpath, layout):
-        """Take a reference and return the staging directory, creating it."""
-        self.hold(dirpath)
-        try:
-            with self._stripe(dirpath):
-                with self._lock:
-                    path = self._made.get(dirpath)
-                if path is None:
-                    path = self._create(dirpath, layout)
-                    with self._lock:
-                        self._made[dirpath] = path
+    def _pins(self, path):
+        with self._lock:
+            got = self._pin_cache.get(path)
+        if got is None:
+            got = (_int_xattr(path, "ceph.dir.pin", -1),
+                   _int_xattr(path, "ceph.dir.pin.distributed", 0))
+            with self._lock:
+                self._pin_cache[path] = got
+        return got
+
+    def _pin_base(self, dirpath):
+        """The deepest directory at or above dirpath, below the mount root's
+        parent, whose subtree an MDS pin keeps on one rank: one with an
+        explicit ceph.dir.pin, or a child of one with ceph.dir.pin.distributed.
+        A staging directory there renames within that rank; one above it would
+        make every rename a two-rank commit (the header's case B). None when
+        no pin bounds dirpath."""
+        p = os.path.abspath(dirpath)
+        child = None
+        while _under_roots(p, [self.root]):
+            pin, distributed = self._pins(p)
+            if distributed > 0 and child is not None:
+                return child
+            if pin >= 0:
+                return p
+            if p == self.root:
+                break
+            child, p = p, os.path.dirname(p)
+        return None
+
+    def path_for(self, dirpath, layout):
+        """The staging directory for a file in dirpath going to layout, made
+        if this run has none yet."""
+        base = self.base_for(dirpath)
+        with self._lock:
+            path = self._made.get((base, layout))
+        if path is not None:
             return path
-        except Exception:
-            self.release(dirpath)
-            raise
+        # Made once however many workers ask for it at the same time.
+        with self._make_lock:
+            with self._lock:
+                path = self._made.get((base, layout))
+            if path is None:
+                path = self._create(base, layout)
+                with self._lock:
+                    self._made[(base, layout)] = path
+        return path
 
-    def _create(self, dirpath, layout):
-        path = os.path.join(dirpath, self.name)
+    def recreate(self, dirpath, layout):
+        """Make dirpath's staging directory again after it vanished (someone
+        removed it under the run); the same name, so in-flight paths agree."""
+        base = self.base_for(dirpath)
+        with self._make_lock:
+            path = self._create(base, layout)
+            with self._lock:
+                self._made[(base, layout)] = path
+        logging.warning(f"Staging directory {path} had vanished; recreated it")
+        return path
+
+    def _create(self, base, layout):
+        if not layout.valid:
+            raise InvalidLayout(f"refusing to stage under {base} for {layout}")
+        path = os.path.join(base, self.name_for(layout))
+        if run_journal is not None:
+            # Seen before the mkdir moves its rctime; claimed by the files
+            # staged here (process_file) and by the removal.
+            run_journal.note_dir(base)
         try:
             os.mkdir(path, 0o700)
         except FileExistsError:
             pass
-        try:
-            os.setxattr(path, "ceph.dir.layout.pool", layout.pool.encode("utf-8"),
-                        follow_symlinks=False)
+        with self._lock:
+            if path not in self._paths:
+                # Recorded before the layout is set: a directory whose layout
+                # failed is still this run's to remove, at the end and never
+                # here (see the header).
+                self._paths.append(path)
+        os.setxattr(path, "ceph.dir.layout.pool", layout.pool.encode("utf-8"),
+                    follow_symlinks=False)
+        got = CephLayout.from_dir(path)
+        if got != layout:
+            # Only the pool was set, so anything else that differs came from
+            # the base's own layout. Set every field rather than stage into
+            # the wrong layout.
+            for attr in ("stripe_unit", "stripe_count", "object_size", "pool"):
+                os.setxattr(path, f"ceph.dir.layout.{attr}",
+                            str(getattr(layout, attr)).encode("utf-8"),
+                            follow_symlinks=False)
             got = CephLayout.from_dir(path)
             if got != layout:
-                # Only the pool was set, so anything else that differs came
-                # from the MDS not starting where it should. Set every field
-                # rather than stage into the wrong layout.
-                for attr in ("stripe_unit", "stripe_count", "object_size", "pool"):
-                    os.setxattr(path, f"ceph.dir.layout.{attr}",
-                                str(getattr(layout, attr)).encode("utf-8"),
-                                follow_symlinks=False)
-                got = CephLayout.from_dir(path)
-                if got != layout:
-                    raise RuntimeError(
-                        f"staging layout did not apply to {path}: wanted "
-                        f"{layout}, read back {got}")
-        except Exception:
+                raise RuntimeError(
+                    f"staging layout did not apply to {path}: wanted "
+                    f"{layout}, read back {got}")
+        return path
+
+    def note_exdev(self, dirpath):
+        """A rename out of staging into dirpath failed with EXDEV: find the
+        nearest ancestor of dirpath (itself included, the mount root not) that
+        carries a quota, so later files under it are staged there. Returns
+        that realm root, or None when no such ancestor explains the EXDEV."""
+        p = os.path.abspath(dirpath)
+        while p != self.root and _under_roots(p, [self.root]):
+            if _has_quota(p):
+                with self._lock:
+                    if p not in self._realms:
+                        self._realms.append(p)
+                        self._realms.sort(key=len, reverse=True)
+                logging.info(f"{dirpath} is in the quota realm rooted at {p}; "
+                             f"files under it are staged there")
+                return p
+            p = os.path.dirname(p)
+        return None
+
+    def probe(self, pool):
+        """None if a file can be born in pool here, else why not.
+
+        Makes the mount root's staging directory -- the one every file with
+        no deeper base uses -- with the exact mechanism staging uses, creates
+        a file in it and reads its layout back, then unlinks only the file. So
+        a pool the filesystem does not have, or one the client cannot write,
+        fails at startup rather than once per file. Nothing is removed: the
+        directory is the run's.
+        """
+        try:
+            base = get_layout_walking_up(self.root)
+            if base is None:
+                return (f"no explicit layout at or above {self.root}; set one "
+                        f"on the volume root (setfattr -n ceph.dir.layout.pool "
+                        f"-v <default pool> {self.root})")
+            path = self.path_for(self.root, base.with_pool(pool))
+        except (OSError, RuntimeError) as e:
+            return f"staging directory under {self.root}: {e}"
+        f = os.path.join(path, f".{uuid.uuid4().hex}{TMP_SUFFIX}")
+        why = None
+        try:
+            with open(f, "wb"):
+                pass
+            got = CephLayout.from_file(f)
+            if got is None or got.pool != pool:
+                why = f"a file created under {path} landed in {got and got.pool}"
+        except (OSError, InvalidLayout) as e:
+            why = f"{path}: {e}"
+        finally:
             try:
-                os.rmdir(path)
+                os.unlink(f)
             except OSError:
                 pass
-            raise
-        return path
-
-    def recreate(self, dirpath, layout):
-        """Make dirpath's staging directory again after it vanished.
-
-        A held directory goes idle during a long pause -- threads = 0 over a
-        weekend -- and after TMP_ORPHAN_MIN_AGE_S another run walking the same
-        tree reclaims it as a killed run's leftover. Caught where it shows, at
-        the temp's open, so the common path pays no stat for it.
-        """
-        with self._stripe(dirpath):
-            path = self._create(dirpath, layout)
-            with self._lock:
-                self._made[dirpath] = path
-        logging.warning(f"Staging directory {path} had vanished; recreated it")
-        return path
-
-    def release(self, dirpath):
-        """Drop a reference; True if this removed the staging directory."""
-        with self._stripe(dirpath):
-            with self._lock:
-                n = self._refs.get(dirpath, 0) - 1
-                if n > 0:
-                    self._refs[dirpath] = n
-                    return False
-                self._refs.pop(dirpath, None)
-                path = self._made.pop(dirpath, None)
-            if path is None:
-                return False
+        if why is None and self.session is not None:
+            # Mapped, not statted: open() proved this mount's mapping, and a
+            # getattr through the session of a directory the kernel client
+            # has just made can wait on a recall of that client's caps, as an
+            # rmdir does.
             try:
-                os.rmdir(path)
-            except FileNotFoundError:
-                pass
+                self.session.fs_path(path)
             except OSError as e:
-                logging.warning(f"Could not remove staging directory {path}: {e}")
-            return True
+                why = f"{path}: {e}"
+        return why
+
+    def keepalive_once(self):
+        """Create and unlink a temp in each staging directory, which moves its
+        ctime, so --reap-staging's age guard leaves a paused job's directory
+        alone. A dentry change, like the copies' own, not a utime: setting a
+        directory's times takes an exclusive cap."""
+        with self._lock:
+            paths = list(self._paths)
+        for path in paths:
+            f = os.path.join(path, f".{uuid.uuid4().hex}{TMP_SUFFIX}")
+            try:
+                open(f, "wb").close()
+                os.unlink(f)
+            except OSError as e:
+                logging.warning(f"Could not refresh staging directory {path}: {e}")
+                continue
+            if run_journal is not None:
+                run_journal.note_write(path)
+
+    def start_keepalive(self, interval):
+        """keepalive_once() every interval seconds until remove_all()."""
+        def run():
+            while not self._keepalive_stop.wait(interval):
+                try:
+                    self.keepalive_once()
+                except Exception:
+                    logging.exception("Staging keepalive failed")
+        t = self._keepalive = threading.Thread(
+            target=run, name="staging-keepalive", daemon=True)
+        t.start()
+        return t
 
     def remove_all(self):
-        """Remove whatever is still made. Every exit Python gets to run."""
+        """End of run: remove every staging directory this run made, each
+        bounded by rmdir_timeout_s. The executor has joined, so no copy is in
+        flight; a temp a failure left inside is this run's and is unlinked.
+
+        A hang aborts the removal session, killing its process, and the
+        directory, like any this pass cannot remove, is left with a WARNING
+        for --reap-staging. Nothing pauses: the run is over. Returns the paths
+        removed."""
+        self._keepalive_stop.set()
+        if self._keepalive is not None:
+            # A refresh in progress would add a temp after the listing below.
+            self._keepalive.join(self.rmdir_timeout_s)
         with self._lock:
-            left = list(self._made.items())
-            self._made.clear()
-            self._refs.clear()
-        for _dirpath, path in left:
+            paths = list(self._paths)
+        removed, left = [], []
+        for path in paths:
+            why = self._remove(path)
+            if why is None:
+                removed.append(path)
+                logging.info(f"Removed staging directory {path}")
+                continue
+            left.append(path)
+            if len(left) <= 10:
+                logging.warning(f"Staging directory {path} left on disk: {why}. "
+                                f"Remove it with --reap-staging once "
+                                f"--reap-staging-min-age old.")
+        if len(left) > 10:
+            logging.warning(f"{len(left) - 10} more staging directories left on "
+                            f"disk, for --reap-staging likewise")
+        return removed
+
+    def _remove(self, path):
+        """Unlink this run's temps in path, fsync it and its parent, rmdir it
+        through the session; None once it is gone, else why not."""
+        s = self.session
+        if self._aborted is not None:
+            return "the removal session was aborted after an earlier hang"
+        phase = {"p": "listing"}
+
+        def work():
             try:
-                os.rmdir(path)
+                names = os.listdir(path)
+            except FileNotFoundError:
+                return
+            phase["p"] = "temp unlink"
+            for n in names:
+                if TMP_RE.match(n):
+                    try:
+                        os.unlink(os.path.join(path, n))
+                    except FileNotFoundError:
+                        pass
+            for name, d in (("staging-dir fsync", path),
+                            ("parent-dir fsync", os.path.dirname(path))):
+                phase["p"] = name
+                fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            phase["p"] = "rmdir"
+            try:
+                (s.rmdir if s is not None else os.rmdir)(path)
             except FileNotFoundError:
                 pass
-            except OSError as e:
-                logging.warning(f"Could not remove staging directory {path}: {e}")
-        return [d for d, _ in left]
+            if run_journal is not None:
+                run_journal.note_write(path)
+
+        done, _, e = _run_bounded(work, self.rmdir_timeout_s, "staging-rmdir")
+        if done:
+            return None if e is None else f"{phase['p']} failed: {e}"
+        why = (f"removal has not returned in {self.rmdir_timeout_s}s (stuck "
+               f"in the {phase['p']})")
+        if s is not None:
+            # Closed whatever hung: a thread that gets past a slow fsync later
+            # must not send its rmdir through a session this run is done with.
+            global removal_session
+            self._aborted = s
+            if removal_session is s:
+                removal_session = None
+            # Logged before the abort, which kills the removal process.
+            if phase["p"] == "rmdir":
+                logging.warning(f"Removing staging directory {path}: {why}. "
+                                f"{_stuck_session_advice(s)}")
+            else:
+                logging.warning(f"Removing staging directory {path}: {why} "
+                                f"on the kernel mount; removal session closed.")
+            why += f"; removal session client.{s.ident} was closed"
+            _abort_session_bounded(s)
+        return why
 
 
 staging = None
 
 
-def _release_hold(dirpath):
-    """Drop the producer's hold on dirpath, journaling a removal it causes."""
-    if dirpath is None or staging is None:
-        return
-    if staging.release(dirpath) and run_journal is not None:
-        run_journal.note_write(os.path.join(dirpath, staging.name))
+# Staging directories are removed through a second CephFS session (libcephfs),
+# never the kernel mount, whose own caps the MDS may be recalling. Its mount is
+# in a child process (_RemovalProcess): in 18.2.8 an in-process abort_conn()
+# waits for a hung call while the session keeps renewing, but killing the child
+# ends the call and lets the MDS drop the session at session_autoclose, or at
+# once on an eviction. No second session, no staging (see main()).
+REMOVAL_SESSION_MOUNT_TIMEOUT_S = 30
+REMOVAL_SESSION_CLOSE_TIMEOUT_S = 10
+# An abort kills the removal process, which returns at once; still bounded, as
+# the reap of a killed child.
+REMOVAL_SESSION_ABORT_TIMEOUT_S = 10
+
+removal_session = None
+
+
+def _conf_fsid(path):
+    """The fsid a ceph.conf names, or None."""
+    try:
+        with open(path) as fh:
+            for line in fh:
+                m = re.match(r"\s*fsid\s*=\s*([0-9a-fA-F-]{36})\s*$", line)
+                if m:
+                    return m.group(1).lower()
+    except OSError:
+        pass
+    return None
+
+
+_IPV4_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])")
+
+
+def _conf_mon_ips(path):
+    """IPv4 addresses on a ceph.conf's mon_host / mon host line."""
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if re.match(r"\s*mon[ _]host\s*=", line):
+                    return set(_IPV4_RE.findall(line))
+    except OSError:
+        pass
+    return set()
+
+
+def _mount_mon_ips(src):
+    """IPv4 addresses of the monitors a kernel CephFS mount source names."""
+    head = src.rsplit(":/", 1)[0] if ":/" in src else ""
+    return set(_IPV4_RE.findall(head))
+
+
+def _ceph_mount_for(path, mounts="/proc/self/mounts"):
+    """(mountpoint, source, options dict) of the CephFS kernel mount holding
+    path, or None.
+
+    Read from the mount table, not findmnt --target: for an autofs-managed
+    volume findmnt answers with the autofs parent (/shared/ceph) rather than
+    the CephFS mount stacked on it (/shared/ceph/myvol).
+    """
+    def unescape(s):
+        return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
+    p = os.path.realpath(path)
+    best = None
+    try:
+        with open(mounts) as fh:
+            for line in fh:
+                f = line.split()
+                if len(f) < 4 or f[2] != "ceph":
+                    continue
+                tgt = unescape(f[1])
+                if p == tgt or p.startswith(tgt.rstrip("/") + "/"):
+                    if best is None or len(tgt) > len(best[0]):
+                        best = (tgt, unescape(f[0]), f[3])
+    except OSError:
+        return None
+    if best is None:
+        return None
+    opts = {}
+    for o in best[2].split(","):
+        k, _, v = o.partition("=")
+        if k:
+            opts[k] = v
+    return best[0], best[1], opts
+
+
+def _source_subtree(src):
+    """The fs-relative subtree a kernel CephFS mount source names: after the
+    last ':/' (mons:/sub) or '=/' (name@fsid.fs=/sub)."""
+    for sep in ("=", ":"):
+        i = src.rfind(sep + "/")
+        if i >= 0:
+            return src[i + len(sep):] or "/"
+    return "/"
+
+
+class _CephfsErrors:
+    """The cephfs module's exceptions, as the removal process reports them."""
+
+    class Error(Exception):
+        def __init__(self, errno_=None, msg=""):
+            super().__init__(msg)
+            self.errno = errno_
+
+    class ObjectNotFound(Error):
+        pass
+
+
+# Tests point the removal process at a fake cephfs module through this.
+_removal_worker_env = None
+
+
+class _RemovalProcess:
+    """A libcephfs mount in a child process: what RemovalSession calls as its
+    LibCephFS. One JSON request and reply per line over the child's stdin and
+    stdout, one call at a time.
+
+    A call stuck in the MDS blocks only the thread waiting on its reply, and
+    abort_conn() ends it by killing the child -- which an in-process
+    abort_conn() cannot do, since in 18.2.8 it waits for the call. The child
+    ignores the exit signals, so a SIGTERM to the job's cgroup still lets the
+    job's own end-of-run removal through it, and exits when its stdin closes.
+    """
+
+    def __init__(self, conf, conffile, auth_id, fsname, timeout):
+        self._p = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--removal-worker",
+             str(os.getpid())],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=_removal_worker_env,
+            close_fds=True, start_new_session=True)
+        self.pid = self._p.pid
+        self._lock = threading.Lock()
+        try:
+            self.ident = self._call({"op": "mount", "conf": conf,
+                                     "conffile": conffile, "auth_id": auth_id,
+                                     "fsname": fsname}, timeout)["ident"]
+        except BaseException:
+            self.abort_conn()
+            raise
+
+    def _call(self, req, timeout=None):
+        with self._lock:
+            try:
+                self._p.stdin.write((json.dumps(req) + "\n").encode("utf-8"))
+                self._p.stdin.flush()
+                if timeout is not None:
+                    ready, _, _ = select.select([self._p.stdout], [], [], timeout)
+                    if not ready:
+                        self.abort_conn()
+                        raise RuntimeError(f"the removal process has not "
+                                           f"answered in {timeout}s")
+                line = self._p.stdout.readline()
+            except (OSError, ValueError):
+                line = b""
+        if not line:
+            raise _CephfsErrors.Error(errno.ENOTCONN, "the removal process "
+                                      "has exited")
+        reply = json.loads(line)
+        if reply.get("err") == "notfound":
+            raise _CephfsErrors.ObjectNotFound(errno.ENOENT, reply.get("msg", ""))
+        if reply.get("err") == "import":
+            raise RuntimeError("the CephFS Python bindings are missing ('import "
+                               "cephfs'; dnf install python3-cephfs): %s"
+                               % reply.get("msg", ""))
+        if reply.get("err"):
+            raise _CephfsErrors.Error(reply.get("errno"), reply.get("msg", ""))
+        return reply
+
+    def get_instance_id(self):
+        return self.ident
+
+    def stat(self, path):
+        # Bounded like the mount: a getattr can wait on a cap recall too, and
+        # it runs on the main thread at startup.
+        ino = self._call({"op": "stat", "path": os.fsdecode(path)},
+                         REMOVAL_SESSION_MOUNT_TIMEOUT_S)["ino"]
+        return os.stat_result([0, ino] + [0] * 8)
+
+    def rmdir(self, path):
+        self._call({"op": "rmdir", "path": os.fsdecode(path)})
+
+    def unlink(self, path):
+        self._call({"op": "unlink", "path": os.fsdecode(path)})
+
+    def abort_conn(self):
+        """Kill the child: a call it is stuck in ends with it."""
+        try:
+            self._p.kill()
+        except OSError:
+            pass
+        try:
+            self._p.wait(REMOVAL_SESSION_ABORT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def unmount(self):
+        self._call({"op": "quit"}, REMOVAL_SESSION_CLOSE_TIMEOUT_S)
+
+    def shutdown(self):
+        try:
+            self._p.wait(REMOVAL_SESSION_CLOSE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            self.abort_conn()
+
+
+def _die_with_parent(ppid):
+    """Exit when the job does, even in the middle of a libcephfs call, so a
+    request stuck in the MDS goes with it: PR_SET_PDEATHSIG where there is a
+    prctl (Linux), and a watcher thread either way. A killed job (kill -9, the
+    OOM killer, a second SIGINT) would otherwise leave the child renewing its
+    session and the request stuck, with nobody watching."""
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)
+    except (AttributeError, OSError):          # 1 = PR_SET_PDEATHSIG
+        pass
+    if os.getppid() != ppid:                   # it died before the prctl
+        os._exit(1)
+
+    def watch():
+        while os.getppid() == ppid:
+            time.sleep(1)
+        os._exit(1)
+    threading.Thread(target=watch, name="parent-watch", daemon=True).start()
+
+
+def _removal_worker(ppid):
+    """--removal-worker PID (internal): serve _RemovalProcess's requests on
+    stdin and stdout through one libcephfs mount, until stdin closes or job
+    PID exits."""
+    for sig in _EXIT_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+    _die_with_parent(ppid)
+    cephfs = fs = None
+    out = sys.stdout.buffer
+    for line in sys.stdin.buffer:
+        req = json.loads(line)
+        op = req.get("op")
+        try:
+            if op == "mount":
+                try:
+                    import cephfs
+                except ImportError as e:
+                    reply = {"err": "import", "msg": str(e)}
+                else:
+                    fs = cephfs.LibCephFS(conf=req["conf"],
+                                          conffile=req.get("conffile") or None,
+                                          auth_id=req["auth_id"])
+                    fs.mount(mount_root=b"/",
+                             filesystem_name=req["fsname"].encode("utf-8"))
+                    reply = {"ident": fs.get_instance_id()}
+            elif op == "stat":
+                reply = {"ino": fs.stat(os.fsencode(req["path"])).st_ino}
+            elif op in ("rmdir", "unlink"):
+                getattr(fs, op)(os.fsencode(req["path"]))
+                reply = {}
+            elif op == "quit":
+                if fs is not None:
+                    fs.unmount()
+                    fs.shutdown()
+                out.write(b"{}\n")
+                out.flush()
+                return 0
+            else:
+                reply = {"err": "error", "msg": f"unknown op {op!r}"}
+        except Exception as e:
+            notfound = (cephfs is not None
+                        and isinstance(e, getattr(cephfs, "ObjectNotFound", ())))
+            reply = {"err": "notfound" if notfound else "error",
+                     "errno": getattr(e, "errno", None), "msg": str(e)}
+        out.write((json.dumps(reply) + "\n").encode("utf-8"))
+        out.flush()
+    # stdin closed: the job has gone without a quit.
+    if fs is not None:
+        try:
+            fs.unmount()
+            fs.shutdown()
+        except Exception:
+            pass
+    return 0
+
+
+class RemovalSession:
+    """A libcephfs client session that staging directories are removed through.
+
+    The path a staging directory has on the kernel mount is mapped to the path
+    it has in the filesystem (the mount may be of a subtree), and the mapping is
+    proved at open by stat()ing the mount root both ways.
+    """
+
+    def __init__(self, fs, cephfs_mod, fsname, mountpoint, subtree, ident, who):
+        self._fs = fs
+        self._cephfs = cephfs_mod
+        self.fsname = fsname
+        self.mountpoint = mountpoint
+        self.subtree = subtree
+        self.ident = ident
+        self.who = who
+        self._dead = False
+
+    @staticmethod
+    def _identity(args, root, opts, src=""):
+        """(conffile, conf overrides, client name) for the session.
+
+        An explicit --rados-name with --rados-keyring wins: that is how the
+        operator chose to reach the cluster. Otherwise the kernel mount's own
+        name= is used -- the copier's privileges, no more -- with the keyring
+        of the cluster whose fsid the mount names (several clusters' keyrings
+        for the same name live side by side in /etc/ceph).
+        """
+        import glob
+        if args.rados_name and args.rados_keyring:
+            conffile, over = _ceph_connect_args(args.rados_conffile, root,
+                                                args.rados_mon_host)
+            over = dict(over)
+            over["keyring"] = args.rados_keyring
+            return conffile, over, args.rados_name
+        name = opts.get("name") or "guest"
+        fsid = (opts.get("fsid") or "").lower()
+        if fsid.strip("0-") == "":
+            # mount.ceph without a readable conf reports an all-zero fsid; the
+            # monitors in the mount source still say which cluster it is.
+            fsid = ""
+        mons = _mount_mon_ips(src)
+        for conf in sorted(glob.glob("/etc/ceph/*.conf")):
+            if fsid:
+                if _conf_fsid(conf) != fsid:
+                    continue
+            elif not mons or not (mons & _conf_mon_ips(conf)):
+                continue
+            stem = os.path.basename(conf)[:-len(".conf")]
+            kr = f"/etc/ceph/{stem}.client.{name}.keyring"
+            if os.path.exists(kr):
+                return conf, {"keyring": kr}, "client." + name
+        raise ValueError(
+            f"no ceph.conf in /etc/ceph matches this mount (fsid "
+            f"{fsid or 'unknown'}, monitors {','.join(sorted(mons)) or 'unknown'}) "
+            f"with a client.{name} keyring beside it; pass --rados-name and "
+            f"--rados-keyring")
+
+    @classmethod
+    def open(cls, args, root):
+        """(session, None), or (None, why) when no second session can be had."""
+        try:
+            os.stat(root)        # an idle autofs volume is mounted on access
+        except OSError as e:
+            return None, f"{root}: {e}"
+        m = _ceph_mount_for(root)
+        if m is None:
+            # An idle autofs volume does not always mount on stat() alone.
+            try:
+                os.listdir(root)
+            except OSError:
+                pass
+            m = _ceph_mount_for(root)
+        if m is None:
+            return None, f"{root} is not on a CephFS kernel mount"
+        mp, src, opts = m
+        subtree = _source_subtree(src)
+        fsname = opts.get("mds_namespace") or opts.get("fs")
+        if not fsname:
+            # New-style source: name@fsid.fsname=/subtree
+            m = re.match(r"^[^@]*@[^.]*\.([^=]+)=", src)
+            fsname = m.group(1) if m else None
+        if not fsname:
+            return None, (f"cannot tell which filesystem {mp} is: no "
+                          f"mds_namespace= or fs= in its mount options")
+        try:
+            conffile, conf, who = cls._identity(args, root, opts, src)
+        except (ValueError, SystemExit) as e:
+            return None, str(e)
+        conf = dict(conf)
+        conf.update({"client_mount_timeout": str(REMOVAL_SESSION_MOUNT_TIMEOUT_S),
+                     "log_to_stderr": "false", "err_to_stderr": "false",
+                     "admin_socket": ""})
+        auth_id = who[len("client."):] if who.startswith("client.") else who
+        try:
+            fs = _RemovalProcess(conf, conffile or None, auth_id, fsname,
+                                 REMOVAL_SESSION_MOUNT_TIMEOUT_S + 10)
+        except Exception as e:
+            return None, (f"libcephfs mount of filesystem {fsname} as {who} "
+                          f"failed: {e}")
+        s = cls(fs, _CephfsErrors, fsname, mp, subtree, fs.get_instance_id(), who)
+        # The path mapping is derived, so prove it: one inode, seen both ways.
+        try:
+            same = s.ino(root) == os.stat(root).st_ino
+        except Exception as e:
+            s.abort()
+            return None, f"cannot map {root} into filesystem {fsname}: {e}"
+        if not same:
+            s.abort()
+            return None, (f"{root} maps to {s.fs_path(root)} in filesystem "
+                          f"{fsname}, a different inode")
+        return s, None
+
+    def fs_path(self, local):
+        """local's path inside the filesystem the session mounted.
+
+        Matched textually first: that costs no lookups, and every staging
+        directory sits under a root already proved to be on the mount. A
+        path reached through a symlink (a --tmpdir of /data/tmp linked onto
+        CephFS) is resolved and tried again, the way _ceph_mount_for()
+        finds the mount."""
+        for p in (os.path.abspath(local), None):
+            if p is None:
+                p = os.path.realpath(local)
+            rel = os.path.relpath(p, self.mountpoint)
+            if not (rel == os.pardir or rel.startswith(os.pardir + os.sep)):
+                return os.path.normpath(os.path.join(self.subtree, rel))
+        raise OSError(errno.EXDEV, f"not under {self.mountpoint}, the mount "
+                      f"the removal session maps", local)
+
+    def ino(self, local):
+        """local's inode number as this session sees it."""
+        return self._fs.stat(os.fsencode(self.fs_path(local))).st_ino
+
+    def rmdir(self, local):
+        """rmdir through this session, raising the builtin OSErrors."""
+        self._call(self._fs.rmdir, local)
+
+    def unlink(self, local):
+        """unlink through this session, raising the builtin OSErrors."""
+        self._call(self._fs.unlink, local)
+
+    def _call(self, fn, local):
+        if self._dead:
+            raise OSError(errno.ENOTCONN,
+                          f"removal session client.{self.ident} was aborted",
+                          local)
+        try:
+            fn(os.fsencode(self.fs_path(local)))
+        except self._cephfs.ObjectNotFound:
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT),
+                                    local) from None
+        except self._cephfs.Error as e:
+            raise OSError(getattr(e, "errno", None) or errno.EIO, str(e),
+                          local) from None
+
+    def abort(self):
+        """Mark the session dead, then abort_conn(): kill the removal process,
+        which ends a call stuck in it. Its session stops renewing, so the MDS
+        closes it -- cancelling the stuck request -- once it goes stale, or at
+        once on an eviction."""
+        self._dead = True
+        try:
+            self._fs.abort_conn()
+        except Exception:
+            logging.exception(f"abort of removal session client.{self.ident} "
+                              f"failed")
+
+    def close(self):
+        """Unmount at the end of a run, bounded: an aborted session is left."""
+        if self._dead:
+            return
+        self._dead = True
+
+        def work():
+            try:
+                self._fs.unmount()
+                self._fs.shutdown()
+            except Exception:
+                logging.exception(f"closing removal session "
+                                  f"client.{self.ident} failed")
+        t = threading.Thread(target=work, name="removal-session-close",
+                             daemon=True)
+        t.start()
+        t.join(REMOVAL_SESSION_CLOSE_TIMEOUT_S)
+
+
+def _new_removal_session(args):
+    """A new removal session for args.dirs[0]'s mount; raise RuntimeError(why)."""
+    s, why = RemovalSession.open(args, args.dirs[0])
+    if why:
+        raise RuntimeError(why)
+    return s
+
+
+def _open_removal_session(args):
+    """Open the module's removal session; raise RuntimeError(why)."""
+    global removal_session
+    removal_session = None
+    removal_session = _new_removal_session(args)
+    return removal_session
+
+
+def _stuck_session_advice(s):
+    """What clears a request stuck on removal session s, for a log line."""
+    return (f"client.{s.ident}'s removal process is killed; the MDS drops "
+            f"its request at session_autoclose. To clear it now: 'ceph tell "
+            f"mds.{s.fsname}:<rank> client evict id={s.ident}' (find <rank> "
+            f"with 'ceph tell mds.{s.fsname}:<rank> client ls id={s.ident}'; "
+            f"the job's kernel mount is a different client).")
+
+
+def _run_bounded(fn, timeout, name):
+    """fn() in a throwaway daemon thread joined with timeout.
+
+    (True, value, None) or (True, None, exception) when it returned in time,
+    else (False, None, None): a call still running is left to finish or not
+    on its own, and whatever it returns later is dropped."""
+    out = {}
+
+    def work():
+        try:
+            out["v"] = fn()
+        except Exception as e:
+            out["e"] = e
+    t = threading.Thread(target=work, name=name, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return False, None, None
+    return True, out.get("v"), out.get("e")
+
+
+def _abort_session_bounded(s):
+    """s.abort(), bounded by REMOVAL_SESSION_ABORT_TIMEOUT_S; False if it is
+    still running. RemovalSession.abort() marks the session dead before it
+    calls abort_conn(), so nothing removes through it again either way."""
+    done, _, e = _run_bounded(s.abort, REMOVAL_SESSION_ABORT_TIMEOUT_S,
+                              "removal-session-abort")
+    if not done:
+        logging.error(f"Abort of removal session client.{s.ident} not done "
+                      f"after {REMOVAL_SESSION_ABORT_TIMEOUT_S}s; nothing more "
+                      f"is removed through it")
+    elif e is not None:
+        logging.error(f"Aborting removal session client.{s.ident} failed: {e}")
+    return done
+
+
+def _session_mismatch(s, path):
+    """None if the removal session reaches path as the inode the kernel mount
+    shows for it, else why not."""
+    try:
+        mapped = s.fs_path(path)
+        same = s.ino(path) == os.stat(path).st_ino
+    except Exception as e:
+        return (f"{path} cannot be reached through the removal session, which "
+                f"maps {s.mountpoint}: {e}")
+    if not same:
+        return (f"{path} maps to {mapped} in filesystem {s.fsname}, which is a "
+                f"different inode")
+    return None
+
+
+def start_removal_session(args):
+    """Open the removal session a staging run or --reap-staging needs, or exit.
+
+    Staging, and reaping its leftovers, remove directories only through a
+    second CephFS session. No session, no staging: an rmdir through the
+    kernel mount the copies use can deadlock against that client's own caps.
+    """
+    global removal_session
+    if not (args.reap_staging or (args.target_pool and not args.stage_in_tmpdir)):
+        return None
+    try:
+        s = _open_removal_session(args)
+    except RuntimeError as e:
+        logging.error(
+            "Refusing to start: %s needs a separate CephFS session, and none "
+            "could be opened: %s"
+            % ("--reap-staging" if args.reap_staging else "--target-pool staging",
+               e))
+        sys.exit(1)
+    # The session maps one kernel mount, the one args.dirs[0] is on. A root on
+    # another mount would have every staging directory under it fail to be
+    # removed, one WARNING each, for the whole run.
+    for d in args.dirs[1:]:
+        why = _session_mismatch(s, os.path.abspath(d))
+        if why:
+            logging.error(f"Refusing to start: {why}. All directories must "
+                          f"be on {s.mountpoint}; run one job per mount")
+            s.close()
+            removal_session = None
+            sys.exit(1)
+    logging.info(f"Removal session: libcephfs client.{s.ident} as {s.who}, "
+                 f"filesystem {s.fsname}, {s.mountpoint} = {s.subtree}")
+    return s
+
+
+def _rmdir_staging(path, s):
+    """rmdir a staging directory through removal session s -- never through
+    the kernel mount, whose own caps the MDS would wait on (see the removal
+    session above)."""
+    if s is None:
+        raise OSError(errno.ENOTCONN, "no separate CephFS session for staging "
+                      "removals", path)
+    s.rmdir(path)
+
+
+def _bounded_rmdir_staging(path, timeout=None, unlink=()):
+    """rmdir a staging directory, after unlinking the paths in unlink, all
+    through the removal session, in a throwaway thread joined with a timeout,
+    so a stuck request cannot block --reap-staging.
+
+    Returns "ok", "gone" (already absent), "error" (logged), or "hung". On a
+    hang the session is aborted, so nothing more is removed through it.
+    """
+    global removal_session
+    timeout = STAGE_RMDIR_TIMEOUT_S if timeout is None else timeout
+    result = {}
+    # Captured before the thread starts: a hang is handled on the session the
+    # rmdir went out on, not on whatever replaced it since.
+    s = removal_session
+
+    def work():
+        try:
+            for f in unlink:
+                if s is None:
+                    break
+                try:
+                    s.unlink(f)
+                except FileNotFoundError:
+                    pass
+            _rmdir_staging(path, s)
+            result["r"] = "ok"
+        except FileNotFoundError:
+            result["r"] = "gone"
+        except OSError as e:
+            result["r"] = "error"
+            result["e"] = e
+    t = threading.Thread(target=work, name="staging-rmdir", daemon=True)
+    t.start()
+    t.join(timeout)
+    r = result.get("r")
+    if r == "error":
+        logging.warning(f"Could not remove staging directory {path}: "
+                        f"{result['e']}")
+    if r is not None:
+        return r
+    if s is not None and s is not removal_session:
+        logging.warning(
+            f"Removing staging directory {path} through already-aborted "
+            f"client.{s.ident}: no return in {timeout}s; left on disk")
+    elif s is not None:
+        removal_session = None
+        # Logged before the abort, which kills the removal process.
+        logging.critical(
+            f"Removing staging directory {path} through client.{s.ident}: "
+            f"no return in {timeout}s; no more removals this run. "
+            f"{_stuck_session_advice(s)}")
+        _abort_session_bounded(s)
+    return "hung"
 
 
 def _group_spill_dir(args):
@@ -3509,8 +4123,8 @@ def tmpdir_conflicts(args, tmpdir_pool):
     """(dir, pool) for each root whose target pool is the tmpdir's pool.
 
     Both reasons for the check are about temps staged IN the tmpdir. A staged
-    --target-pool run never puts one there: its temps are born in a staging
-    subdirectory, a no-op rewrite is already skipped as a layout match, and the
+    --target-pool run never puts one there: its temps are born in the run's
+    staging directory, a no-op rewrite is already skipped as a layout match, and the
     read-back in _verify_layout() is what catches a layout that did not take.
     And its usual target, the replicated pool, IS the default pool the tmpdir
     is supposed to be on, so checking it would refuse the main use case.
@@ -3519,61 +4133,198 @@ def tmpdir_conflicts(args, tmpdir_pool):
         return []
     out = []
     for d in args.dirs:
-        target = target_layout(args, get_layout_walking_up(d))
+        try:
+            target = target_layout(args, get_layout_walking_up(d))
+        except InvalidLayout as e:
+            if args.stage_in_tmpdir:
+                # Its temps would go into the tmpdir, and this check does not
+                # run again for it.
+                raise
+            # Left out of the check, not fatal: temps are staged beside their
+            # targets, and each one's layout is read back once it is set.
+            logging.warning("No tmpdir check for %s: %s", d, e)
+            continue
         if target is not None and target.pool == tmpdir_pool:
             out.append((d, target.pool))
     return out
 
 
-def probe_target_pool(pool, where):
-    """None if a file can be born in pool under where, else why not.
-
-    Exercises the exact mechanism staging uses -- a directory set to the pool, a
-    file created inside it, its layout read back -- so a pool the filesystem
-    does not have, or one the client cannot write, fails here at startup rather
-    than once per file for the length of the run.
-    """
-    probe = os.path.join(where, STAGE_PREFIX + uuid.uuid4().hex[:16])
-    f = os.path.join(probe, f".{uuid.uuid4().hex}{TMP_SUFFIX}")
-    try:
-        os.mkdir(probe, 0o700)
-        try:
-            os.setxattr(probe, "ceph.dir.layout.pool", pool.encode("utf-8"),
-                        follow_symlinks=False)
-            with open(f, "wb"):
-                pass
-            got = CephLayout.from_file(f)
-            if got is None or got.pool != pool:
-                return f"a file created under {probe} landed in {got and got.pool}"
-        finally:
-            try:
-                os.unlink(f)
-            except OSError:
-                pass
-            os.rmdir(probe)
-    except OSError as e:
-        return f"{probe}: {e}"
-    return None
-
-
-def reclaim_staging_orphan(path):
-    """Remove an aged staging directory a killed run left behind.
-
-    Aged by ctime like temp files: any create, rename or unlink inside moves
-    it, so a staging directory still in use is never this old. Only our own
-    temp files are unlinked from it, and rmdir refuses anything else.
-    """
-    try:
-        if time.time() - os.lstat(path).st_ctime < TMP_ORPHAN_MIN_AGE_S:
+def _reap_pace():
+    """Hold for the thread limit's pause and the file delay between steps of
+    --reap-staging (walk included) and --paths-from-pool's path checks; False
+    once the run is to stop."""
+    if thread_count is not None:
+        if not thread_count.acquire(cancel=do_exit.is_set, tick=_poll_config):
             return False
-        for entry in os.scandir(path):
-            if TMP_RE.match(entry.name) and entry.is_file(follow_symlinks=False):
-                os.unlink(entry.path)
-        os.rmdir(path)
-    except OSError:
-        return False
-    logging.info(f"Reclaimed orphaned staging directory {path}")
-    return True
+        thread_count.release()
+    if file_delay_ms > 0:
+        _file_delay()
+    else:
+        _poll_config()
+    return not do_exit.is_set()
+
+
+def _staging_candidates(args):
+    """Staging directories for --reap-staging, each once.
+
+    With --paths-from, each listed path is a directory whose staging
+    subdirectories are checked -- one readdir, no walk -- or is a staging
+    directory itself. Without it, the given directories are walked, which on a
+    large volume is a full tree walk; a list built from a run's log is the
+    cheap way.
+    """
+    roots = [os.path.abspath(d) for d in args.dirs]
+
+    def inside(p):
+        return any(p == r or p.startswith(r.rstrip("/") + "/") for r in roots)
+
+    seen = set()
+    if args.paths_from:
+        for p in _iter_listed_paths(args.paths_from):
+            if not _reap_pace():
+                return
+            p = os.path.abspath(p)
+            if not inside(p):
+                logging.warning(f"{p} is outside the directories given; skipped")
+                continue
+            if STAGE_RE.match(os.path.basename(p)):
+                if p not in seen:
+                    seen.add(p)
+                    yield p
+                continue
+            try:
+                it = os.scandir(p)
+            except OSError:
+                continue
+            with it:
+                for e in it:
+                    if (STAGE_RE.match(e.name) and e.path not in seen
+                            and e.is_dir(follow_symlinks=False)):
+                        seen.add(e.path)
+                        yield e.path
+        return
+    for r in roots:
+        for dirpath, dirnames, _ in os.walk(r):
+            if not _reap_pace():
+                return
+            keep = []
+            for d in dirnames:
+                if STAGE_RE.match(d):
+                    yield os.path.join(dirpath, d)
+                else:
+                    keep.append(d)
+            dirnames[:] = keep
+
+
+def reap_staging(args):
+    """--reap-staging: remove leftover staging directories that are empty,
+    through the removal session; report the rest. Returns an exit status.
+
+    Each removal moves its artifact's rctime, so it is journaled the way the
+    walk journals an orphan it reclaims, and the journal is written on every
+    way out."""
+    roots = [os.path.abspath(d) for d in args.dirs]
+    try:
+        return _reap_staging(args)
+    finally:
+        if run_journal is not None:
+            run_journal.write(roots, args)
+
+
+def _reap_staging(args):
+    found = removed = gone = errors = young = 0
+    nonempty = []
+    min_age = getattr(args, "reap_staging_min_age", REAP_STAGING_MIN_AGE_S)
+    for sd in _staging_candidates(args):
+        if do_exit.is_set():
+            break
+        found += 1
+        # Paced and paused like a walk: the thread limit's pause (the
+        # regulator's, or threads = 0) holds here, and the file delay spaces
+        # removals. A reap is MDS load like a walk, and an unpaced one can
+        # push a volume's MDS latency far past the regulator's target.
+        if thread_count is not None and not thread_count.acquire(
+                cancel=do_exit.is_set, tick=_poll_config):
+            break
+        try:
+            if file_delay_ms > 0:
+                _file_delay()
+            if do_exit.is_set():
+                break
+            r = _reap_one(sd, min_age, nonempty)
+        finally:
+            if thread_count is not None:
+                thread_count.release()
+        if r == "ok":
+            removed += 1
+        elif r == "young":
+            young += 1
+        elif r == "gone":
+            gone += 1
+        elif r == "error":
+            errors += 1
+        elif r == "hung":                       # the session is aborted
+            logging.error(f"Stopped after a hung removal: {removed} removed, "
+                          f"{found - removed} not")
+            return 1
+    logging.info(f"--reap-staging: {found} staging directories found, "
+                 f"{removed} removed, {len(nonempty)} not empty and left alone, "
+                 f"{young} changed in the last {min_age}s and left alone, "
+                 f"{gone} already gone, {errors} errors"
+                 + ("; stopped by a signal" if do_exit.is_set() else ""))
+    return 1 if errors else 0
+
+
+def _reap_one(sd, min_age, nonempty):
+    """Remove one staging directory if it is ours to take: "ok", "young",
+    "nonempty", "gone", "error" or "hung".
+
+    Ours means quiet for min_age: nothing created, renamed or unlinked in it
+    (its ctime), and each temp left in it unwritten as long (its own mtime and
+    ctime: a copy in progress moves those, not the directory's). Those temps
+    are a dead job's, and are unlinked with the rmdir, through the session."""
+    now = time.time()
+    try:
+        st = os.lstat(sd)
+        entries = os.listdir(sd)
+    except FileNotFoundError:
+        return "gone"
+    except OSError as e:
+        logging.warning(f"Cannot read staging directory {sd}: {e}")
+        return "error"
+    if now - st.st_ctime < min_age:
+        logging.info(f"Leaving staging directory {sd}: changed "
+                     f"{now - st.st_ctime:.0f}s ago, under {min_age}s, so a "
+                     f"job may still be using it")
+        return "young"
+    temps, other = [], []
+    for e in entries:
+        p = os.path.join(sd, e)
+        if TMP_RE.match(e):
+            try:
+                t = os.lstat(p)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                t = None
+            if (t is not None and stat.S_ISREG(t.st_mode)
+                    and now - max(t.st_mtime, t.st_ctime) >= min_age):
+                temps.append(p)
+                continue
+        other.append(e)
+    if other:
+        nonempty.append(sd)
+        logging.info(f"Leaving staging directory {sd}: not empty "
+                     f"({len(other)} entries, e.g. {sorted(other)[0]})")
+        return "nonempty"
+    if run_journal is not None:
+        # First sighting before the rmdir, so pre_rctime is still the
+        # owner's; note_write() records nothing for an unseen artifact.
+        run_journal.note_dir(os.path.dirname(sd))
+    r = _bounded_rmdir_staging(sd, unlink=temps)
+    if r == "ok" and run_journal is not None:
+        run_journal.note_write(sd)
+    return r
 
 
 def _tmp_path_for(args, target):
@@ -3582,19 +4333,17 @@ def _tmp_path_for(args, target):
     Beside the target, so the later rename is intra-directory -- see the header.
     Hidden and suffixed so an orphan left behind by a hard kill is recognizable.
     """
-    if args.stage_in_tmpdir:
-        return os.path.join(args.tmpdir, uuid.uuid4().hex)
-    return os.path.join(os.path.dirname(target),
-                        f".{uuid.uuid4().hex}{TMP_SUFFIX}")
+    base = args.tmpdir if args.stage_in_tmpdir else os.path.dirname(target)
+    return os.path.join(base, f".{uuid.uuid4().hex}{TMP_SUFFIX}")
 
 
 def _apply_and_verify_layout(layout, path):
     """Apply the layout, then read it back and confirm it took.
 
-    A shared --tmpdir on the default pool caught a failed apply_file() implicitly:
-    the file stayed visibly in the wrong pool. A sibling temp file inherits the
-    target directory's layout, so that signal is gone and the check has to be
-    explicit -- which is the stronger of the two.
+    A temp in a shared --tmpdir on the default pool shows a failed
+    apply_file() implicitly, by staying visibly in the wrong pool. A sibling
+    temp file inherits the target directory's layout, so that signal is absent
+    and the check has to be explicit -- which is the stronger of the two.
     """
     layout.apply_file(path)
     _verify_layout(layout, path)
@@ -3610,19 +4359,12 @@ def _verify_layout(layout, path):
 def _undo_partial_relink(args, filepaths, st, new_id, link_tmps, err):
     """Rejoin a hard-link set after a rename failed partway through it.
 
-    err is the rename's exception, for the log. Returns (names found on the
-    new inode, whose directories changed; whether the replace in fact
-    completed). It completed if every name is already on
-    the new inode: the last rename took effect and still raised.
-
-    Which names moved is read from their inodes, not from which renames
-    returned: a rename can take effect and still raise. A name still on the
-    ORIGINAL inode is linked back over each one that moved, which puts the set
-    back as if the replace had never started. A name on neither inode was
-    replaced by someone else and is left alone. Staged links that were never
-    renamed are removed either way. If the set does not end whole on the
-    original, say exactly how it split: nothing else will notice two inodes
-    with identical contents.
+    err is the rename's exception, for the log. Returns (names on the new
+    inode, whose directories changed; whether the replace in fact completed,
+    i.e. every name is on the new inode). Moved names are read from their
+    inodes, since a rename can take effect and still raise, and each is linked
+    back to the original. Unrenamed staged links are removed. A set left split
+    is logged name by name.
     """
     for link_tmp, _ in link_tmps:
         try:
@@ -3686,6 +4428,59 @@ def _undo_partial_relink(args, filepaths, st, new_id, link_tmps, err):
     return moved, False
 
 
+# False once _probe_caps() finds that the kernel cannot report ceph.caps.
+caps_check = True
+
+
+def _probe_caps(path):
+    global caps_check
+    try:
+        os.getxattr(path, "ceph.caps")
+    except (OSError, AttributeError) as e:     # no os.getxattr: macOS
+        caps_check = False
+        logging.warning(f"No open-for-write check: cannot read ceph.caps on {path}: {e}")
+
+
+def _skip_if_open_for_write(path):
+    """True, logged and counted, if path is open for write anywhere.
+
+    Holding it open read-only, our client lacks Fc while another client has it
+    open for write, and holds Fw while a process on this host does. A swap
+    then leaves that writer on the old, unlinked inode, and what it writes
+    next is lost. A writer idle for about a minute drops its wanted caps and
+    is invisible here, so this does not replace --min-age."""
+    global caps_check
+    if not caps_check:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            caps = os.getxattr(fd, "ceph.caps").decode()
+        finally:
+            os.close(fd)
+    except (OSError, AttributeError) as e:
+        logging.debug(f"No open-for-write check for {path}: {e}")
+        return False
+    # "<letters>/0x<issued mask>": test the mask, not the letters, so a caps
+    # string this code does not recognize reads as "check unavailable", said
+    # once, rather than as a writer on every file of the pass. Bits from
+    # ceph_fs.h: Fc = CEPH_CAP_FILE_CACHE 0x400, Fw = CEPH_CAP_FILE_WR 0x1000.
+    try:
+        issued = int(caps.split("/")[1], 16)
+    except (IndexError, ValueError):
+        caps_check = False
+        logging.warning(f"No open-for-write check: cannot parse ceph.caps "
+                        f"{caps!r} on {path}")
+        return False
+    if issued & 0x400 and not issued & 0x1000:
+        return False
+    logging.warning(f"Skipping {path}: open for write elsewhere "
+                    f"(caps {caps.partition('/')[0]})")
+    with stats._lock:
+        stats.files_skipped_open_elsewhere += 1
+    return True
+
+
 def process_file(args, filepaths, st, layout, file_layout, stage=False):
     # Every target whose directory this call changes. A sibling temp, a staged
     # link and a swept orphan move that directory's rctime as surely as the
@@ -3694,24 +4489,51 @@ def process_file(args, filepaths, st, layout, file_layout, stage=False):
     # the call's last change, whether or not the replace went through.
     #
     # stage: the file's directory does not point at layout's pool (only ever
-    # under --target-pool), so the temp is made in a staging subdirectory.
+    # under --target-pool), so the temp is made in the run's staging directory.
     touched = set()
-    stage_dir = None
     try:
+        stage_dir = None
         if stage and staging is not None and not do_exit.is_set():
-            # acquire() drops its own reference if it raises, so a reference
-            # is released below exactly when one was taken.
-            stage_dir = staging.acquire(os.path.dirname(filepaths[0]), layout)
-            touched.add(filepaths[0])
-        _replace_file(args, filepaths, st, layout, file_layout, touched,
-                      stage_dir)
+            stage_dir = staging.path_for(os.path.dirname(filepaths[0]), layout)
+            # The temp moves the staging directory's rctime, and so its base's.
+            touched.add(stage_dir)
+        try:
+            _replace_file(args, filepaths, st, layout, file_layout, touched,
+                          stage_dir)
+        except OSError as e:
+            again = _exdev_restage(e, stage_dir, filepaths[0], layout)
+            if again is None:
+                raise
+            # The retry is the same file: counted once.
+            with stats._lock:
+                stats.files_submitted -= 1
+            touched.add(again)
+            _replace_file(args, filepaths, st, layout, file_layout, touched,
+                          again)
+    except InvalidLayout as e:
+        logging.warning(f"Skipping {filepaths[0]}: {e}")
+        with stats._lock:
+            stats.files_skipped_layout_invalid += 1
     finally:
-        if (stage_dir is not None
-                and staging.release(os.path.dirname(filepaths[0]))):
-            touched.add(filepaths[0])
         if run_journal is not None:
             for path in touched:
                 run_journal.note_write(path)
+
+
+def _exdev_restage(err, stage_dir, target, layout):
+    """The staging directory to retry target's copy in after err, or None.
+
+    Only a staged copy whose rename crossed a quota realm (EXDEV) is retried,
+    once, staged under that realm's root."""
+    if stage_dir is None or getattr(err, "errno", None) != errno.EXDEV:
+        return None
+    if staging.note_exdev(os.path.dirname(target)) is None:
+        return None
+    again = staging.path_for(os.path.dirname(target), layout)
+    if again == stage_dir:
+        return None
+    logging.info(f"Retrying {target} staged in {again}: {err}")
+    return again
 
 
 def _replace_file(args, filepaths, st, layout, file_layout, touched,
@@ -3723,6 +4545,11 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
         # Covers both the walk and --paths-from, which has no walk to hook.
         if reclaim_orphans(os.path.dirname(filepaths[0])):
             touched.add(filepaths[0])
+
+    # Before the temp exists: a file skipped here changes nothing at all --
+    # no temp to unlink, no rctime move, no journal pin, pass after pass.
+    if _skip_if_open_for_write(filepaths[0]):
+        return
 
     if stage_dir is not None:
         tmp_file = os.path.join(stage_dir, f".{uuid.uuid4().hex}{TMP_SUFFIX}")
@@ -3747,7 +4574,9 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
             staging.recreate(os.path.dirname(filepaths[0]), layout)
             ofd = open(tmp_file, "wb")
         with ofd:
-            if not args.stage_in_tmpdir:
+            # A staged temp is in the run's staging directory, so the file's
+            # own directory changes only at the rename.
+            if not args.stage_in_tmpdir and stage_dir is None:
                 touched.add(filepaths[0])
             tmp_st = os.fstat(ofd.fileno())
             if stage_dir is None:
@@ -3789,20 +4618,17 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
                 # Lock released when ifd is closed
 
         # chown first: it clears setuid/setgid and drops security.capability,
-        # so a chown after copystat stripped what copystat had just copied.
+        # so a chown after copystat would strip what copystat had just copied.
         os.chown(tmp_file, st.st_uid, st.st_gid)
         shutil.copystat(filepaths[0], tmp_file, follow_symlinks=False)
 
-        # The per-copy rate and copy method were here to show whether
-        # copy_file_range (server-side copy) was actually faster in practice.
-        # It is not measurably so, and the numbers swing 30x on identically
-        # sized files because they track OSD and MDS contention rather than
-        # the copy path. Dropped as noise.
+        # No per-copy rate or copy method: copy_file_range (server-side copy)
+        # is not measurably faster than a userspace copy, and per-file rates
+        # swing 30x on identically sized files because they track OSD and MDS
+        # contention rather than the copy path.
         #
-        # The "[N bytes] in Xs" shape is deliberately unchanged: log mining
-        # keys on it, and the archives span years of prior runs. Only the
-        # "(Y MiB/s) via <method>" suffix is gone, so old and new logs parse
-        # identically.
+        # The "[N bytes] in Xs" shape is fixed: log mining keys on it, across
+        # years of archived runs.
         if copy_elapsed > 0:
             logging.info(
                 f"Copied {filepaths[0]} [{st.st_size} bytes] in {copy_elapsed:.2f}s"
@@ -3832,13 +4658,17 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
             # belt-and-suspenders.
             signal.pthread_sigmask(signal.SIG_BLOCK, _EXIT_SIGNALS)
             st2 = os.stat(filepaths[0], follow_symlinks=False)
-            # Check mtime, ctime, and size for a more robust change-detection
+            # Check inode, mtime, ctime and size for a more robust
+            # change-detection
             if (
-                st2.st_mtime_ns != st.st_mtime_ns
+                (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino)
+                or st2.st_mtime_ns != st.st_mtime_ns
                 or st2.st_ctime_ns != st.st_ctime_ns
                 or st2.st_size != st.st_size
             ):
-                if st2.st_mtime_ns != st.st_mtime_ns:
+                if (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino):
+                    logging.error(f"... inode changed")
+                elif st2.st_mtime_ns != st.st_mtime_ns:
                     logging.error(f"... mtime changed")
                 elif st2.st_ctime_ns != st.st_ctime_ns:
                     logging.error(f"... ctime changed (metadata-only change?)")
@@ -3852,46 +4682,38 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
                     stats.files_skipped_changed += 1
                 return
 
-            # The FILE's mtime is preserved, by copystat above -- pipeline
-            # archival (archive_*) and rsync both key on it directly.
+            if _skip_if_open_for_write(filepaths[0]):
+                os.unlink(tmp_file)
+                return
+
+            # Each extra hard-link name is re-checked against the original
+            # inode. Unlinking or replacing a NAME moves the inode's ctime,
+            # which the re-check above catches, but renaming an ANCESTOR of
+            # one name does not touch the inode: the old path can then hold
+            # someone else's new file, which the staged rename would replace.
+            for path in filepaths[1:]:
+                try:
+                    s = os.stat(path, follow_symlinks=False)
+                except OSError:
+                    s = None
+                if s is None or (s.st_dev, s.st_ino) != (st.st_dev, st.st_ino):
+                    logging.error(
+                        f"Failed to replace {filepaths[0]} "
+                        f"(+ {len(filepaths) - 1} hardlink(s)): {path} no "
+                        f"longer holds the original inode")
+                    os.unlink(tmp_file)
+                    with stats._lock:
+                        stats.files_skipped_changed += 1
+                    return
+
+            # The file's mtime is kept (copystat): archive_* and rsync key on
+            # it. The parent directory's is not restored: os.utime() moves its
+            # ctime, and so rctime, anyway; nothing reads directory mtime; and
+            # setting it takes an exclusive MDS cap that stalls walkers.
             #
-            # The parent DIRECTORY's mtime is deliberately NOT restored, and the
-            # os.stat + os.utime that used to do it here are gone:
-            #
-            #   * It did not achieve its purpose. The point was to keep
-            #     ceph.dir.rctime from jumping to the transcode date, but
-            #     os.utime() updates the directory's ctime as a side effect, and
-            #     rctime is a monotonic high-water mark over subtree ctimes that
-            #     never rolls back. Verified live: a transcoded subtree's rctime
-            #     reads as today either way, so retention reports see it as
-            #     0 days old until it ages again. Deferring the utime to
-            #     directory exit would not have helped either.
-            #   * Nothing consumes it. Archive scripts select -type f, restic
-            #     handles directory nodes independently, and rsync compares
-            #     child file mtime and size.
-            #   * It was the contention. Setting a directory's times requires an
-            #     exclusive MDS auth cap (CEPH_CAP_AUTH_EXCL), which collides
-            #     with directory walkers and with sibling workers in the same
-            #     directory -- measured as utimensat stalls up to 4.94s.
-            # Stage EVERY extra hardlink before renaming anything.
-            #
-            # The previous order renamed the first path, then linked and
-            # renamed each remaining one in turn. A failure partway through
-            # that loop -- ENOSPC, an MDS hiccup, a quota -- left some names
-            # pointing at the new inode and the rest still at the old one:
-            # files that were hardlinks to one inode silently became two
-            # inodes with identical contents, with nothing detecting or
-            # reporting the split.
-            #
-            # Linking from tmp_file (the new inode, before its rename)
-            # rather than from filepaths[0] (the same inode, after) lets all
-            # the staging happen first. If any link fails, nothing has been
-            # renamed yet and the temp files are reclaimed as orphans. The
-            # renames that follow are metadata-only.
-            #
-            # Hard links can live in different directories, so the staging
-            # path is recomputed per target; reusing one would reintroduce
-            # the cross-directory rename for every extra link.
+            # Stage EVERY extra hard link, linked from tmp_file, before renaming
+            # anything, so a failed link leaves the set whole. Each link's temp
+            # sits in that link's own directory, so its rename stays there.
             link_tmps = []
             try:
                 for path in filepaths[1:]:
@@ -3969,52 +4791,82 @@ def _under_roots(path, roots):
                for r in roots)
 
 
+def _real_dir(path, cache):
+    """os.path.realpath() of directory *path*, resolving each directory once.
+
+    realpath() lstat()s every component on every call. The paths in a list
+    share nearly all their ancestors, so with *cache* each directory not yet
+    seen costs one lstat().
+    """
+    real = cache.get(path)
+    if real is None:
+        parent, name = os.path.split(path)
+        if not name:
+            real = path
+        else:
+            here = os.path.join(_real_dir(parent, cache), name)
+            real = os.path.realpath(here) if os.path.islink(here) else here
+        cache[path] = real
+    return real
+
+
+def _containing_root(path, roots):
+    """The innermost of *roots* that *path* is under, or None."""
+    return max((r for r in roots if _under_roots(path, [r])), key=len,
+               default=None)
+
+
+def _symlink_below_root(dirpath, roots, cache):
+    """Where *dirpath* really is when a symlink below its root leads elsewhere,
+    else None. A symlink in the root's own path is the operator's choice and
+    is allowed; only the part of the path under the root is held to the walk's
+    rule of never following one."""
+    root = _containing_root(dirpath, roots)
+    if root is None:
+        return None
+    real = _real_dir(dirpath, cache)
+    expected = os.path.normpath(os.path.join(_real_dir(root, cache),
+                                             os.path.relpath(dirpath, root)))
+    return None if real == expected else real
+
+
 # ---------------------------------------------------------------------------
 # --paths-from-pool: read the candidate list out of a RADOS pool
 #
-# The walk prunes machine-generated directories by default, which is what makes
-# it affordable -- on some volumes 86.5% of files are inside virtualenvs -- but
-# it means those files are never moved, so a pool being drained never empties
-# and cannot be deleted. Reading the pool directly costs no MDS walk at all and
-# is proportional to what is LEFT rather than to the size of the tree. Measured
-# on a 44 TiB pool: 4,074 files/s enumerating versus 0.23 files/s walking.
+# The walk prunes machine-generated directories, so it alone never empties a
+# drained pool. Listing the pool costs no MDS walk and scales with what is left
+# (4,074 files/s, against 0.23 walking, on a 44 TiB pool). Only a file's first
+# object, "<ino-hex>.00000000", carries the `parent` backtrace, and the MDS
+# always creates it, sparse and empty files included.
 #
-# Only the first object of a file, "<ino-hex>.00000000", carries the `parent`
-# xattr, so this is one read per FILE rather than per object, and the backtrace
-# holds the whole ancestry -- no per-level lookups. The MDS creates that object
-# explicitly to store the backtrace (CInode.cc, op.create(false) before
-# op.setxattr("parent", ...)), so sparse files with no data at offset 0 and
-# zero-length files both still have one.
-#
-# Object naming lives above erasure coding: it is computed by the client-side
-# striper purely from file_layout_t, and src/osdc/Striper.cc contains no EC
-# references at all. Optimized/"fast" EC operates on the shards inside an
-# already-named object, so none of this is affected by it.
-#
-# RENAME STALENESS -- the important caveat. Pointing the volume root at another
-# pool freezes the pool's MEMBERSHIP: nothing new enters it. It does NOT freeze
-# PATHS. A rename marks the inode STATE_DIRTYPARENT and the corrected backtrace
-# is written only when the log segment holding that rename expires
-# (LogSegment::try_to_expire walks dirty_parent_inodes calling store_backtrace).
-# Until then the object still names the pre-rename path, this reads that stale
-# path, the file is not there, and it is counted "vanished" -- while the file is
-# alive under its new name and still in the pool. So a single enumeration is NOT
-# final even on a frozen pool.
-#
-# It converges by RE-ENUMERATION once the MDS has trimmed its journal, and
-# `ceph tell mds.<daemon> flush journal` forces that rather than waiting. For
-# the last few objects in a pool, `ceph tell mds.<daemon> dump inode <ino>`
-# returns the live path authoritatively; that is too costly per inode at scale
-# and exactly right for closing a pool out.
+# A backtrace path can be stale for a live file. A renamed file's backtrace is
+# rewritten only when the MDS expires the log segment holding the rename ('ceph
+# tell mds.<daemon> flush journal' forces it). Files under a renamed ANCESTOR
+# keep the old path for good, but their parent's inode stays right. So each
+# path's parent directory is checked once (InodeLocator): unchanged, the path is
+# used as listed; moved, the file is found by LOOKUPINO of the parent plus its
+# dname, inode-checked. A name holding another inode is skipped as replaced,
+# with no further lookup; otherwise a LOOKUPINO of the file decides: ESTALE is
+# gone, anything else is live but unlocatable ('dump inode <ino>' names it).
+# Only backtraces inside the mounted subtree are looked up. Checks wait out a
+# thread-limit pause and sleep file_delay_ms first; inode lookups are capped by
+# --lookupino-rate.
 # ---------------------------------------------------------------------------
 
 BACKTRACE_XATTR = "parent"
 
 # Cap on the distinct-inode set used by the end-of-listing cross-check.
-# Measured cost is ~66 bytes per entry, so 50M entries is ~3.3 GB; a
+# Each entry costs ~66 bytes, so 50M entries is ~3.3 GB; a
 # 665M-object pool would need ~44 GB. Past the cap the set is dropped and
 # the cross-check is reported as skipped rather than exhausting memory.
 INODE_TRACK_MAX = 50_000_000
+
+
+class Backtrace(tuple):
+    """decode_backtrace's result, (ino, [dname ...] root-first, pool), with
+    .dirinos: the ancestors' directory inodes, root-first like the dnames, so
+    dirinos[-1] is the file's parent."""
+    dirinos = ()
 
 
 class BacktraceError(Exception):
@@ -4023,7 +4875,8 @@ class BacktraceError(Exception):
 
 
 def decode_backtrace(blob):
-    """Decode an inode_backtrace_t. Returns (ino, [dname ...] root-first, pool).
+    """Decode an inode_backtrace_t. Returns a Backtrace: (ino, [dname ...]
+    root-first, pool), with the ancestors' inodes in .dirinos.
 
         u8 struct_v  u8 compat_v  u32 payload_len
         u64 ino
@@ -4070,6 +4923,7 @@ def decode_backtrace(blob):
         ino = fixed("<Q", 8)
 
         names = []
+        dirinos = []
         n = fixed("<I", 4)
         if n > 4096:
             raise BacktraceError("implausible ancestor count %d" % n)
@@ -4082,7 +4936,7 @@ def decode_backtrace(blob):
             if not 1 <= bp_v <= 16:
                 raise BacktraceError("implausible backpointer struct_v %d" % bp_v)
             fixed("<I", 4)                  # backpointer payload length
-            fixed("<Q", 8)                  # dirino -- ancestry is by name
+            dirinos.append(fixed("<Q", 8))
             ln = fixed("<I", 4)
             if ln > 4096:
                 raise BacktraceError("implausible dname length %d" % ln)
@@ -4097,11 +4951,268 @@ def decode_backtrace(blob):
             fixed("<Q", 8)                  # version
 
         pool = fixed("<q", 8)
-        return ino, list(reversed(names)), pool
+        bt = Backtrace((ino, list(reversed(names)), pool))
+        bt.dirinos = tuple(reversed(dirinos))
+        return bt
     except BacktraceError:
         raise
     except (IndexError, struct.error) as e:
         raise BacktraceError(str(e)) from e
+
+
+# Default for --lookupino-rate: inode lookups are MDS requests, and a pool with
+# tens of thousands of files under renamed directories asks for one per file
+# until the directory cache warms up.
+LOOKUPINO_RATE = 20.0
+# Directory lookups and parent checks cached per listing; past this a cache
+# starts over.
+PARENT_CACHE_MAX = 1_000_000
+# struct ceph_nfs_fh { u64 ino; }: the kernel client's plain file handle.
+_FILEID_INO32_GEN = 1
+
+
+class _StopListing(Exception):
+    """The run is stopping; end the pool listing early."""
+
+
+class InodeLocator:
+    """Find a live file's current path on one kernel CephFS mount from its inode
+    and its backtrace's parent inode. Lookups go to the MDS (open_by_handle_at
+    -> LOOKUPINO), are paced at rate per second, and directories are cached.
+    The two lookup primitives raise OSError; ESTALE means no such inode."""
+
+    def __init__(self, mount, rate):
+        self.mount = mount
+        self.rate = rate
+        self.lookups = 0
+        self.slept = 0.0
+        self._dirs = {}              # dirino -> current path, None when gone, or the OSError
+        self._parents = {}           # parent path -> its st_ino, 0 when missing
+        self._next = 0.0
+        self._mfd = None
+        self._obha = None
+        self.mount_dev = None        # st_dev of the mount; checked when known
+
+    @classmethod
+    def open(cls, mount, rate):
+        """A locator for mount, or None (said once) when lookups are off or
+        unavailable. It is proved on the mount root before it is used."""
+        if not rate or rate <= 0:
+            return None
+        loc = cls(mount, rate)
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            obha = libc.open_by_handle_at
+        except (OSError, AttributeError) as e:
+            logging.warning("--paths-from-pool: no open_by_handle_at (%s); no "
+                            "inode lookups", e)
+            return None
+        obha.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        obha.restype = ctypes.c_int
+        loc._obha = obha
+        try:
+            loc._mfd = os.open(mount, os.O_RDONLY | os.O_DIRECTORY)
+            mst = os.stat(mount)
+            loc.mount_dev = mst.st_dev
+            got = loc._lookup_dir(mst.st_ino)
+        except OSError as e:
+            why = ("it needs CAP_DAC_READ_SEARCH; run as root"
+                   if e.errno in (errno.EPERM, errno.EACCES) else str(e))
+            logging.warning("--paths-from-pool: no inode lookups on %s (%s)",
+                            mount, why)
+            loc.close()
+            return None
+        if os.path.realpath(got) != os.path.realpath(mount):
+            logging.warning("--paths-from-pool: %s's root inode looked up as %s; "
+                            "no inode lookups", mount, got)
+            loc.close()
+            return None
+        return loc
+
+    def close(self):
+        if self._mfd is not None:
+            os.close(self._mfd)
+            self._mfd = None
+
+    def _open_fd(self, ino):
+        import struct
+        fh = ctypes.create_string_buffer(
+            struct.pack("<Ii", 8, _FILEID_INO32_GEN) + struct.pack("<Q", ino))
+        fd = self._obha(self._mfd, fh, getattr(os, "O_PATH", 0o10000000))
+        if fd < 0:
+            e = ctypes.get_errno()
+            raise OSError(e, os.strerror(e))
+        return fd
+
+    def _lookup_dir(self, dirino):
+        """The directory's current path. The kernel reconnects a directory
+        handle to its dentry chain, so /proc/self/fd names it; a file handle
+        can come back disconnected, which is why only directories are named
+        this way. A directory removed between the open and the readlink reads
+        back as "<path> (deleted)" with no links left, and is ESTALE, like one
+        already gone. The suffix alone only means the dentry is unhashed, so a
+        directory that still has links keeps the path it read back."""
+        fd = self._open_fd(dirino)
+        try:
+            path = os.readlink(f"/proc/self/fd/{fd}")
+            if path.endswith(" (deleted)") and os.fstat(fd).st_nlink == 0:
+                raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+            return path
+        finally:
+            os.close(fd)
+
+    def _lookup(self, ino):
+        """Return if ino is a linked inode; OSError (ESTALE) if not."""
+        os.close(self._open_fd(ino))
+
+    def _pace(self):
+        """Wait for the rate cap, in slices so an exit is not held up."""
+        start = now = time.monotonic()
+        while self._next > now and not do_exit.is_set():
+            time.sleep(min(self._next - now, 1.0))
+            now = time.monotonic()
+        self.slept += now - start
+        self._next = max(now, self._next) + 1.0 / self.rate
+        self.lookups += 1
+
+    def parent_exists(self, parent):
+        """Was parent checked and found to exist? Cache only, no lookup."""
+        got = self._parents.get(parent)
+        return bool(got) and not isinstance(got, OSError)
+
+    def parent_gone(self, dirino, parent):
+        """Is dirino already known to be gone (looked up, ESTALE) and is
+        nothing at its old path (parent checked missing)? A new directory at
+        that path can hold a file moved in under its old name."""
+        return (dirino in self._dirs and self._dirs[dirino] is None
+                and self._parents.get(parent) == 0)
+
+    def dir_path(self, dirino):
+        """dirino's current path, or None when it is gone. Any other failure
+        is cached too and raised again, so a directory costs one lookup."""
+        if dirino not in self._dirs:
+            self._pace()
+            if len(self._dirs) >= PARENT_CACHE_MAX:
+                self._dirs.clear()
+            try:
+                self._dirs[dirino] = self._lookup_dir(dirino)
+            except OSError as e:
+                self._dirs[dirino] = None if e.errno == errno.ESTALE else e
+        got = self._dirs[dirino]
+        if isinstance(got, OSError):
+            raise got.with_traceback(None)   # a cached error must not grow
+        return got
+
+    def parent_unchanged(self, parent, dirino, pace=None):
+        """Is parent still directory inode dirino? One lstat per directory,
+        cached (up to PARENT_CACHE_MAX entries), failures included; pace()
+        runs before each lstat that is not cached."""
+        got = self._parents.get(parent)
+        if got is None:
+            if pace is not None:
+                pace()
+            try:
+                got = os.lstat(parent).st_ino
+            except OSError as e:
+                got = 0 if e.errno in _VANISHED_ERRNOS else e
+            if len(self._parents) >= PARENT_CACHE_MAX:
+                self._parents.clear()
+            self._parents[parent] = got
+        if isinstance(got, OSError):
+            raise got.with_traceback(None)   # a cached error must not grow
+        return got == dirino
+
+    def _is(self, st, ino):
+        """Is st inode ino on this mount?"""
+        return st.st_ino == ino and (self.mount_dev is None
+                                     or st.st_dev == self.mount_dev)
+
+    def alive(self, ino):
+        self._pace()
+        try:
+            self._lookup(ino)
+        except OSError as e:
+            if e.errno != errno.ESTALE:
+                raise
+            return False
+        return True
+
+    def locate(self, path, ino, dirino, dname):
+        """(path, how) for inode ino read at path from its backtrace:
+        "as-is" when path is that inode, "parent" when it is dname under
+        dirino's current path, (None, "replaced") when the parent is where
+        the backtrace says but the dname no longer holds the inode, or the
+        dname under the parent's current path holds another inode (replaced,
+        deleted or renamed; no further lookup), (None, "gone") when the inode
+        or its parent directory no longer exists, and (None, "unlocatable")
+        when the inode exists but neither path holds it. Raises OSError for
+        any other failure."""
+        def holds(p):
+            try:
+                return self._is(os.lstat(p), ino)
+            except OSError as e:
+                if e.errno not in _VANISHED_ERRNOS:
+                    raise
+                return False
+        if holds(path):
+            return path, "as-is"
+        if dirino:
+            d = self.dir_path(dirino)
+            if d is None:
+                # The parent is gone (ESTALE), so is the name under it; no
+                # lookup per file.
+                return None, "gone"
+            # A directory moved out of a subtree mount reconnects outside it;
+            # its path is not on this mount, so it is not used.
+            if not _under_roots(os.path.normpath(d), [self.mount]):
+                d = None
+            if d is not None:
+                if os.path.normpath(d) == os.path.dirname(os.path.normpath(path)):
+                    return None, "replaced"
+                cand = os.path.join(d, dname)
+                try:
+                    st = os.lstat(cand)
+                except OSError as e:
+                    if e.errno not in _VANISHED_ERRNOS:
+                        raise
+                    st = None
+                if st is not None:
+                    if self._is(st, ino):
+                        return cand, "parent"
+                    return None, "replaced"
+        return None, ("unlocatable" if self.alive(ino) else "gone")
+
+
+def _nonnegative_float(v):
+    """argparse type: a finite float >= 0."""
+    import math
+    try:
+        f = float(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {v!r}") from None
+    if not math.isfinite(f) or f < 0:
+        raise argparse.ArgumentTypeError(
+            f"must be a finite number, 0 or more, not {v}")
+    return f
+
+
+def _inode_locator(mount, rate):
+    """An InodeLocator for a kernel CephFS mount, else None. Not on an ino32
+    mount: there st_ino is a hash of the inode number the handle carries, so
+    no lstat would ever match."""
+    if not rate or rate <= 0:
+        return None                  # lookups turned off; nothing to say
+    fstype = _findmnt("FSTYPE", mount)
+    if fstype != "ceph":
+        logging.warning("--paths-from-pool: %s is not a kernel CephFS mount "
+                        "(%s); no inode lookups", mount,
+                        fstype or "findmnt unavailable")
+        return None
+    if "ino32" in _findmnt("OPTIONS", mount).split(","):
+        logging.warning("--paths-from-pool: %s is mounted ino32; no inode "
+                        "lookups", mount)
+        return None
+    return InodeLocator.open(mount, rate)
 
 
 def _findmnt(field, path):
@@ -4164,7 +5275,7 @@ def _ceph_connect_args(explicit, sample_path, mon_host=None):
         return "", {"mon_host": ",".join(mons)}
 
     raise SystemExit(
-        "--paths-from-pool: cannot reach the cluster. No --rados-conffile, no "
+        "Cannot reach the cluster over RADOS. No --rados-conffile, no "
         "CEPH_CONF, no /etc/ceph/ceph.conf, %d candidates in /etc/ceph (%s), and no "
         "monitor addresses in the mount source (%r -- cephadm-style sources do not "
         "carry them). Pass --rados-conffile, or --rados-mon-host." % (
@@ -4208,19 +5319,45 @@ def _path_source(args, roots):
     return _iter_listed_paths(args.paths_from)
 
 
+def _prefix_shift(moves):
+    """The one wrong ancestry prefix that explains every relocated sample, as
+    (extra, components): extra True when the derived paths carry those leading
+    components and the files lack them, False the other way round. moves are
+    (derived, found) mount-relative component lists. None when no single
+    leading-component shift explains them all; a rename changes a component,
+    and a directory moved under its own name shifts only its own files."""
+    shift = None
+    for d, f in moves:
+        if len(d) == len(f):
+            continue
+        short, long_ = (d, f) if len(d) < len(f) else (f, d)
+        if long_[len(long_) - len(short):] != short:
+            continue
+        cand = (len(d) > len(f), tuple(long_[:len(long_) - len(short)]))
+        if shift is not None and cand != shift:
+            return None
+        shift = cand
+    if shift is None:
+        return None
+    extra, comps = shift
+    for d, f in moves:
+        if tuple((d if extra else f)[:len(comps)]) != comps:
+            return None
+    return shift
+
+
 def _prefix_error(checked, example):
     """Message for "every derived path is missing".
 
-    Two causes, and they cannot be told apart from here, so name both: a wrong
+    Two causes, which the path alone cannot tell apart, so name both: a wrong
     ancestry prefix (the subtree-vs-root mount case) or a pool holding only
-    objects whose files have since been deleted. Either way, transcoding
+    objects whose files have since been deleted. Inode lookups tell them apart
+    when they run (an all-gone sample is not refused); otherwise transcoding
     nothing while reporting a clean pass is the wrong outcome.
     """
-    return ("--paths-from-pool: none of the %d sampled derived paths exist (e.g. %s). "
-            "Either the ancestry prefix is wrong for this mount -- check whether it "
-            "is a subtree mount -- or every remaining object belongs to an "
-            "already-deleted file. Refusing rather than reporting a clean pass "
-            "that moved nothing." % (checked, example))
+    return ("--paths-from-pool: none of the %d sampled derived paths exist "
+            "(e.g. %s): a wrong ancestry prefix (a subtree mount?), or only "
+            "deleted files' objects are left. Refusing." % (checked, example))
 
 
 def write_target_refusal(args, pool, root, cur):
@@ -4240,27 +5377,18 @@ def write_target_refusal(args, pool, root, cur):
             "allowed for a --target-pool %s sweep of files up to %d bytes",
             pool, root, args.target_pool, args.max_size)
         return None
-    return ("--paths-from-pool %s is still the default write target of %s. New "
-            "files keep landing in it, so a drain cannot converge and the list "
-            "would be stale immediately. Repoint ceph.dir.layout.pool first."
+    return ("--paths-from-pool %s is still the default write target of %s, "
+            "so a drain cannot converge. Repoint ceph.dir.layout.pool first."
             % (pool, root))
 
 
 def _iter_pool_paths(args, roots):
     """Yield the CephFS path of every file currently in args.paths_from_pool.
 
-    Guards, in order, because each one is a way this silently produces a wrong
-    or incomplete list:
-
-      * the bindings may be absent -- name the PACKAGE, not the module
-      * the pool must not still be the volume's default write target, or the
-        drain cannot converge and the list is stale the moment it is made
-      * snapshots pin objects, so a snapshotted pool can never reach empty
-      * every inode with objects must have a bno-0 object carrying the
-        backtrace. That is what the MDS does today; asserting it at runtime
-        means a future change is caught rather than silently dropping files
-      * the derived path prefix must actually resolve, or the whole list is
-        phantom paths that get counted as "vanished"
+    Refuses rather than yield a wrong or partial list: no RADOS bindings, the
+    pool still a default write target, snapshots on the pool, an inode with
+    no backtrace-carrying bno-0 object, or a path prefix that does not resolve
+    (unless every sampled object is gone by inode lookup: a deleted tree).
     """
     try:
         import rados
@@ -4298,7 +5426,7 @@ def _iter_pool_paths(args, roots):
             if e.errno == ENODATA:
                 try:
                     lay = get_layout_walking_up(r)
-                except OSError as e2:
+                except (OSError, InvalidLayout) as e2:
                     e = e2
             if lay is None:
                 logging.warning(
@@ -4324,6 +5452,16 @@ def _iter_pool_paths(args, roots):
     strip = [c for c in subtree.strip("/").split("/") if c]
     logging.info("--paths-from-pool %s: conf %s, mount %s, fs subtree %s",
                  pool, conffile, mp, subtree)
+    locator = _inode_locator(mp, getattr(args, "lookupino_rate", LOOKUPINO_RATE))
+    # Lookups are MDS requests, so only paths the run may touch are located;
+    # anything else is refused downstream whatever its path.
+    bounds = [os.path.abspath(r) for r in roots]
+
+    def check_pace():
+        # The thread limit's pause and the file delay hold these checks in
+        # both modes: --target-pool reads the whole listing before any copy.
+        if not _reap_pace():
+            raise _StopListing()
 
     conf = dict(conf_over)
     if args.rados_keyring:
@@ -4344,7 +5482,14 @@ def _iter_pool_paths(args, roots):
     vanished = 0
     yielded = 0
     checked = 0
+    sampled_gone = 0
+    sampled_moves = []           # relocated samples, mount-relative components
     resolved = 0
+    relocated = 0
+    gone = 0
+    replaced = 0
+    unlocatable = 0
+    lookup_errors = 0
     # The inode cross-check below is only meaningful after a COMPLETE listing.
     # Stop early -- a break in the consumer, --max-files, an exception -- and
     # stripe objects whose bno-0 object had not been reached yet look like
@@ -4387,7 +5532,8 @@ def _iter_pool_paths(args, roots):
                 vanished += 1
                 continue
             try:
-                bt_ino, names, _pool = decode_backtrace(blob)
+                bt = decode_backtrace(blob)
+                bt_ino, names, _pool = bt
             except BacktraceError as e:
                 logging.error("%s: undecodable backtrace: %s", key, e)
                 unusable += 1
@@ -4405,28 +5551,108 @@ def _iter_pool_paths(args, roots):
             if not names:
                 continue
             rel = [n.decode("utf-8", "surrogateescape") for n in names]
-            if strip and rel[:len(strip)] == strip:
+            # A backtrace outside the mount's subtree keeps its full path; no
+            # lookup from this mount can reach it, so it is not looked up.
+            inside = not strip or rel[:len(strip)] == strip
+            if strip and inside:
                 rel = rel[len(strip):]
             path = os.path.join(mp, *rel) if rel else mp
+            derived = path
+            how = None
+            if locator is not None and inside and rel and _under_roots(path, bounds):
+                dirinos = getattr(bt, "dirinos", ())
+                dirino = dirinos[-1] if dirinos else 0
+                try:
+                    if dirino and locator.parent_unchanged(
+                            os.path.dirname(path), dirino, pace=check_pace):
+                        found, how = path, None
+                    elif dirino and locator.parent_gone(dirino, os.path.dirname(path)):
+                        found, how = None, "gone"    # settled from the cache
+                    else:
+                        check_pace()
+                        found, how = locator.locate(path, ino, dirino, rel[-1])
+                except _StopListing:
+                    logging.info("--paths-from-pool %s: stopping the listing", pool)
+                    return
+                except OSError as e:
+                    lookup_errors += 1
+                    if lookup_errors <= 5:
+                        logging.warning("%s (inode 0x%x): inode lookup failed "
+                                        "(%s); using the backtrace path", path, ino, e)
+                    found, how = path, None
+                if how == "parent":
+                    relocated += 1
+                    if relocated <= 5:
+                        logging.info("%s is now %s (a parent was renamed)",
+                                     path, found)
+                    path = found
+                elif how == "unlocatable":
+                    unlocatable += 1
+                    if unlocatable <= 10:
+                        logging.warning(
+                            "inode 0x%x is alive but not at %s or under its "
+                            "parent; re-run once its backtrace is rewritten, or "
+                            "'ceph tell mds.<fs>:<rank> dump inode %d'",
+                            ino, path, ino)
             # Verify the derived prefix on the first handful rather than
             # emitting a whole list of paths that do not exist.
             if checked < 64:
                 checked += 1
-                exists = os.path.lexists(path)
+                # A replaced name, or a derived parent the locator found on
+                # disk, proves the prefix as well as an existing derived path.
+                exists = (how == "replaced"
+                          or (locator is not None
+                              and locator.parent_exists(os.path.dirname(derived)))
+                          or os.path.lexists(path))
                 if exists:
                     resolved += 1
+                    if how == "parent":
+                        sampled_moves.append(
+                            (os.path.relpath(derived, mp).split(os.sep),
+                             os.path.relpath(path, mp).split(os.sep)))
                 else:
                     last_unresolved = path
-                if checked == 64 and resolved == 0:
+                    if how == "gone":
+                        sampled_gone += 1
+                # Inodes the MDS says are gone (ESTALE) say nothing against
+                # the prefix: a fully deleted tree awaiting purge looks so.
+                if checked == 64 and resolved == 0 and sampled_gone < checked:
                     raise SystemExit(_prefix_error(checked, path))
+            if how == "gone":
+                gone += 1
+                continue
+            if how == "replaced":
+                replaced += 1
+                continue
+            if how == "unlocatable":
+                continue
             yielded += 1
             yield path
         # Evaluate the prefix guard again at end of listing. Gating it solely on
         # reaching 64 samples meant a pool with fewer candidates than that never
         # reached the abort -- and that is the near-empty pool a drain converges
         # toward, so the guard was weakest exactly where it matters most.
+        shift = (_prefix_shift(sampled_moves)
+                 if sampled_moves and len(sampled_moves) == resolved else None)
         if checked > 0 and resolved == 0:
-            raise SystemExit(_prefix_error(checked, last_unresolved))
+            if sampled_gone < checked:
+                raise SystemExit(_prefix_error(checked, last_unresolved))
+            logging.warning("--paths-from-pool %s: all %d sampled objects are "
+                            "gone (ESTALE); prefix not checked", pool, checked)
+        elif shift:
+            # Every resolved sample was found only by inode, and one leading-
+            # component shift explains them all: a wrong ancestry prefix.
+            extra, comps = shift
+            # The example shows the shift itself, not a renamed sample.
+            d, f = next((d, f) for d, f in sampled_moves
+                        if len(d) != len(f) and (d if extra else f)[len(comps):]
+                        == (f if extra else d))
+            logging.warning("--paths-from-pool %s: all %d resolved samples were "
+                            "found by inode, as if the derived paths %s leading "
+                            "'%s' (e.g. %s -> %s); check the ancestry prefix (a "
+                            "subtree mount?)", pool, resolved,
+                            "had extra" if extra else "lacked", "/".join(comps),
+                            "/".join(d), "/".join(f))
         complete = True
     finally:
         missing = (len(inodes_seen) - first_objs) if inodes_seen is not None else 0
@@ -4450,12 +5676,25 @@ def _iter_pool_paths(args, roots):
                 "not be used (absent, undecodable, or for a different inode): no "
                 "path was emitted for them and they will hold the pool above "
                 "zero.%s", unusable, pool, note)
+        if complete and unlocatable > 0:
+            logging.warning(
+                "%d live inode(s) in %s not located; no path emitted, and they "
+                "hold the pool until a re-run", unlocatable, pool)
         logging.info(
             "--paths-from-pool %s: %d inodes, %d bno-0 objects (%d unusable, "
             "%d gone before read), %d paths emitted, %d/%d sampled paths resolved%s",
             pool, len(inodes_seen) if inodes_seen is not None else -1,
             first_objs, unusable, vanished, yielded, resolved, checked,
             "" if complete else " (listing stopped early; counts are partial)")
+        if locator is not None:
+            logging.info(
+                "--paths-from-pool %s: %d found under a renamed directory, %d gone "
+                "(not deletion evidence; re-run to catch late backtraces), %d no "
+                "longer at their name, %d alive but not locatable, %d lookup "
+                "error(s); %d inode lookups, %.0fs in their rate cap",
+                pool, relocated, gone, replaced, unlocatable, lookup_errors,
+                locator.lookups, locator.slept)
+            locator.close()
         ioctx.close()
         cluster.shutdown()
 
@@ -4475,22 +5714,28 @@ def _iter_listed_paths(src):
         sep = b"\0" if b"\0" in first else b"\n"
         logging.info("--paths-from %s: %s-delimited", src,
                      "NUL" if sep == b"\0" else "newline")
+
+        def _entry(raw):
+            # surrogateescape: a path the filesystem accepts is not always
+            # valid UTF-8, and refusing to process it would be worse than
+            # round-tripping the bytes. A NUL list (find -print0) is read
+            # byte-exact, so a name's own CR or LF survives and stays
+            # targetable; a newline list drops one trailing CR, for CRLF.
+            t = raw.decode("utf-8", "surrogateescape")
+            return t.removesuffix("\r") if sep == b"\n" else t
         buf = first
         while True:
             parts = buf.split(sep)
             buf = parts.pop()
             for raw in parts:
-                # surrogateescape: a path the filesystem accepts is not always
-                # valid UTF-8, and refusing to process it would be worse than
-                # round-tripping the bytes.
-                t = raw.decode("utf-8", "surrogateescape").strip("\r\n")
+                t = _entry(raw)
                 if t:
                     yield t
             chunk = fh.read(1 << 20)
             if not chunk:
                 break
             buf += chunk
-        t = buf.decode("utf-8", "surrogateescape").strip("\r\n")
+        t = _entry(buf)
         if t:
             yield t
     finally:
@@ -4654,8 +5899,8 @@ def _apply_config_threads(n):
     regulator pause, so "threads = 0" arrives while the limit is already 0,
     and "threads = 1" during its 1-thread probe. Either is the operator taking
     over, and the write is how the regulator knows (DynamicSemaphore._gen).
-    Skipped, the edit was lost -- RuntimeConfig never passes it again -- and
-    the regulator later resumed over the operator's pause.
+    Skipped, the edit would be lost -- RuntimeConfig never passes it again --
+    and the regulator would later resume over the operator's pause.
     """
     old_v = thread_count.limit
     if n == old_v:
@@ -4681,9 +5926,32 @@ def _apply_config_threads(n):
 
 
 def _poll_config():
-    """Re-read --config if it changed. Walker thread only."""
+    """Re-read --config if it changed. Walker and config-poller threads."""
     if runtime_config is not None:
         runtime_config.poll(apply_config)
+
+
+def _start_config_poller(poll_seconds):
+    """Poll --config on its own clock, not only from the walker.
+
+    The walker polls between files, so anything that stops the walker -- a
+    filesystem call that hangs -- would stop config changes too, including
+    "threads = 0", the operator's pause. Plain sleeps, as in
+    _file_delay(); applying from here is safe because _apply_config only
+    rebinds module globals and args attributes and RuntimeConfig serializes
+    polls.
+    """
+    def run():
+        while not do_exit.is_set():
+            time.sleep(max(1.0, float(poll_seconds)))
+            try:
+                _poll_config()
+            except Exception:
+                logging.exception("Config poller: poll failed")
+
+    t = threading.Thread(target=run, name="config-poller", daemon=True)
+    t.start()
+    return t
 
 
 # The longest single sleep inside one file delay, so an exit or a config change
@@ -4714,34 +5982,37 @@ def _file_delay():
 def process_paths(args, hard_links, executor, dir_layouts, roots):
     """Transcode an explicit list of paths instead of walking the tree.
 
-    A second pass at a lower --min-size already knows its candidates from the
-    previous pass's log, and rediscovering them is the expensive part: the
-    walker sleeps file_delay once per file ENCOUNTERED, before the stat, so a
-    pass costs roughly rfiles x delay however few files actually qualify. On one
-    production volume that is 195M paths visited to reach 8.7M candidates -- 45
-    days of walking for 2 days of work.
-
-    The list is a snapshot and it decays. Measured on that volume, 63% of the
-    listed paths no longer existed six days later and 39% of the survivors had
-    already moved to the target pool. So nothing here trusts the list: every
-    path is re-stat'ed and re-checked exactly as the walker would, and a path
-    that has since vanished is an expected outcome rather than an error.
+    For a pass whose candidates a previous log already holds: the walker pays
+    file_delay per file encountered, not per candidate. A list goes stale, so
+    every path is re-stat'ed and re-checked as the walker would, and a
+    vanished one is expected, not an error.
     """
-    # The directory the producer is on, held so its files share a staging
-    # directory. Only under --target-pool.
-    held = [None]
-    try:
-        _process_paths(args, hard_links, executor, dir_layouts, roots, held)
-    finally:
-        _release_hold(held[0])
+    return _process_paths(args, hard_links, executor, dir_layouts, roots)
 
 
-def _process_paths(args, hard_links, executor, dir_layouts, roots, held):
+def _process_paths(args, hard_links, executor, dir_layouts, roots):
     def _limit_reached():
         return args.max_files is not None and stats.files_submitted >= args.max_files
 
     last_progress = time.monotonic()
     outside_logged = 0
+    real_dirs = {}
+    root_dev = {r: os.stat(r).st_dev for r in roots}
+    restat_failed = set()
+    # Directories whose layout read was refused, read once per pass: a list
+    # grouped by directory would otherwise pay the re-reads for every file.
+    bad_layout_dirs = {}
+
+    def _skip_outside(filepath, why):
+        nonlocal outside_logged
+        with stats._lock:
+            stats.files_outside_root += 1
+        outside_logged += 1
+        if outside_logged <= 10:
+            logging.warning("Skipping %s: %s", filepath, why)
+        elif outside_logged == 11:
+            logging.warning("Further out-of-tree paths will be counted but not "
+                            "logged individually")
 
     source = _path_source(args, roots)
     # Grouping reads the whole list first, which a --max-files run would pay
@@ -4769,15 +6040,20 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots, held):
         # the damage would be silent and large, so a path outside the roots
         # given on the command line is refused rather than followed.
         if not _under_roots(filepath, roots):
-            with stats._lock:
-                stats.files_outside_root += 1
-            outside_logged += 1
-            if outside_logged <= 10:
-                logging.warning("Skipping %s: outside the directories given on the "
-                                "command line", filepath)
-            elif outside_logged == 11:
-                logging.warning("Further out-of-tree paths will be counted but not "
-                                "logged individually")
+            _skip_outside(filepath, "outside the directories given on the command line")
+            continue
+
+        # The walker never follows a symlinked directory under its root, and
+        # neither does a list: one can lead into another volume, or another
+        # cluster's mount whose pool of the same name passes --source-pool. The
+        # st_dev test below catches a directory replaced, after it was cached
+        # here, by a symlink to another filesystem.
+        dirpath = os.path.dirname(filepath)
+        if len(real_dirs) >= PARENT_CACHE_MAX:
+            real_dirs.clear()
+        real = _symlink_below_root(dirpath, roots, real_dirs)
+        if real is not None:
+            _skip_outside(filepath, f"reached through a symlink (its directory is {real})")
             continue
 
         # Ours, as in the walk: the shared journal or a run's checkpoint of
@@ -4787,19 +6063,30 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots, held):
             logging.info("Skipping %s: the run journal", filepath)
             continue
 
-        dirpath = os.path.dirname(filepath)
         # A pool drain can list a copy in flight in another run's staging
         # directory. It is not a candidate; it is about to replace one.
         if STAGE_RE.match(os.path.basename(dirpath)):
             logging.info("Skipping %s: inside a staging directory", filepath)
             continue
-        if staging is not None and dirpath != held[0]:
-            _release_hold(held[0])
-            staging.hold(dirpath)
-            held[0] = dirpath
 
         try:
             st = os.stat(filepath, follow_symlinks=False)
+            root = _containing_root(filepath, roots)
+            if st.st_dev != root_dev[root]:
+                # An autofs volume that expired and was mounted again has a
+                # new device number, so the file's own root is looked at again
+                # first. A root that cannot be stat'ed keeps its old device;
+                # its error is its own, said once, not the file's.
+                try:
+                    root_dev[root] = os.stat(root).st_dev
+                except OSError as e:
+                    if root not in restat_failed:
+                        restat_failed.add(root)
+                        logging.warning("Could not stat %s again: %s", root, e)
+            if st.st_dev != root_dev[root]:
+                _skip_outside(filepath, "on another filesystem than the directories "
+                              "given on the command line")
+                continue
             if run_journal is not None:
                 run_journal.note_file(filepath, st)
         except OSError as e:
@@ -4822,7 +6109,20 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots, held):
         dir_layout = dir_layouts.get(dirpath)
         if dir_layout is None:
             try:
-                dir_layout = get_layout_walking_up(dirpath)
+                # bad_layout_dirs caches a refused read (the message) and a
+                # missing layout (None), once per directory per pass.
+                if dirpath in bad_layout_dirs:
+                    why = bad_layout_dirs[dirpath]
+                    if why is not None:
+                        raise InvalidLayout(why)
+                else:
+                    dir_layout = get_layout_walking_up(dirpath)
+            except InvalidLayout as e:
+                bad_layout_dirs[dirpath] = str(e)
+                logging.warning("Skipping %s: %s", filepath, e)
+                with stats._lock:
+                    stats.files_skipped_layout_invalid += 1
+                continue
             except OSError as e:
                 if e.errno not in _VANISHED_ERRNOS:
                     raise
@@ -4831,9 +6131,21 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots, held):
                 logging.info("Skipping %s: no longer exists", filepath)
                 continue
             if dir_layout is None:
-                logging.error(f"Could not determine layout for {dirpath}, skipping")
+                # Skipped, not failed: chains stop on failures, and the state
+                # is repairable (set the root's layout) with the files intact.
+                if dirpath not in bad_layout_dirs:
+                    bad_layout_dirs[dirpath] = None
+                    logging.error(
+                        f"Could not determine layout for {dirpath}: no "
+                        f"explicit layout at or above it; its files are "
+                        f"skipped, not failed. Set the volume root's layout "
+                        f"(setfattr -n ceph.dir.layout.pool -v <default pool> "
+                        f"<mount root>)")
                 with stats._lock:
-                    stats.files_failed += 1
+                    stats.files_skipped_layout_missing += 1
+                # Named per file, like every other skip class: a chain that
+                # rebuilds its next list from the log must not lose these.
+                logging.info("Skipping %s: no layout for its directory", filepath)
                 continue
             dir_layouts[dirpath] = dir_layout
         layout = target_layout(args, dir_layout)
@@ -4844,11 +6156,16 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots, held):
         # layout for every file would add an MDS round trip to the common case.
         # A path list is already filtered to plausible candidates, and its
         # staleest entries are precisely the ones an earlier pass has since
-        # moved -- testing size first would log those as "below --min-size" and
-        # conceal that they are already done, which is exactly how a previous
-        # analysis came to overstate the remaining work.
+        # moved -- testing size first would log those as "below --min-size",
+        # conceal that they are already done, and overstate the remaining
+        # work.
         try:
             file_layout = CephLayout.from_file(filepath)
+        except InvalidLayout as e:
+            logging.warning("Skipping %s: %s", filepath, e)
+            with stats._lock:
+                stats.files_skipped_layout_invalid += 1
+            continue
         except OSError as e:
             if e.errno not in _VANISHED_ERRNOS:
                 raise
@@ -4920,21 +6237,10 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots, held):
 
 
 def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts):
-    # The directory the walk is on, held so its files share a staging
-    # directory. Only under --target-pool.
-    held = [None]
-    try:
-        _process_dir(args, start_dir, hard_links, executor, mountpoints,
-                     dir_layouts, held)
-    finally:
-        _release_hold(held[0])
-
-
-def _process_dir(args, start_dir, hard_links, executor, mountpoints,
-                 dir_layouts, held):
     def _limit_reached():
         return args.max_files is not None and stats.files_submitted >= args.max_files
 
+    start_dev = os.stat(start_dir).st_dev
     for dirpath, dirnames, filenames in os.walk(start_dir, topdown=True):
         if do_exit.is_set() or _limit_reached():
             return
@@ -4951,6 +6257,32 @@ def _process_dir(args, start_dir, hard_links, executor, mountpoints,
             logging.warning(f"Skipping {dirpath}: path is a mountpoint")
             del dirnames[:]
             continue
+        try:
+            dev = os.stat(dirpath).st_dev
+        except OSError as e:
+            if e.errno in _VANISHED_ERRNOS:
+                logging.info(f"Skipping {dirpath}: no longer exists")
+            else:
+                logging.warning(f"Skipping {dirpath} and everything under "
+                                f"it: {e}")
+            del dirnames[:]
+            continue
+        if dev != start_dev:
+            # A mount that appeared here after the startup mountpoint
+            # snapshot. Its directories would inherit layouts walked up from
+            # OUR side of the boundary, aiming a foreign filesystem's files
+            # at this one's pool. An autofs root that expired and remounted
+            # mid-walk changes st_dev too, so the root is re-read before the
+            # subtree is pruned.
+            try:
+                start_dev = os.stat(start_dir).st_dev
+            except OSError:
+                pass
+            if dev != start_dev:
+                logging.warning(f"Skipping {dirpath}: on another filesystem "
+                                f"than {start_dir}")
+                del dirnames[:]
+                continue
         if dirpath == args.tmpdir:
             logging.info(f"Skipping {dirpath}: path is the temporary dir")
             del dirnames[:]
@@ -4990,6 +6322,14 @@ def _process_dir(args, start_dir, hard_links, executor, mountpoints,
 
             if layout is None:
                 layout = get_layout_walking_up(dirpath)
+        except InvalidLayout as e:
+            # The subtree waits for a later pass. Descending would skip the
+            # pruning below, which needs this directory's layout first.
+            logging.warning(f"Skipping {dirpath} and everything under it: {e}")
+            with stats._lock:
+                stats.subtrees_skipped_layout_invalid += 1
+            del dirnames[:]
+            continue
         except OSError as e:
             # Removed between os.walk listing it and this read: nothing under
             # it to transcode, and no reason to end the run.
@@ -5001,23 +6341,17 @@ def _process_dir(args, start_dir, hard_links, executor, mountpoints,
 
         if layout is None:
             logging.error(f"Could not determine layout for {dirpath}, skipping")
+            with stats._lock:
+                stats.subtrees_skipped_layout_missing += 1
             del dirnames[:]
             continue
 
         # Staging directories are ours, from this run or another, and are
         # never walked whatever --prune-dir-regex says: a file inside one is
-        # a copy in flight. An aged one is a killed run's leftover.
-        stages = [d for d in dirnames if STAGE_RE.match(d)]
-        if stages:
-            dirnames[:] = [d for d in dirnames if not STAGE_RE.match(d)]
-            for d in stages:
-                if staging is not None and d == staging.name:
-                    continue
-                if run_journal is not None:
-                    run_journal.note_dir(dirpath)
-                if (reclaim_staging_orphan(os.path.join(dirpath, d))
-                        and run_journal is not None):
-                    run_journal.note_write(os.path.join(dirpath, d))
+        # a copy in flight. A killed run's leftover is --reap-staging's, never
+        # removed by a walk, for the reason no run removes one mid-run (see the
+        # staging header).
+        dirnames[:] = [d for d in dirnames if not STAGE_RE.match(d)]
 
         dirnames.sort()
         filenames.sort()
@@ -5067,10 +6401,6 @@ def _process_dir(args, start_dir, hard_links, executor, mountpoints,
         # children inherit; from here on `layout` is where files go.
         dir_layout = layout
         layout = target_layout(args, dir_layout)
-        if staging is not None and dirpath != held[0]:
-            _release_hold(held[0])
-            staging.hold(dirpath)
-            held[0] = dirpath
 
         def submit(filepaths, st, file_layout, stage, _layout=layout):
             if do_exit.is_set() or _limit_reached():
@@ -5153,6 +6483,11 @@ def _process_dir(args, start_dir, hard_links, executor, mountpoints,
                 continue
             try:
                 file_layout = CephLayout.from_file(filepath)
+            except InvalidLayout as e:
+                logging.warning("Skipping %s: %s", filepath, e)
+                with stats._lock:
+                    stats.files_skipped_layout_invalid += 1
+                continue
             except OSError as e:
                 if e.errno not in _VANISHED_ERRNOS:
                     raise
@@ -5246,11 +6581,13 @@ def cleanup_tmpdir(tmpdir):
     for entry in os.scandir(tmpdir):
         if entry.is_file(follow_symlinks=False):
             try:
-                # Both staging shapes: the bare UUID hex used by --stage-in-tmpdir,
-                # and the ".<hex>.vcephfs-tc-tmp" a sibling-staged run leaves if
-                # --tmpdir happens to sit inside the tree being walked.
+                # Only this tool's one temp shape, ".<hex>.vcephfs-tc-tmp".
+                # The bare-hex names older --stage-in-tmpdir runs used are no
+                # longer taken: uuid.UUID() also accepted any 32-hex name,
+                # which is an md5-named user file in a shared --tmpdir. An old
+                # bare-hex orphan is left for removal by hand.
                 if not TMP_RE.match(entry.name):
-                    uuid.UUID(entry.name)
+                    continue
                 if (now - entry.stat(follow_symlinks=False).st_ctime
                         < TMP_ORPHAN_MIN_AGE_S):
                     continue
@@ -5260,6 +6597,37 @@ def cleanup_tmpdir(tmpdir):
                 pass
     if count:
         logging.info(f"Cleaned up {count} orphaned temp file(s) from {tmpdir}")
+
+
+def start_job_staging(args):
+    """The run's JobStaging, at the root of the removal session's mount.
+
+    main() refuses a staging run without a removal session; this guard is for
+    a caller that skipped it, so staging never removes through the kernel
+    mount."""
+    if removal_session is None:
+        raise SystemExit("--target-pool staging needs a separate removal "
+                         "session; none is open")
+    return JobStaging(uuid.uuid4().hex[:16], removal_session.mountpoint,
+                      session=removal_session)
+
+
+def _start_staging(args):
+    """Make the run's JobStaging and probe it: None, or why not.
+
+    On a refusal the probe's directory is left, with a WARNING naming it, for
+    --reap-staging: the kernel client has just made and written it, so an
+    rmdir through the session would wait on the same cap recall as a removal
+    at the end of a run."""
+    global staging
+    staging = start_job_staging(args)
+    why = staging.probe(args.target_pool)
+    if why:
+        for p in staging._paths:
+            logging.warning(f"Staging directory {p} left by the refused "
+                            f"start, for --reap-staging")
+        staging = None
+    return why
 
 
 def process_files(args):
@@ -5275,12 +6643,17 @@ def process_files(args):
     roots_seen = []
 
     global staging
-    staging = None
     if getattr(args, "target_pool", None) and not args.stage_in_tmpdir:
-        staging = StagingDirs(uuid.uuid4().hex[:16])
+        if staging is None:
+            # main() makes and probes it; this is for a caller that skipped it.
+            staging = start_job_staging(args)
+        staging.start_keepalive(REAP_STAGING_MIN_AGE_S / 4)
         logging.info("--target-pool %s: files whose directory points elsewhere "
-                     "are staged in %s/ beside them", args.target_pool,
-                     staging.name)
+                     "are staged in %s%s under %s, removed when the run ends",
+                     args.target_pool, STAGE_PREFIX, staging.run_id[:8] + "*",
+                     staging.root)
+    else:
+        staging = None
 
     mountpoints = set()
     with open("/proc/self/mounts", "r") as f:
@@ -5312,9 +6685,9 @@ def process_files(args):
                     start_dir = os.path.abspath(start_dir)
                     if args.stage_in_tmpdir and os.stat(start_dir).st_dev != tmpdir_dev:
                         logging.error(
-                            f"--stage-in-tmpdir was given and tmpdir {args.tmpdir} is on a "
-                            f"different filesystem than {start_dir}. os.rename() will fail "
-                            f"with EXDEV. Aborting."
+                            f"--stage-in-tmpdir: tmpdir {args.tmpdir} is on "
+                            f"another filesystem than {start_dir} (EXDEV); "
+                            f"aborting"
                         )
                         sys.exit(1)
                     roots.append(start_dir)
@@ -5335,19 +6708,30 @@ def process_files(args):
                 start_dir = os.path.abspath(start_dir)
                 if args.stage_in_tmpdir and os.stat(start_dir).st_dev != tmpdir_dev:
                     logging.error(
-                        f"--stage-in-tmpdir was given and tmpdir {args.tmpdir} is on a "
-                        f"different filesystem than {start_dir}. os.rename() will fail with "
-                        f"EXDEV. Aborting."
+                        f"--stage-in-tmpdir: tmpdir {args.tmpdir} is on "
+                        f"another filesystem than {start_dir} (EXDEV); aborting"
                     )
                     sys.exit(1)
 
                 if start_dir in mountpoints:
                     mountpoints.remove(start_dir)
 
-                layout = get_layout_walking_up(start_dir)
+                try:
+                    layout = get_layout_walking_up(start_dir)
+                except InvalidLayout as e:
+                    logging.error(f"Skipping {start_dir}: {e}")
+                    with stats._lock:
+                        stats.subtrees_skipped_layout_invalid += 1
+                    continue
 
                 if layout is None:
-                    logging.error(f"Could not determine layout for {start_dir}, skipping")
+                    with stats._lock:
+                        stats.subtrees_skipped_layout_missing += 1
+                    logging.error(
+                        f"Could not determine layout for {start_dir}, "
+                        f"skipping. If no directory up to the volume root "
+                        f"carries one, set the root's (setfattr -n "
+                        f"ceph.dir.layout.pool -v <default pool> <mount root>)")
                     continue
                 dir_layouts[start_dir] = layout
 
@@ -5357,22 +6741,19 @@ def process_files(args):
                 if do_exit.is_set():
                     break
     finally:
-        # Every exit path Python gets to run: a return (including the
-        # --paths-from branch's), an exception mid-walk, and SIGINT, SIGTERM
-        # or SIGHUP, which set do_exit and unwind the walk to here. The
-        # journal is the only record of the pre-transcode rctime, and a run
-        # that died partway is exactly the one whose damage cannot be
-        # reconstructed afterwards. SIGKILL, the OOM killer and power loss
-        # never get here; the checkpoint covers those, one interval behind.
-        #
-        # The executor has joined by now, so no copy is in flight and any
-        # staging directory still made is one a hold or a failure left behind.
-        if staging is not None:
-            for d in staging.remove_all():
-                if run_journal is not None:
-                    run_journal.note_write(os.path.join(d, staging.name))
-        if run_journal is not None:
-            run_journal.write(roots_seen, args)
+        # Every exit Python runs (a return, an exception, SIGINT, SIGTERM or
+        # SIGHUP) writes the journal here; the checkpoint covers SIGKILL. The
+        # executor has joined, so no copy is in flight: the run's staging
+        # directories are removed here, once.
+        try:
+            if staging is not None:
+                staging.remove_all()    # journals each removal itself
+        finally:
+            # Whatever remove_all() hit, the journal is still written.
+            if run_journal is not None:
+                run_journal.write(roots_seen, args)
+            if removal_session is not None:
+                removal_session.close()
 
     if hard_links and not do_exit.is_set():
         logging.warning(
@@ -5463,7 +6844,7 @@ def _install_exit_handlers():
     """Route SIGINT, SIGTERM and SIGHUP to the same clean exit.
 
     SIGTERM is what systemd, kill(1) and a shutdown send, and SIGHUP is a
-    closed terminal; both used to kill the job outright, skipping the run
+    closed terminal; by default both kill the job outright, skipping the run
     journal. An inherited SIG_IGN is kept for those two, so a job started
     under nohup still survives its terminal closing.
     """
@@ -5473,11 +6854,117 @@ def _install_exit_handlers():
             signal.signal(sig, _exit_signal_handler)
 
 
+def _check_tmpdir_and_target(args):
+    """The tmpdir and --target-pool checks a transcoding run makes at startup;
+    exits on a refusal. Not for --reap-staging, which copies nothing."""
+    try:
+        layout = get_layout_walking_up(args.tmpdir)
+    except InvalidLayout as e:
+        logging.error("Refusing to start: %s", e)
+        sys.exit(1)
+
+    if layout is None:
+        logging.error(
+            f"Could not determine layout for tmpdir {args.tmpdir}: no explicit "
+            f"ceph.dir.layout at or above it. Either this is not a CephFS "
+            f"mount, or no directory up to the volume root carries a layout "
+            f"-- set one on the root (setfattr -n ceph.dir.layout.pool -v "
+            f"<default pool> <mount root>) and run again.")
+        sys.exit(1)
+
+    logging.info(f"Temporary directory is {args.tmpdir} with pool {layout.pool}")
+    _probe_caps(args.tmpdir)
+
+    # Decided once, before the config file is read, so that a config min_size
+    # below an EC target's floor is refused as it is applied (_apply_config).
+    args.target_kind = args.target_floor = None
+    if args.target_pool:
+        args.target_kind, _how = target_pool_kind(
+            args.target_pool, args.target_pool_kind,
+            {n for n in (_mds_namespace_for(d) for d in args.dirs) if n})
+        if args.target_kind is None:
+            logging.error("Refusing to start: %s", _how)
+            sys.exit(1)
+        if args.target_kind == "ec":
+            args.target_floor = target_pool_floor(
+                args.source_pool or layout.pool, args.target_pool)
+        logging.info(
+            "--target-pool %s: %s (decided by %s)%s", args.target_pool,
+            "replicated" if args.target_kind == "rep" else "EC", _how,
+            f", floor {args.target_floor} bytes" if args.target_floor else "")
+
+    # The tmpdir must not be in a pool we are transcoding INTO: those files
+    # would be rewritten for nothing, and a failed apply_file() would go
+    # unnoticed, as the temp inherits the target pool. Refused, not prompted,
+    # so a detached start cannot hang on it.
+    try:
+        conflicts = tmpdir_conflicts(args, layout.pool)
+    except InvalidLayout as e:
+        logging.error("Refusing to start (--stage-in-tmpdir): %s", e)
+        sys.exit(1)
+
+    if conflicts:
+        for d, pool in conflicts:
+            logging.error(
+                f"tmpdir {args.tmpdir} is in pool {pool}, which is also the "
+                f"target pool for {d}."
+            )
+        logging.error(
+            "The tmpdir must be the filesystem's DEFAULT data pool, never a "
+            "target pool. Fix with: setfattr -n ceph.dir.layout.pool "
+            f"-v <default_data_pool> {args.tmpdir}"
+        )
+        if not args.force_tmpdir_pool:
+            logging.error("Aborting. Pass --force-tmpdir-pool if this is deliberate.")
+            sys.exit(1)
+        logging.warning(
+            "--force-tmpdir-pool given; continuing despite the pool conflict. "
+            "Layout-application failures will NOT be detectable in this run."
+        )
+
+    # Advisory: below the crossover a transcode consumes MORE raw space than it
+    # frees, and nothing else here would notice. Source defaults to the tmpdir's
+    # pool (the FS default pool, where most untranscoded data lives); --source-pool
+    # overrides it so a pool-to-pool drain is judged against the right baseline.
+    # Best-effort -- needs the ceph CLI, and stays silent without it.
+    for _d in args.dirs:
+        try:
+            _t = target_layout(args, get_layout_walking_up(_d))
+        except InvalidLayout as e:
+            logging.warning("No crossover check for %s: %s", _d, e)
+            continue
+        if _t is None:
+            continue
+        # A replicated --target-pool wins only BELOW a size, and its band is
+        # enforced by target_pool_refusal(); this advisory is for EC targets.
+        if args.target_pool and args.target_kind == "rep":
+            continue
+        _msg = crossover_warning(args.source_pool or layout.pool, _t.pool, args.min_size)
+        if _msg:
+            logging.warning(_msg)
+
+
 def main():
+    if sys.argv[1:2] == ["--removal-worker"]:
+        sys.exit(_removal_worker(int(sys.argv[2]) if len(sys.argv) > 2
+                                 else os.getppid()))
     global thread_count
     parser = argparse.ArgumentParser(
         description="Transcode cephfs files to their directory layout",
         epilog=(
+            "files held open for writing:\n"
+            "  Before the copy and again right before the swap, the tool reads\n"
+            "  its own client's caps on the file (ceph.caps). No Fc means\n"
+            "  another client has it open for write; Fw means a process on\n"
+            "  this host does. Either way the file is skipped, counted as\n"
+            "  \"open for write elsewhere\", and a later pass retries it. The\n"
+            "  kernel client drops its wanted caps on an open file left idle\n"
+            "  for about a minute, so a writer that keeps a file open, sits\n"
+            "  idle past --min-age and then writes again is invisible to this\n"
+            "  check; its writes go to the replaced, unlinked inode. --min-age\n"
+            "  stays the main guard: use 2 or more, and keep the tool off\n"
+            "  trees whose writers hold files open for days (long-lived logs,\n"
+            "  databases).\n\n"
             "runtime signals:\n"
             "  SIGUSR1  (10)  increase thread count by 1 (resumes from pause)\n"
             "  SIGUSR2  (12)  decrease thread count by 1 (0 = pause)\n"
@@ -5515,49 +7002,56 @@ def main():
     parser.add_argument("dirs", help="Directories to scan", nargs="*")
     parser.add_argument(
         "--paths-from-pool", metavar="POOL",
-        help="Transcode exactly the files that are currently in POOL, discovered "
-             "by reading the pool itself instead of walking the tree. Costs no MDS "
-             "walk and is proportional to what is left in the pool rather than to "
-             "the size of the filesystem. POOL must no longer be the default write "
-             "target of the directories given, or the set keeps growing and the "
-             "drain cannot converge; that is checked and refused. Needs the RADOS "
-             "Python bindings. Mutually exclusive with --paths-from. NOTE: a file "
-             "renamed after the listing keeps its old backtrace until the MDS "
-             "trims the log segment holding the rename, so it is read at a stale "
-             "path and counted vanished while still occupying the pool. One pass "
-             "is therefore not final: re-run to converge, and "
-             "'ceph tell mds.<daemon> flush journal' forces the backtrace writes "
-             "instead of waiting for them.")
+        help="Transcode exactly the files in POOL, read from the pool instead "
+             "of walking the tree. POOL must not be the default write target "
+             "of the directories given (refused). Needs the RADOS Python "
+             "bindings; not with --paths-from. A file under a renamed directory "
+             "is found again by inode (as root; each parent checked once, held "
+             "by a pause and paced by --file-delay and --lookupino-rate, only "
+             "under the directories given); a replaced or gone one is skipped "
+             "and a live one it cannot locate is reported. Gone is not deletion "
+             "evidence: a file moved out just before its directory was deleted "
+             "is skipped until a re-run sees its new backtrace. A recently "
+             "renamed file itself is read at its old path and counted vanished, "
+             "so re-run to converge ('ceph tell mds.<daemon> flush journal' "
+             "speeds that up).")
+    parser.add_argument(
+        "--lookupino-rate", metavar="N", type=_nonnegative_float,
+        default=LOOKUPINO_RATE,
+        help="MDS inode lookups per second for --paths-from-pool (default "
+             "%(default)g; 0 turns them off).")
     parser.add_argument(
         "--rados-conffile", metavar="PATH",
         help="ceph.conf for --paths-from-pool. Default: $CEPH_CONF, then "
              "/etc/ceph/ceph.conf, then a single /etc/ceph/*.conf, then monitor "
              "addresses recovered from the mount. Containerized hosts often have "
-             "no ceph.conf at all, hence the fallbacks.")
+             "no ceph.conf at all, hence the fallbacks. With --rados-name and "
+             "--rados-keyring, this and --rados-mon-host also locate the cluster "
+             "for --target-pool's staging-removal session.")
     parser.add_argument(
         "--rados-mon-host", metavar="ADDRS",
         help="Comma-separated monitor addresses for --paths-from-pool, used "
              "instead of a conffile.")
     parser.add_argument(
         "--rados-keyring", metavar="PATH",
-        help="Keyring for --paths-from-pool. Default: whatever the conffile says.")
+        help="Keyring for --paths-from-pool. Default: whatever the conffile says. "
+             "Given with --rados-name, also the keyring of --target-pool's "
+             "staging-removal session.")
     parser.add_argument(
         "--rados-name", metavar="NAME", default=None,
         help="RADOS client name for --paths-from-pool (default client.admin). "
-             "Needs read access to the pool and to its objects' xattrs.")
+             "Needs read access to the pool and to its objects' xattrs. Given "
+             "with --rados-keyring, also the user of --target-pool's "
+             "staging-removal session, which otherwise is the mount's name=.")
     parser.add_argument(
         "--paths-from", metavar="FILE",
-        help="Transcode exactly the files listed in FILE ('-' for stdin) instead "
-             "of walking the directories. NUL- or newline-delimited, detected "
-             "from the content. The directories still have to be given: they "
-             "bound what the list is allowed to touch, and a listed path outside "
-             "them is refused. Every path is re-stat'ed and re-checked, so a list "
-             "that has gone stale is safe -- vanished files are counted and "
-             "logged, not treated as errors. Multiply-linked files are declined "
-             "in this mode because a list cannot promise it holds every link. "
-             "Intended for a second pass whose candidates are already known from "
-             "an earlier run's log, where walking the whole tree again to "
-             "rediscover them is the expensive part.")
+        help="Transcode exactly the files listed in FILE ('-' for stdin; NUL- "
+             "or newline-delimited; a NUL list is read byte-exact) instead of "
+             "walking. A path outside the "
+             "given directories is refused, as is one reached through a "
+             "symlinked directory under them or on another filesystem (the "
+             "walk never follows a symlink either). Every path is re-checked, "
+             "so a stale list is safe; multiply-linked files are declined.")
     parser.add_argument(
         "--tmpdir",
         default="/data/tmp",
@@ -5572,9 +7066,10 @@ def main():
     parser.add_argument("--debug", "-d", action="store_true")
     parser.add_argument(
         "--min-age",
-        default=1,
+        default=MIN_AGE_DAYS,
         type=int,
-        help="Minimum age of file before transcoding, in days (adjustable at runtime via SIGRTMIN+2/SIGRTMIN+3)",
+        help="Minimum age of file before transcoding, in days (adjustable at runtime via SIGRTMIN+2/SIGRTMIN+3). "
+        "The main guard against files held open for writing; see below",
     )
     parser.add_argument(
         "--min-size",
@@ -5592,7 +7087,7 @@ def main():
     )
     parser.add_argument(
         "--threads",
-        default=4,
+        default=THREADS_DEFAULT,
         type=int,
         help="Number of threads for data copying",
     )
@@ -5601,16 +7096,16 @@ def main():
         "-n",
         action="store_true",
         help="Perform transcode but do not replace files. Without "
-             "--stage-in-tmpdir each copy is still staged beside its target, "
-             "which moves the directory's rctime, so the run journal records "
-             "that pin.",
+             "--stage-in-tmpdir each copy is still staged, beside its target "
+             "or, with --target-pool, in a staging directory, which moves "
+             "that directory's rctime, so the run journal records that pin.",
     )
     parser.add_argument(
         "--config",
         default=None,
         metavar="PATH",
-        help="key=value file of live tunables (file_delay_ms, threads, min_age_days, "
-             "min_size, prune_dir_regex), re-read when its mtime changes. Keep it on "
+        help="key=value file of live tunables, re-read when its mtime changes; "
+             "the example at the end of this help lists every key. Keep it on "
              "local disk, NOT in the CephFS volume: a stat there is an MDS round trip.",
     )
     parser.add_argument(
@@ -5631,8 +7126,8 @@ def main():
         "--stage-in-tmpdir",
         action="store_true",
         default=False,
-        help="Stage temp copies in --tmpdir instead of beside their target. This "
-             "is the pre-2026-09 behavior and it is slow: staging elsewhere makes "
+        help="Stage temp copies in --tmpdir instead of beside their target. "
+             "It is slow: staging elsewhere makes "
              "every replace a cross-rank distributed rename (mean 1266 ms, tail to "
              "14.9 s) instead of an intra-directory one (mean 0.26 ms). Escape "
              "hatch only.",
@@ -5678,10 +7173,9 @@ def main():
         action="store_true",
         default=True,
         help="Disable use of copy_file_range and always use userspace copy. "
-             "DEFAULT since 2026-09-05: a 15-thread A/B measured "
-             "copy_file_range no faster overall (154.0 vs 170.1 MiB/s) and "
-             "1.3-2.1x SLOWER for files under 1 MiB, which is the size range "
-             "these jobs now work in.",
+             "The DEFAULT: in a 15-thread A/B copy_file_range is no faster "
+             "overall (154.0 vs 170.1 MiB/s) and 1.3-2.1x SLOWER for files "
+             "under 1 MiB, which is the size range these jobs work in.",
     )
     parser.add_argument(
         "--copy-file-range",
@@ -5694,21 +7188,11 @@ def main():
         "--regulate-prometheus-url",
         default=None,
         metavar="URL",
-        help="Prometheus /api/v1/query endpoint for self-regulation. Unset "
-             "(the default) disables regulation entirely and the job simply "
-             "runs at --file-delay and --threads -- and says so at WARNING, "
-             "since an accidental omission looks exactly like a deliberate "
-             "one. Pass --no-regulate to declare it deliberate and quiet. "
-             "Credentials in the URL are NOT supported: urllib does not use "
-             "URL userinfo for authentication, so a user:password@ URL is "
-             "refused rather than failing on every sample -- use an "
-             "HTTPBasicAuthHandler if the endpoint needs basic auth. A "
-             "credential passed here is ALSO exposed in `ps`, which log "
-             "scrubbing cannot undo: the title is only rewritten from the "
-             "first retitle onward, so the original argv is visible until "
-             "then -- and if python3-setproctitle is not installed the title "
-             "is never rewritten at all and the credential stays visible for "
-             "the whole run. Do not put a credential on the command line.",
+        help="Prometheus /api/v1/query endpoint for self-regulation. Unset, "
+             "the job runs at --file-delay and --threads and says so at "
+             "WARNING (--no-regulate makes that deliberate and quiet). A "
+             "user:password@ URL is refused: urllib ignores URL userinfo. "
+             "Never put a credential on the command line; ps shows it.",
     )
     parser.add_argument(
         "--regulate-query",
@@ -5764,6 +7248,22 @@ def main():
              % REG_BLIND_RESUME_S_DEFAULT,
     )
     parser.add_argument(
+        "--regulate-blind-throttle-s", type=non_negative_int,
+        default=REG_BLIND_THROTTLE_S_DEFAULT, metavar="SEC",
+        help="If the job is running (not paused) and no usable sample arrives "
+             "for this long, throttle it to 1 thread and at least "
+             "--regulate-blind-delay-ms per file until one does, rather than "
+             "keep whatever settings it had earned with nothing watching the "
+             "MDS (default %d; 0 = hold the last settings indefinitely)."
+             % REG_BLIND_THROTTLE_S_DEFAULT,
+    )
+    parser.add_argument(
+        "--regulate-blind-delay-ms", type=non_negative_int,
+        default=REG_BLIND_DELAY_MS_DEFAULT, metavar="MS",
+        help="File delay a blind throttle raises the job to (default %d)."
+             % REG_BLIND_DELAY_MS_DEFAULT,
+    )
+    parser.add_argument(
         "--source-pool",
         default=None,
         metavar="POOL",
@@ -5775,19 +7275,40 @@ def main():
         "--target-pool",
         default=None,
         metavar="POOL",
-        help="Send eligible files to POOL instead of to their directory's "
-             "layout pool. Directory layouts are never changed: a file whose "
-             "directory points elsewhere is copied in a hidden staging "
-             "subdirectory created with POOL's layout and renamed up into "
-             "place, so new files keep landing where they always did. Needs a "
-             "size band: a replicated POOL takes only --max-size below %d, an "
-             "EC POOL only --min-size at or above its floor (at least %d). "
-             "Lets a small-file pass run while the volume root stays on EC. "
-             "With --paths-from or --paths-from-pool the list is read in full "
-             "and grouped by directory before anything moves, spilling about "
-             "100 bytes per path beside --log-file -- or, without one, in the "
-             "system temp directory, which is often RAM-backed."
+        help="Send eligible files to POOL instead of their directory's layout "
+             "pool, without changing any directory layout: the copy is made in "
+             "a hidden staging directory with POOL's layout (under the mount "
+             "root, the file's pin boundary or its quota realm) and renamed "
+             "into place; staging directories are removed when the run ends. "
+             "Needs a size band: a replicated POOL --max-size below %d, an EC "
+             "POOL --min-size at or above its floor (at least %d). With "
+             "--paths-from or --paths-from-pool the list is grouped by "
+             "directory first, spilling ~100 bytes per path beside --log-file "
+             "(else in the system temp directory)."
              % (YIELD_FLOOR_BYTES, YIELD_FLOOR_BYTES),
+    )
+    parser.add_argument(
+        "--reap-staging",
+        action="store_true",
+        help="Instead of transcoding, remove leftover staging directories "
+             "(%s<id>) through a separate CephFS session: each untouched for "
+             "--reap-staging-min-age, with its aged temps; anything else is "
+             "reported and left. --paths-from FILE lists directories to check "
+             "without a walk. Paced like a walk (--file-delay, --config "
+             "threads, the regulator); the first SIGINT, SIGTERM or SIGHUP "
+             "stops it."
+             % STAGE_PREFIX,
+    )
+    parser.add_argument(
+        "--reap-staging-min-age",
+        type=non_negative_int,
+        default=REAP_STAGING_MIN_AGE_S,
+        metavar="SEC",
+        help="With --reap-staging, take a staging directory only once its "
+             "ctime, and each temp's mtime and ctime, are this old (default "
+             "%d). Running jobs refresh theirs every quarter of the default, "
+             "so a lower value can take a live job's directory."
+             % REAP_STAGING_MIN_AGE_S,
     )
     parser.add_argument(
         "--target-pool-kind",
@@ -5803,12 +7324,9 @@ def main():
         "--prune-small-subtrees",
         action="store_true",
         default=False,
-        help="Skip whole subtrees whose recursive size makes them not worth "
-             "walking, using the MDS's own ceph.dir.rbytes/rfiles (one getfattr "
-             "per directory, no walk). OFF by default: it changes what the pass "
-             "covers, which should always be deliberate. INERT without --min-size, "
-             "since the mean-size test compares against min-size/8; a warning is "
-             "logged at startup if you pass this with --min-size 0.",
+        help="Skip subtrees whose ceph.dir.rbytes/rfiles make them not worth "
+             "walking (one getfattr per directory). Off by default, since it "
+             "changes what a pass covers. Inert with --min-size 0 (warned).",
     )
     parser.add_argument(
         "--prune-subtree-max-bytes",
@@ -5847,12 +7365,10 @@ def main():
         "--prune-dir-regex",
         default=None,
         metavar="REGEX",
-        help="Regular expression (unanchored, via re.search) matched against "
-        "directory NAMES; any name containing a match is pruned from the walk "
-        "entirely (not descended into or statted). Anchor with ^ / $ for exact "
-        "names, e.g. '\\.runfiles$' to skip Bazel runfiles symlink farms. "
-        "Overrides the built-in default set (see DEFAULT_PRUNE_DIRS); pass an "
-        "empty string to disable pruning entirely.",
+        help="Regex (re.search) matched against directory NAMES; a match is "
+             "pruned, not descended into. Anchor with ^ / $, e.g. "
+             "'\\.runfiles$'. Replaces the default set (DEFAULT_PRUNE_DIRS); "
+             "'' disables pruning.",
     )
 
     parser.add_argument(
@@ -5861,16 +7377,12 @@ def main():
         action="store_false",
         default=True,
         help="Do not write .vcephfs-transcode-runs.jsonl at each volume root. "
-        "The journal records, per artifact, the ceph.dir.rctime and newest file "
-        "mtime seen BEFORE this run modified anything, because transcoding pins "
-        "rctime at the time we ran and a directory that is never written again "
-        "stays pinned forever -- so retention reads transcoded data as fresh and "
-        "stops expiring it. rctime cannot be restored (it is monotonic and not "
-        "settable), so preserving the answer is the only option. Costs one "
-        "getxattr per artifact root. A run that does not exit cleanly leaves "
-        "its last checkpoint, at most %d minutes old, in "
-        ".vcephfs-transcode-runs.jsonl.<run>.partial. Disable only if nothing "
-        "consumes rctime." % (RUN_JOURNAL_CHECKPOINT_S // 60),
+             "It keeps each artifact's ceph.dir.rctime and newest file mtime "
+             "from before the run, since a transcode pins rctime and retention "
+             "would read the data as new. One getxattr per artifact root; an "
+             "unclean exit leaves a checkpoint at most %d minutes old in "
+             ".vcephfs-transcode-runs.jsonl.<run>.partial."
+             % (RUN_JOURNAL_CHECKPOINT_S // 60),
     )
 
     args = parser.parse_args()
@@ -5883,6 +7395,9 @@ def main():
 
     if not args.dirs:
         parser.error("the following arguments are required: dirs")
+    for _d in args.dirs:
+        if not os.path.isdir(_d):
+            parser.error(f"not a directory: {_d}")
 
     try:
         validate_size_bounds(args.min_size, args.max_size)
@@ -5978,36 +7493,8 @@ def main():
     else:
         logging.info("copy_file_range not available, using userspace copy")
 
-    layout = get_layout_walking_up(args.tmpdir)
-
     if args.max_files is not None:
         logging.info(f"Will stop after transcoding {args.max_files} file(s)")
-
-    if layout is None:
-        logging.error(
-            f"Could not determine layout for tmpdir {args.tmpdir}. Is this a CephFS mount?"
-        )
-        sys.exit(1)
-
-    logging.info(f"Temporary directory is {args.tmpdir} with pool {layout.pool}")
-
-    # Decided once, before the config file is read, so that a config min_size
-    # below an EC target's floor is refused as it is applied (_apply_config).
-    args.target_kind = args.target_floor = None
-    if args.target_pool:
-        args.target_kind, _how = target_pool_kind(
-            args.target_pool, args.target_pool_kind,
-            {n for n in (_mds_namespace_for(d) for d in args.dirs) if n})
-        if args.target_kind is None:
-            logging.error("Refusing to start: %s", _how)
-            sys.exit(1)
-        if args.target_kind == "ec":
-            args.target_floor = target_pool_floor(
-                args.source_pool or layout.pool, args.target_pool)
-        logging.info(
-            "--target-pool %s: %s (decided by %s)%s", args.target_pool,
-            "replicated" if args.target_kind == "rep" else "EC", _how,
-            f", floor {args.target_floor} bytes" if args.target_floor else "")
 
     # State the effective prune set before any walking happens. When it is the
     # built-in default the operator has not chosen it, so name every directory
@@ -6024,57 +7511,8 @@ def main():
     else:
         logging.warning("Pruning directory names matching: %s", args.prune_dir_regex)
 
-    # The tmpdir must not sit in a pool we are transcoding *into*.
-    #
-    # Two distinct failures if it does. First, every file whose target is that
-    # pool becomes a no-op that still pays a full data rewrite -- the exact
-    # churn that burned 41 TiB of already-EC data on one volume. Second, and worse,
-    # a silently failed apply_file() stops being detectable: the temp file
-    # inherits the target pool from the tmpdir, so a broken layout call still
-    # produces a correct-looking result and the bug ships.
-    #
-    # This was previously an interactive "Proceed? [y/N]" prompt. A prompt
-    # cannot be answered by a detached or scripted start -- input() raises
-    # EOFError and the job aborts -- so the check is done programmatically
-    # instead. That works headless AND is stronger, because it cannot be
-    # waved through by a human who is not reading carefully.
-    conflicts = tmpdir_conflicts(args, layout.pool)
-
-    if conflicts:
-        for d, pool in conflicts:
-            logging.error(
-                f"tmpdir {args.tmpdir} is in pool {pool}, which is also the "
-                f"target pool for {d}."
-            )
-        logging.error(
-            "The tmpdir must be the filesystem's DEFAULT data pool, never a "
-            "target pool. Fix with: setfattr -n ceph.dir.layout.pool "
-            f"-v <default_data_pool> {args.tmpdir}"
-        )
-        if not args.force_tmpdir_pool:
-            logging.error("Aborting. Pass --force-tmpdir-pool if this is deliberate.")
-            sys.exit(1)
-        logging.warning(
-            "--force-tmpdir-pool given; continuing despite the pool conflict. "
-            "Layout-application failures will NOT be detectable in this run."
-        )
-
-    # Advisory: below the crossover a transcode consumes MORE raw space than it
-    # frees, and nothing else here would notice. Source defaults to the tmpdir's
-    # pool (the FS default pool, where most untranscoded data lives); --source-pool
-    # overrides it so a pool-to-pool drain is judged against the right baseline.
-    # Best-effort -- needs the ceph CLI, and stays silent without it.
-    for _d in args.dirs:
-        _t = target_layout(args, get_layout_walking_up(_d))
-        if _t is None:
-            continue
-        # A replicated --target-pool wins only BELOW a size, and its band is
-        # enforced by target_pool_refusal(); this advisory is for EC targets.
-        if args.target_pool and args.target_kind == "rep":
-            continue
-        _msg = crossover_warning(args.source_pool or layout.pool, _t.pool, args.min_size)
-        if _msg:
-            logging.warning(_msg)
+    if not args.reap_staging:
+        _check_tmpdir_and_target(args)
 
     global file_delay_ms, min_age_days
     if args.file_delay < 0:
@@ -6205,6 +7643,7 @@ def main():
         logging.info("Runtime config: %s (polled every %.0fs)",
                      args.config, args.config_poll_seconds)
         runtime_config.poll(apply_config)     # apply once at startup
+        _start_config_poller(args.config_poll_seconds)
 
     _install_exit_handlers()
     signal.signal(signal.SIGTSTP, sigtstp_handler)
@@ -6237,13 +7676,29 @@ def main():
     # Prime the ps command line with the launch-time tunables.
     _update_proctitle()
 
+    start_removal_session(args)
+
+    if args.reap_staging:
+        # Regulated like a run: the config read above, its poller, the signal
+        # handlers and the regulator all apply to the reap's pacing.
+        global regulator, regulator_started, run_journal
+        regulator = start_regulator(args)
+        regulator_started = True
+        run_journal = RunJournal(
+            enabled=args.run_journal,
+            stop_at=[os.path.abspath(d) for d in args.dirs])
+        try:
+            sys.exit(reap_staging(args))
+        finally:
+            if removal_session is not None:
+                removal_session.close()
+
     # After the config's first read, since min_size may come from it.
     if args.target_pool:
         why = target_pool_refusal(args.target_kind, args.target_floor,
                                   args.min_size, args.max_size, args.target_pool)
-        if why is None:
-            os.makedirs(args.tmpdir, exist_ok=True)
-            why = probe_target_pool(args.target_pool, args.tmpdir)
+        if why is None and not args.stage_in_tmpdir:
+            why = _start_staging(args)
         if why:
             logging.error("Refusing to start: %s", why)
             sys.exit(1)
@@ -6271,6 +7726,11 @@ def main():
         f"{stats.files_skipped_changed} changed during processing, "
         f"{stats.files_skipped_hardlink} hardlinks skipped, "
         f"{stats.files_skipped_open} open/locked, "
+        f"{stats.files_skipped_open_elsewhere} open for write elsewhere, "
+        f"{stats.files_skipped_layout_invalid} invalid layout"
+        f" (+{stats.subtrees_skipped_layout_invalid} subtrees), "
+        f"{stats.files_skipped_layout_missing} no layout"
+        f" (+{stats.subtrees_skipped_layout_missing} subtrees), "
         f"{stats.files_skipped_small} below min-size, "
         f"{stats.files_skipped_symlink} symlinks/non-regular, "
         f"{stats.files_skipped_large} above max-size, "
