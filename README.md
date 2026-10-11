@@ -158,7 +158,9 @@ A file whose directory layout reads back invalid (all zeros, `pool=-1`) is
 skipped and counted as `invalid layout`; in a walk, the directory's whole subtree
 is skipped and counted in the `(+N subtrees)` beside it. If the same paths are
 skipped pass after pass, look at the directory by hand
-(`getfattr -n ceph.dir.layout DIR`).
+(`getfattr -n ceph.dir.layout DIR`). A path whose layout cannot be resolved at
+all is counted as `no layout` instead; the fix is the root `setfattr` from
+step 1, not `getfattr` archaeology.
 
 **5. Add EC layouts on exception subtrees.** Where a subtree's new files are
 mostly large, point it at the EC pool so they land there directly:

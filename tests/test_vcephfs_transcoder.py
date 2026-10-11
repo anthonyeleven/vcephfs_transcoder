@@ -3900,6 +3900,64 @@ class ProcessFilesStartup(unittest.TestCase):
         self.assertEqual(vct.stats.files_failed, 0)
 
 
+    def test_a_walk_root_with_no_layout_is_counted_as_missing(self):
+        root = os.path.join(self.tmp, "root")
+        os.mkdir(root)
+        saved = (vct.get_layout_walking_up, vct.stats)
+
+        def restore():
+            vct.get_layout_walking_up, vct.stats = saved
+        self.addCleanup(restore)
+        vct.stats = vct.Stats()
+        vct.get_layout_walking_up = lambda p: None
+        with self.assertLogs(level="ERROR") as logs:
+            vct.process_files(Args(
+                tmpdir=os.path.join(self.tmp, "t"), dirs=[root], run_journal=False,
+                paths_from=None, paths_from_pool=None, stage_in_tmpdir=False))
+        self.assertIn("setfattr", "\n".join(logs.output))
+        self.assertEqual(vct.stats.subtrees_skipped_layout_missing, 1)
+        self.assertEqual(vct.stats.files_failed, 0)
+
+
+class ListModeMissingLayout(unittest.TestCase):
+    """A list whose directories' layouts cannot be resolved (a volume root
+    with no explicit layout) must skip, not fail: chains stop on failures,
+    and the state is repairable with the files intact."""
+
+    def test_files_are_skipped_once_per_dir_not_failed(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        paths = []
+        for n in ("f1", "f2"):
+            p = os.path.join(d, n)
+            with open(p, "wb") as fh:
+                fh.write(b"x")
+            paths.append(p)
+        lst = os.path.join(d, "list.txt")
+        with open(lst, "w") as fh:
+            fh.write("".join(p + "\n" for p in paths))
+        saved = (vct.get_layout_walking_up, vct.stats, vct.thread_count,
+                 vct.run_journal, vct.staging)
+        def restore():
+            (vct.get_layout_walking_up, vct.stats, vct.thread_count,
+             vct.run_journal, vct.staging) = saved
+        self.addCleanup(restore)
+        vct.stats = vct.Stats()
+        vct.thread_count = vct.DynamicSemaphore(1)
+        vct.run_journal = vct.staging = None
+        vct.get_layout_walking_up = lambda p: None
+        args = Args(paths_from=lst, paths_from_pool=None, dirs=[d],
+                    max_files=None, source_pool=None, target_pool=None,
+                    min_size=0, max_size=None, stage_in_tmpdir=False,
+                    log_file=None)
+        with self.assertLogs(level="ERROR") as logs:
+            vct._process_paths(args, {}, None, {}, [os.path.abspath(d)])
+        hits = [l for l in logs.output if "Could not determine layout" in l]
+        self.assertEqual(len(hits), 1, "not said once per directory")
+        self.assertIn("setfattr", hits[0])
+        self.assertEqual(vct.stats.files_skipped_layout_missing, 2)
+        self.assertEqual(vct.stats.files_failed, 0)
+
 
 # --- --target-pool ------------------------------------------------------------
 

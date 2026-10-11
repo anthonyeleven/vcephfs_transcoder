@@ -877,6 +877,8 @@ class Stats:
     files_skipped_source_pool: int = 0
     files_skipped_layout_invalid: int = 0
     subtrees_skipped_layout_invalid: int = 0
+    files_skipped_layout_missing: int = 0
+    subtrees_skipped_layout_missing: int = 0
     files_vanished: int = 0
     files_outside_root: int = 0
     dirs_pruned: int = 0
@@ -6107,9 +6109,14 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots):
         dir_layout = dir_layouts.get(dirpath)
         if dir_layout is None:
             try:
+                # bad_layout_dirs caches a refused read (the message) and a
+                # missing layout (None), once per directory per pass.
                 if dirpath in bad_layout_dirs:
-                    raise InvalidLayout(bad_layout_dirs[dirpath])
-                dir_layout = get_layout_walking_up(dirpath)
+                    why = bad_layout_dirs[dirpath]
+                    if why is not None:
+                        raise InvalidLayout(why)
+                else:
+                    dir_layout = get_layout_walking_up(dirpath)
             except InvalidLayout as e:
                 bad_layout_dirs[dirpath] = str(e)
                 logging.warning("Skipping %s: %s", filepath, e)
@@ -6124,9 +6131,18 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots):
                 logging.info("Skipping %s: no longer exists", filepath)
                 continue
             if dir_layout is None:
-                logging.error(f"Could not determine layout for {dirpath}, skipping")
+                # Skipped, not failed: chains stop on failures, and the state
+                # is repairable (set the root's layout) with the files intact.
+                if dirpath not in bad_layout_dirs:
+                    bad_layout_dirs[dirpath] = None
+                    logging.error(
+                        f"Could not determine layout for {dirpath}: no "
+                        f"explicit layout at or above it; its files are "
+                        f"skipped, not failed. Set the volume root's layout "
+                        f"(setfattr -n ceph.dir.layout.pool -v <default pool> "
+                        f"<mount root>)")
                 with stats._lock:
-                    stats.files_failed += 1
+                    stats.files_skipped_layout_missing += 1
                 continue
             dir_layouts[dirpath] = dir_layout
         layout = target_layout(args, dir_layout)
@@ -6323,7 +6339,7 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
         if layout is None:
             logging.error(f"Could not determine layout for {dirpath}, skipping")
             with stats._lock:
-                stats.subtrees_skipped_layout_invalid += 1
+                stats.subtrees_skipped_layout_missing += 1
             del dirnames[:]
             continue
 
@@ -6707,7 +6723,7 @@ def process_files(args):
 
                 if layout is None:
                     with stats._lock:
-                        stats.subtrees_skipped_layout_invalid += 1
+                        stats.subtrees_skipped_layout_missing += 1
                     logging.error(
                         f"Could not determine layout for {start_dir}, "
                         f"skipping. If no directory up to the volume root "
@@ -7710,6 +7726,8 @@ def main():
         f"{stats.files_skipped_open_elsewhere} open for write elsewhere, "
         f"{stats.files_skipped_layout_invalid} invalid layout"
         f" (+{stats.subtrees_skipped_layout_invalid} subtrees), "
+        f"{stats.files_skipped_layout_missing} no layout"
+        f" (+{stats.subtrees_skipped_layout_missing} subtrees), "
         f"{stats.files_skipped_small} below min-size, "
         f"{stats.files_skipped_symlink} symlinks/non-regular, "
         f"{stats.files_skipped_large} above max-size, "
