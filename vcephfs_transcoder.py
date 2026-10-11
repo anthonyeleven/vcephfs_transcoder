@@ -871,6 +871,7 @@ class Stats:
     files_skipped_layout_match: int = 0
     files_skipped_hardlink: int = 0
     files_skipped_open: int = 0
+    files_skipped_open_elsewhere: int = 0
     files_skipped_small: int = 0
     files_skipped_symlink: int = 0
     files_skipped_large: int = 0
@@ -4416,6 +4417,46 @@ def _undo_partial_relink(args, filepaths, st, new_id, link_tmps, err):
     return moved, False
 
 
+# False once _probe_caps() finds that the kernel cannot report ceph.caps.
+caps_check = True
+
+
+def _probe_caps(path):
+    global caps_check
+    try:
+        os.getxattr(path, "ceph.caps")
+    except (OSError, AttributeError) as e:     # no os.getxattr: macOS
+        caps_check = False
+        logging.warning(f"No open-for-write check: cannot read ceph.caps on {path}: {e}")
+
+
+def _skip_if_open_for_write(path):
+    """True, logged and counted, if path is open for write anywhere.
+
+    Holding it open read-only, our client lacks Fc while another client has it
+    open for write, and holds Fw while a process on this host does. A swap
+    then leaves that writer on the old, unlinked inode, and what it writes
+    next is lost. A writer idle for about a minute drops its wanted caps and
+    is invisible here, so this does not replace --min-age."""
+    if not caps_check:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            caps = os.getxattr(fd, "ceph.caps").decode().split("/")[0]
+        finally:
+            os.close(fd)
+    except (OSError, AttributeError):
+        return False
+    m = re.search(r"F([a-z]*)", caps)
+    if m and "c" in m.group(1) and "w" not in m.group(1):
+        return False
+    logging.warning(f"Skipping {path}: open for write elsewhere (caps {caps})")
+    with stats._lock:
+        stats.files_skipped_open_elsewhere += 1
+    return True
+
+
 def process_file(args, filepaths, st, layout, file_layout, stage=False):
     # Every target whose directory this call changes. A sibling temp, a staged
     # link and a swept orphan move that directory's rctime as surely as the
@@ -4539,6 +4580,9 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
                         stats.files_skipped_open += 1
                     os.unlink(tmp_file)
                     return
+                if _skip_if_open_for_write(filepaths[0]):
+                    os.unlink(tmp_file)
+                    return
                 copy_start = time.monotonic()
                 copy_method = _copy_file_data(ifd, ofd, st.st_size, layout.object_size)
                 # Flush to disk before we compare stats
@@ -4606,6 +4650,10 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
                 os.unlink(tmp_file)
                 with stats._lock:
                     stats.files_skipped_changed += 1
+                return
+
+            if _skip_if_open_for_write(filepaths[0]):
+                os.unlink(tmp_file)
                 return
 
             # The file's mtime is kept (copystat): archive_* and rsync key on
@@ -6712,6 +6760,7 @@ def _check_tmpdir_and_target(args):
         sys.exit(1)
 
     logging.info(f"Temporary directory is {args.tmpdir} with pool {layout.pool}")
+    _probe_caps(args.tmpdir)
 
     # Decided once, before the config file is read, so that a config min_size
     # below an EC target's floor is refused as it is applied (_apply_config).
@@ -6791,16 +6840,17 @@ def main():
         description="Transcode cephfs files to their directory layout",
         epilog=(
             "files held open for writing:\n"
-            "  --min-age is the only guard against moving a file that a\n"
-            "  process still holds open for writing. The mtime/ctime/size\n"
-            "  re-check before the swap catches a write during the copy, but\n"
-            "  a writer that keeps the file open, sits idle past --min-age\n"
-            "  and then writes again is writing to the replaced, unlinked\n"
-            "  inode: those writes never reach the path. Neither the MDS nor\n"
-            "  this tool can see such a writer, because the kernel client\n"
-            "  drops its wanted caps on an open file left idle for about a\n"
-            "  minute. Use --min-age 2 or more, and keep the tool off trees\n"
-            "  whose writers hold files open for days (long-lived logs,\n"
+            "  Before the copy and again right before the swap, the tool reads\n"
+            "  its own client's caps on the file (ceph.caps). No Fc means\n"
+            "  another client has it open for write; Fw means a process on\n"
+            "  this host does. Either way the file is skipped, counted as\n"
+            "  \"open for write elsewhere\", and a later pass retries it. The\n"
+            "  kernel client drops its wanted caps on an open file left idle\n"
+            "  for about a minute, so a writer that keeps a file open, sits\n"
+            "  idle past --min-age and then writes again is invisible to this\n"
+            "  check; its writes go to the replaced, unlinked inode. --min-age\n"
+            "  stays the main guard: use 2 or more, and keep the tool off\n"
+            "  trees whose writers hold files open for days (long-lived logs,\n"
             "  databases).\n\n"
             "runtime signals:\n"
             "  SIGUSR1  (10)  increase thread count by 1 (resumes from pause)\n"
@@ -6905,7 +6955,7 @@ def main():
         default=MIN_AGE_DAYS,
         type=int,
         help="Minimum age of file before transcoding, in days (adjustable at runtime via SIGRTMIN+2/SIGRTMIN+3). "
-        "The only guard against files held open for writing; see below",
+        "The main guard against files held open for writing; see below",
     )
     parser.add_argument(
         "--min-size",
@@ -7559,6 +7609,7 @@ def main():
         f"{stats.files_skipped_changed} changed during processing, "
         f"{stats.files_skipped_hardlink} hardlinks skipped, "
         f"{stats.files_skipped_open} open/locked, "
+        f"{stats.files_skipped_open_elsewhere} open for write elsewhere, "
         f"{stats.files_skipped_layout_invalid} invalid layout"
         f" (+{stats.subtrees_skipped_layout_invalid} subtrees), "
         f"{stats.files_skipped_small} below min-size, "

@@ -194,14 +194,18 @@ replicated pools.
 
 ## Files held open for writing
 
-`--min-age` is the only guard against moving a file that a process still holds open
-for writing. The mtime/ctime/size re-check before the swap catches a write during
-the copy. But a writer that keeps the file open, sits idle past `--min-age` and then
-writes again is writing to the replaced, unlinked inode, and those writes never
-reach the path. Neither the MDS nor the transcoder can see such a writer: the kernel
-client drops its wanted caps on an open file left idle for about a minute. Keep
-`--min-age` at 2 (the default) or more, and keep the transcoder off trees whose
-writers hold files open for days, such as long-lived logs and databases.
+Before the copy and again right before the swap, the transcoder reads its own
+client's caps on the file (`ceph.caps`). No `Fc` means another client has it open
+for write; `Fw` means a process on this host does. Either way the file is skipped
+and counted as "open for write elsewhere", and a later pass retries it. The
+mtime/ctime/size re-check before the swap catches a write during the copy. Neither
+check sees a writer that keeps the file open and sits idle: the kernel client drops
+its wanted caps on an open file left idle for about a minute. When that writer
+writes again, it writes to the replaced, unlinked inode, and those writes never
+reach the path. `--min-age` stays the main guard: keep it at 2 (the default) or
+more, and keep the transcoder off trees whose writers hold files open for days, such
+as long-lived logs and databases. If the kernel cannot report `ceph.caps`, the
+transcoder says so once at startup and runs without the check.
 
 ## Advanced options
 
@@ -356,7 +360,7 @@ options:
   --debug, -d
   --min-age MIN_AGE     Minimum age of file before transcoding, in days
                         (adjustable at runtime via SIGRTMIN+2/SIGRTMIN+3). The
-                        only guard against files held open for writing; see
+                        main guard against files held open for writing; see
                         below
   --min-size SIZE       Skip files smaller than this size. Suffix B/K/M/G
                         (binary); plain number means bytes. 0 disables.
@@ -532,16 +536,17 @@ options:
                         in .vcephfs-transcode-runs.jsonl.<run>.partial.
 
 files held open for writing:
-  --min-age is the only guard against moving a file that a
-  process still holds open for writing. The mtime/ctime/size
-  re-check before the swap catches a write during the copy, but
-  a writer that keeps the file open, sits idle past --min-age
-  and then writes again is writing to the replaced, unlinked
-  inode: those writes never reach the path. Neither the MDS nor
-  this tool can see such a writer, because the kernel client
-  drops its wanted caps on an open file left idle for about a
-  minute. Use --min-age 2 or more, and keep the tool off trees
-  whose writers hold files open for days (long-lived logs,
+  Before the copy and again right before the swap, the tool reads
+  its own client's caps on the file (ceph.caps). No Fc means
+  another client has it open for write; Fw means a process on
+  this host does. Either way the file is skipped, counted as
+  "open for write elsewhere", and a later pass retries it. The
+  kernel client drops its wanted caps on an open file left idle
+  for about a minute, so a writer that keeps a file open, sits
+  idle past --min-age and then writes again is invisible to this
+  check; its writes go to the replaced, unlinked inode. --min-age
+  stays the main guard: use 2 or more, and keep the tool off
+  trees whose writers hold files open for days (long-lived logs,
   databases).
 
 runtime signals:

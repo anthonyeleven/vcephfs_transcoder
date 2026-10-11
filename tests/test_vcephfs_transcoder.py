@@ -2869,6 +2869,92 @@ class EveryChangeIsClaimed(_ProcessFileHarness):
         self.assertIsNotNone(rec["pinned_at"])
 
 
+class OpenForWriteElsewhere(_ProcessFileHarness):
+    """Our client's caps on the source show a writer: no Fc while another
+    client has it open for write, Fw while a process on this host does. The
+    file is skipped, before the copy or right before the swap, and kept."""
+
+    NONE, REMOTE, LOCAL = ("pAsLsXsFscr/0xd55", "pAsLsXsFrw/0x1855",
+                           "pAsxLsXsxFsxcrwb/0x3fdd")
+
+    def setUp(self):
+        super().setUp()
+        self._saved_caps = (getattr(os, "getxattr", None), vct.caps_check,
+                            vct.stats)
+        vct.caps_check, vct.stats = True, vct.Stats()
+        self.caps = []                  # answers to successive ceph.caps reads
+
+        def getxattr(target, name, follow_symlinks=True):
+            if name != "ceph.caps":
+                raise OSError(errno.ENODATA, "No data available")
+            a = self.caps.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return a.encode()
+        os.getxattr = getxattr
+
+    def tearDown(self):
+        g, vct.caps_check, vct.stats = self._saved_caps
+        if g is None:
+            del os.getxattr
+        else:
+            os.getxattr = g
+        super().tearDown()
+
+    def assertKept(self):
+        self.assertEqual(os.lstat(self.src).st_ino, self.ino, "replaced")
+        self.assertEqual([n for n in os.listdir(self.art) if vct.TMP_SUFFIX in n],
+                         [], "temp left behind")
+        self.assertEqual(vct.stats.files_skipped_open_elsewhere, 1)
+        self.assertEqual((vct.stats.files_transcoded, vct.stats.files_failed),
+                         (0, 0))
+
+    def _run(self, *caps):
+        self.ino = os.lstat(self.src).st_ino
+        self.caps = list(caps)
+        with self.assertLogs(level="WARNING") as logs:
+            self._process()
+        self.assertIn(f"Skipping {self.src}: open for write elsewhere",
+                      "\n".join(logs.output))
+        self.assertEqual(self.caps, [], "a caps read was not made")
+
+    def test_a_remote_writer_before_the_copy(self):
+        self._run(self.REMOTE)
+        self.assertKept()
+
+    def test_a_remote_writer_before_the_swap(self):
+        self._run(self.NONE, self.REMOTE)
+        self.assertKept()
+
+    def test_a_local_writer(self):
+        self._run(self.NONE, self.LOCAL)
+        self.assertKept()
+
+    def test_no_writer_is_moved(self):
+        ino = os.lstat(self.src).st_ino
+        self.caps = [self.NONE, self.NONE]
+        self._process()
+        self.assertNotEqual(os.lstat(self.src).st_ino, ino)
+        self.assertEqual(vct.stats.files_skipped_open_elsewhere, 0)
+        self.assertEqual(vct.stats.files_transcoded, 1)
+
+    def test_an_unreadable_read_is_no_check(self):
+        ino = os.lstat(self.src).st_ino
+        self.caps = [OSError(errno.ENODATA, "No data available")] * 2
+        self._process()
+        self.assertNotEqual(os.lstat(self.src).st_ino, ino)
+
+    def test_the_startup_probe_turns_it_off(self):
+        self.caps = [OSError(errno.EOPNOTSUPP, "Operation not supported")]
+        with self.assertLogs(level="WARNING") as logs:
+            vct._probe_caps(self.d)
+        self.assertIn("No open-for-write check", "\n".join(logs.output))
+        self.assertFalse(vct.caps_check)
+        ino = os.lstat(self.src).st_ino
+        self._process()                 # an empty self.caps would raise if read
+        self.assertNotEqual(os.lstat(self.src).st_ino, ino)
+
+
 class ChownBeforeCopystat(_ProcessFileHarness):
     """The kernel clears setuid/setgid (and drops security.capability) on
     chown, so a chown after copystat stripped the bits copystat had copied."""
