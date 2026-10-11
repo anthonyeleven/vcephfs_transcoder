@@ -4464,18 +4464,34 @@ class InvalidLayoutRead(unittest.TestCase):
             j._create(d, vct.CephLayout(_ZERO).with_pool("cephfs.v.data"))
         self.assertEqual(os.listdir(d), [])
 
-    def test_a_worker_hitting_it_skips_rather_than_fails(self):
-        saved = vct.thread_count
-        self.addCleanup(setattr, vct, "thread_count", saved)
-        vct.thread_count = vct.DynamicSemaphore(1)
-        vct.thread_count.acquire()
+    def test_a_worker_hitting_it_skips_and_names_the_file(self):
+        saved = (vct.staging, vct.run_journal)
+        self.addCleanup(lambda: (setattr(vct, "staging", saved[0]),
+                                 setattr(vct, "run_journal", saved[1])))
+        vct.run_journal = None
 
-        class F:
-            def result(self):
-                raise vct.InvalidLayout("ceph.dir.layout of /v/a reads back as " + _ZERO)
-        vct.handler(F())
+        class Staging:
+            def path_for(self, dirpath, layout):
+                raise vct.InvalidLayout("staging layout under /v/a reads back as " + _ZERO)
+        vct.staging = Staging()
+        with self.assertLogs(level="WARNING") as logs:
+            vct.process_file(Args(), ["/v/a/f"], None, vct.CephLayout(_L),
+                             vct.CephLayout(_L), stage=True)
+        self.assertIn("Skipping /v/a/f:", "\n".join(logs.output))
         self.assertEqual(vct.stats.files_skipped_layout_invalid, 1)
         self.assertEqual(vct.stats.files_failed, 0)
+
+    def test_a_bad_tmpdir_read_is_a_clean_refusal(self):
+        saved = vct.get_layout_walking_up
+        self.addCleanup(setattr, vct, "get_layout_walking_up", saved)
+
+        def walk_up(p):
+            raise vct.InvalidLayout(f"ceph.dir.layout of {p} reads back as {_ZERO}")
+        vct.get_layout_walking_up = walk_up
+        with self.assertLogs(level="ERROR") as logs:
+            with self.assertRaises(SystemExit):
+                vct._check_tmpdir_and_target(Args(tmpdir="/v/tmp", target_pool=None))
+        self.assertIn("Refusing to start", "\n".join(logs.output))
 
     def test_a_listed_file_under_it_is_skipped_not_failed(self):
         d = tempfile.mkdtemp()
@@ -4512,6 +4528,73 @@ class InvalidLayoutRead(unittest.TestCase):
         vct.process_paths(args, {}, ex, {}, [d])
         self.assertEqual(ex.calls, [])
         self.assertEqual(vct.stats.files_skipped_layout_invalid, 1)
+        self.assertEqual(vct.stats.files_failed, 0)
+
+        # More files in the same directory: skipped, each named, read once.
+        more = []
+        for n in ("g", "h", "i"):
+            p = os.path.join(d, n)
+            with open(p, "wb") as fh:
+                fh.write(b"x" * 1000)
+            os.utime(p, (old, old))
+            more.append(p)
+        reads = []
+        vct.get_layout_walking_up = lambda p: (reads.append(p), walk_up(p))[1]
+        vct._path_source = lambda a, r: iter(more)
+        with self.assertLogs(level="WARNING") as logs:
+            vct.process_paths(args, {}, ex, {}, [d])
+        self.assertEqual(reads, [d])
+        self.assertEqual(ex.calls, [])
+        self.assertEqual(vct.stats.files_skipped_layout_invalid, 4)
+        for p in more:
+            self.assertIn(f"Skipping {p}:", "\n".join(logs.output))
+
+    def test_a_walk_skips_the_subtree_and_counts_it(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        old = time.time() - 30 * 86400
+        for rel in ("top", os.path.join("bad", "f"), os.path.join("bad", "sub", "g")):
+            p = os.path.join(d, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as fh:
+                fh.write(b"x" * 1000)
+            os.utime(p, (old, old))
+        saved = (vct.run_journal, vct.file_delay_ms, vct.runtime_config,
+                 vct.thread_count, vct.staging, vct.get_layout_walking_up,
+                 vct.CephLayout.__dict__["from_file"],
+                 vct.CephLayout.__dict__["from_dir"])
+
+        def restore():
+            (vct.run_journal, vct.file_delay_ms, vct.runtime_config,
+             vct.thread_count, vct.staging, vct.get_layout_walking_up,
+             from_file, from_dir) = saved
+            vct.CephLayout.from_file = from_file
+            vct.CephLayout.from_dir = from_dir
+        self.addCleanup(restore)
+        vct.file_delay_ms = 0
+        vct.runtime_config = None
+        vct.run_journal = None
+        vct.staging = None
+        vct.thread_count = vct.DynamicSemaphore(100)
+        bad = os.path.join(d, "bad")
+
+        def from_dir(cls, p):
+            if p == bad:
+                raise vct.InvalidLayout(f"ceph.dir.layout of {p} reads back as {_ZERO}")
+            return vct.CephLayout(_L)
+        vct.CephLayout.from_dir = classmethod(from_dir)
+        vct.get_layout_walking_up = lambda p: from_dir(None, p)
+        src = vct.CephLayout(_L.replace("cephfs.v.ec4.2.qlc.data",
+                                        "cephfs.v.ec6.3.ssd.data"))
+        vct.CephLayout.from_file = classmethod(lambda cls, p: src)
+        args = Args(max_files=None, source_pool=None, min_size=0, max_size=None,
+                    process_hardlinks=False, tmpdir="/nonexistent", dirs=[d],
+                    stage_in_tmpdir=False, target_pool=None)
+        ex = _FakeExecutor()
+        vct.process_dir(args, d, {}, ex, set(), {})
+        self.assertEqual([c[1][0] for c in ex.calls], [os.path.join(d, "top")])
+        self.assertEqual(vct.stats.subtrees_skipped_layout_invalid, 1)
+        self.assertEqual(vct.stats.files_skipped_layout_invalid, 0)
         self.assertEqual(vct.stats.files_failed, 0)
 
 

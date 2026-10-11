@@ -30,7 +30,8 @@ do_exit = threading.Event()
 run_journal = None
 thread_count = None
 file_delay_ms = 0
-min_age_days = 1
+MIN_AGE_DAYS = 2
+min_age_days = MIN_AGE_DAYS
 
 # --- staging: the temp copy goes beside its target, not in a shared tmpdir ---
 #
@@ -182,7 +183,7 @@ def config_example(volume="VOLUME"):
         "",
         "# --- what counts as eligible ------------------------------------------",
         "# Skip files modified within this many days.",
-        "min_age_days    = 1",
+        "min_age_days    = %d" % MIN_AGE_DAYS,
         "",
         "# Skip files smaller than this many bytes. Pre-Tentacle, EC pads small",
         "# objects to a whole stripe, which is why this is not lower.",
@@ -875,6 +876,7 @@ class Stats:
     files_skipped_large: int = 0
     files_skipped_source_pool: int = 0
     files_skipped_layout_invalid: int = 0
+    subtrees_skipped_layout_invalid: int = 0
     files_vanished: int = 0
     files_outside_root: int = 0
     dirs_pruned: int = 0
@@ -971,7 +973,9 @@ class InvalidLayout(RuntimeError):
 # Taken at its word, --target-pool keeps the zeros and swaps in a pool, and
 # setting stripe_unit=0 fails with EINVAL; walking past it to the parent
 # could pick an ancestor's pool for a directory that has one of its own. So
-# such a read is retried after these pauses, then refused.
+# such a read is retried after these pauses, then refused and the file
+# skipped. The same paths skipped pass after pass mean the read is not
+# transient, and the directory needs a look by hand.
 _LAYOUT_REREAD_DELAYS_S = (0.1, 0.5, 2.0)
 
 
@@ -3307,7 +3311,7 @@ class JobStaging:
             got = CephLayout.from_file(f)
             if got is None or got.pool != pool:
                 why = f"a file created under {path} landed in {got and got.pool}"
-        except OSError as e:
+        except (OSError, InvalidLayout) as e:
             why = f"{path}: {e}"
         finally:
             try:
@@ -4431,6 +4435,10 @@ def process_file(args, filepaths, st, layout, file_layout, stage=False):
             touched.add(again)
             _replace_file(args, filepaths, st, layout, file_layout, touched,
                           again)
+    except InvalidLayout as e:
+        logging.warning(f"Skipping {filepaths[0]}: {e}")
+        with stats._lock:
+            stats.files_skipped_layout_invalid += 1
     finally:
         if run_journal is not None:
             for path in touched:
@@ -4656,10 +4664,6 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
 def handler(future):
     try:
         future.result()
-    except InvalidLayout as e:
-        logging.warning(f"Skipping a file: {e}")
-        with stats._lock:
-            stats.files_skipped_layout_invalid += 1
     except Exception:
         logging.exception("Error processing file in worker thread")
         with stats._lock:
@@ -5314,7 +5318,7 @@ def _iter_pool_paths(args, roots):
             if e.errno == ENODATA:
                 try:
                     lay = get_layout_walking_up(r)
-                except OSError as e2:
+                except (OSError, InvalidLayout) as e2:
                     e = e2
             if lay is None:
                 logging.warning(
@@ -5881,6 +5885,9 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots):
     real_dirs = {}
     root_dev = {r: os.stat(r).st_dev for r in roots}
     restat_failed = set()
+    # Directories whose layout read was refused, read once per pass: a list
+    # grouped by directory would otherwise pay the re-reads for every file.
+    bad_layout_dirs = {}
 
     def _skip_outside(filepath, why):
         nonlocal outside_logged
@@ -5988,8 +5995,11 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots):
         dir_layout = dir_layouts.get(dirpath)
         if dir_layout is None:
             try:
+                if dirpath in bad_layout_dirs:
+                    raise InvalidLayout(bad_layout_dirs[dirpath])
                 dir_layout = get_layout_walking_up(dirpath)
             except InvalidLayout as e:
+                bad_layout_dirs[dirpath] = str(e)
                 logging.warning("Skipping %s: %s", filepath, e)
                 with stats._lock:
                     stats.files_skipped_layout_invalid += 1
@@ -6159,7 +6169,7 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             # pruning below, which needs this directory's layout first.
             logging.warning(f"Skipping {dirpath} and everything under it: {e}")
             with stats._lock:
-                stats.files_skipped_layout_invalid += len(filenames)
+                stats.subtrees_skipped_layout_invalid += 1
             del dirnames[:]
             continue
         except OSError as e:
@@ -6544,7 +6554,11 @@ def process_files(args):
                 if start_dir in mountpoints:
                     mountpoints.remove(start_dir)
 
-                layout = get_layout_walking_up(start_dir)
+                try:
+                    layout = get_layout_walking_up(start_dir)
+                except InvalidLayout as e:
+                    logging.error(f"Skipping {start_dir}: {e}")
+                    continue
 
                 if layout is None:
                     logging.error(f"Could not determine layout for {start_dir}, skipping")
@@ -6673,7 +6687,11 @@ def _install_exit_handlers():
 def _check_tmpdir_and_target(args):
     """The tmpdir and --target-pool checks a transcoding run makes at startup;
     exits on a refusal. Not for --reap-staging, which copies nothing."""
-    layout = get_layout_walking_up(args.tmpdir)
+    try:
+        layout = get_layout_walking_up(args.tmpdir)
+    except InvalidLayout as e:
+        logging.error("Refusing to start: %s", e)
+        sys.exit(1)
 
     if layout is None:
         logging.error(
@@ -6705,7 +6723,11 @@ def _check_tmpdir_and_target(args):
     # would be rewritten for nothing, and a failed apply_file() would go
     # unnoticed, as the temp inherits the target pool. Refused, not prompted,
     # so a detached start cannot hang on it.
-    conflicts = tmpdir_conflicts(args, layout.pool)
+    try:
+        conflicts = tmpdir_conflicts(args, layout.pool)
+    except InvalidLayout as e:
+        logging.error("Refusing to start: %s", e)
+        sys.exit(1)
 
     if conflicts:
         for d, pool in conflicts:
@@ -6732,7 +6754,11 @@ def _check_tmpdir_and_target(args):
     # overrides it so a pool-to-pool drain is judged against the right baseline.
     # Best-effort -- needs the ceph CLI, and stays silent without it.
     for _d in args.dirs:
-        _t = target_layout(args, get_layout_walking_up(_d))
+        try:
+            _t = target_layout(args, get_layout_walking_up(_d))
+        except InvalidLayout as e:
+            logging.warning("No crossover check for %s: %s", _d, e)
+            continue
         if _t is None:
             continue
         # A replicated --target-pool wins only BELOW a size, and its band is
@@ -6858,7 +6884,7 @@ def main():
     parser.add_argument("--debug", "-d", action="store_true")
     parser.add_argument(
         "--min-age",
-        default=1,
+        default=MIN_AGE_DAYS,
         type=int,
         help="Minimum age of file before transcoding, in days (adjustable at runtime via SIGRTMIN+2/SIGRTMIN+3). "
         "The only guard against files held open for writing; see below",
@@ -7515,7 +7541,8 @@ def main():
         f"{stats.files_skipped_changed} changed during processing, "
         f"{stats.files_skipped_hardlink} hardlinks skipped, "
         f"{stats.files_skipped_open} open/locked, "
-        f"{stats.files_skipped_layout_invalid} invalid layout, "
+        f"{stats.files_skipped_layout_invalid} invalid layout"
+        f" (+{stats.subtrees_skipped_layout_invalid} subtrees), "
         f"{stats.files_skipped_small} below min-size, "
         f"{stats.files_skipped_symlink} symlinks/non-regular, "
         f"{stats.files_skipped_large} above max-size, "

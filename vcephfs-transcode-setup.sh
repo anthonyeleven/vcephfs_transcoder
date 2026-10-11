@@ -54,7 +54,7 @@
 #   --compression-algorithm ALG
 #                          Compression algorithm (default: snappy)
 #                          (e.g. "snappy", "zstd", "lz4", "zlib")
-#   --min-age DAYS         Min file age in days (default: 1)
+#   --min-age DAYS         Min file age in days (default: 2)
 #   --min-size SIZE        Min file size (e.g. "1M", "300K")
 #   --subdir PATH           Subdirectory under mount to transcode
 #                          (e.g. "ethel/merman")
@@ -71,7 +71,7 @@ set -euo pipefail
 EC_PLUGIN="isa"
 COMPRESSION="aggressive"
 COMPRESSION_ALG="snappy"
-MIN_AGE=1
+MIN_AGE=2
 MIN_SIZE=""
 FASTEC=false
 DRY_RUN=true
