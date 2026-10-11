@@ -3175,11 +3175,12 @@ class WalkPrunesForeignMounts(unittest.TestCase):
                      r.st_gid, r.st_size, r.st_atime, r.st_mtime, r.st_ctime))
             return r
         # The re-stat of the root sees the same new device, so nothing is
-        # pruned and the walk reaches the file (skipped as a non-candidate,
-        # not refused as foreign).
-        before = vct.stats.files_outside_root
-        self._walk(fake)
-        self.assertEqual(vct.stats.files_outside_root, before)
+        # pruned and the walk reaches the file, which is skipped as too
+        # recent -- a counter the prune path can never reach.
+        before = vct.stats.files_skipped_recent
+        with self.assertNoLogs(level="WARNING"):
+            self._walk(fake)
+        self.assertEqual(vct.stats.files_skipped_recent, before + 1)
 
 
 class FileDelayWakes(unittest.TestCase):

@@ -6704,7 +6704,11 @@ def process_files(args):
                     continue
 
                 if layout is None:
-                    logging.error(f"Could not determine layout for {start_dir}, skipping")
+                    logging.error(
+                        f"Could not determine layout for {start_dir}, "
+                        f"skipping. If no directory up to the volume root "
+                        f"carries one, set the root's (setfattr -n "
+                        f"ceph.dir.layout.pool -v <default pool> <mount root>)")
                     continue
                 dir_layouts[start_dir] = layout
 
