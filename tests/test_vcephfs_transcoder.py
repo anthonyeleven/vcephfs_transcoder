@@ -5251,20 +5251,30 @@ class TmpdirConflictUnderTargetPool(unittest.TestCase):
                          [("/v", "cephfs.v.ec4.2.qlc.data")])
         self.assertEqual(vct.tmpdir_conflicts(self._args(), "cephfs.v.data"), [])
 
-    def test_a_refused_root_is_left_out_not_fatal(self):
+    def _refuse_w(self):
         def walk_up(d):
             if d == "/w":
                 raise vct.InvalidLayout("ceph.dir.layout of /w reads back as "
                                         "stripe_unit=0 stripe_count=0 object_size=0 pool=-1")
             return vct.CephLayout(_L)
         vct.get_layout_walking_up = walk_up
+
+    def test_a_refused_root_is_left_out_not_fatal(self):
+        self._refuse_w()
         with self.assertLogs(level="WARNING"):
             self.assertEqual(vct.tmpdir_conflicts(self._args(dirs=["/w", "/v"]),
                                                   "cephfs.v.ec4.2.qlc.data"),
                              [("/v", "cephfs.v.ec4.2.qlc.data")])
+
+    def test_a_refused_root_stops_a_stage_in_tmpdir_run(self):
+        self._refuse_w()
+        args = self._args(dirs=["/w", "/v"], stage_in_tmpdir=True, tmpdir="/v/tmp")
         with self.assertRaises(vct.InvalidLayout):
-            vct.tmpdir_conflicts(self._args(dirs=["/w", "/v"], stage_in_tmpdir=True),
-                                 "cephfs.v.ec4.2.qlc.data")
+            vct.tmpdir_conflicts(args, "cephfs.v.ec4.2.qlc.data")
+        with self.assertLogs(level="ERROR") as logs:
+            with self.assertRaises(SystemExit):
+                vct._check_tmpdir_and_target(args)
+        self.assertIn("Refusing to start (--stage-in-tmpdir)", "\n".join(logs.output))
 
 
 class TargetPoolKindFailsClosed(unittest.TestCase):
