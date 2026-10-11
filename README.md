@@ -176,8 +176,8 @@ bytes outweigh that.
 pass after another and never two at once on a volume. With `min_age_days = 2` it
 moves the large files that landed on the replicated pool since the last pass. A
 pass is idempotent: files already moved count as "already matched", and files
-skipped as too recent, open or locked, changed during the copy, or with an invalid
-layout are picked up by the next pass.
+skipped as too recent, open or locked, open for write elsewhere, changed during
+the copy, or with an invalid layout are picked up by the next pass.
 
 ## Alternative: point the volume root at the new pool
 
