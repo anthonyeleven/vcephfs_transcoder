@@ -330,10 +330,13 @@ options:
                         Comma-separated monitor addresses for --paths-from-
                         pool, used instead of a conffile.
   --rados-keyring PATH  Keyring for --paths-from-pool. Default: whatever the
-                        conffile says.
+                        conffile says. Given with --rados-name, also the
+                        keyring of --target-pool's staging-removal session.
   --rados-name NAME     RADOS client name for --paths-from-pool (default
                         client.admin). Needs read access to the pool and to
-                        its objects' xattrs.
+                        its objects' xattrs. Given with --rados-keyring, also
+                        the user of --target-pool's staging-removal session,
+                        which otherwise is the mount's name=.
   --paths-from FILE     Transcode exactly the files listed in FILE ('-' for
                         stdin; NUL- or newline-delimited) instead of walking.
                         A path outside the given directories is refused, as is

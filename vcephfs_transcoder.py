@@ -4122,8 +4122,12 @@ def tmpdir_conflicts(args, tmpdir_pool):
         try:
             target = target_layout(args, get_layout_walking_up(d))
         except InvalidLayout as e:
-            # Left out of the check, not fatal: the files under it read the
-            # layout again before anything is written to them.
+            if args.stage_in_tmpdir:
+                # Its temps would go into the tmpdir, and this check does not
+                # run again for it.
+                raise
+            # Left out of the check, not fatal: temps are staged beside their
+            # targets, and each one's layout is read back once it is set.
             logging.warning("No tmpdir check for %s: %s", d, e)
             continue
         if target is not None and target.pool == tmpdir_pool:
@@ -6731,7 +6735,11 @@ def _check_tmpdir_and_target(args):
     # would be rewritten for nothing, and a failed apply_file() would go
     # unnoticed, as the temp inherits the target pool. Refused, not prompted,
     # so a detached start cannot hang on it.
-    conflicts = tmpdir_conflicts(args, layout.pool)
+    try:
+        conflicts = tmpdir_conflicts(args, layout.pool)
+    except InvalidLayout as e:
+        logging.error("Refusing to start (--stage-in-tmpdir): %s", e)
+        sys.exit(1)
 
     if conflicts:
         for d, pool in conflicts:
@@ -6861,11 +6869,15 @@ def main():
              "instead of a conffile.")
     parser.add_argument(
         "--rados-keyring", metavar="PATH",
-        help="Keyring for --paths-from-pool. Default: whatever the conffile says.")
+        help="Keyring for --paths-from-pool. Default: whatever the conffile says. "
+             "Given with --rados-name, also the keyring of --target-pool's "
+             "staging-removal session.")
     parser.add_argument(
         "--rados-name", metavar="NAME", default=None,
         help="RADOS client name for --paths-from-pool (default client.admin). "
-             "Needs read access to the pool and to its objects' xattrs.")
+             "Needs read access to the pool and to its objects' xattrs. Given "
+             "with --rados-keyring, also the user of --target-pool's "
+             "staging-removal session, which otherwise is the mount's name=.")
     parser.add_argument(
         "--paths-from", metavar="FILE",
         help="Transcode exactly the files listed in FILE ('-' for stdin; NUL- "

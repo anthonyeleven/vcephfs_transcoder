@@ -5262,6 +5262,9 @@ class TmpdirConflictUnderTargetPool(unittest.TestCase):
             self.assertEqual(vct.tmpdir_conflicts(self._args(dirs=["/w", "/v"]),
                                                   "cephfs.v.ec4.2.qlc.data"),
                              [("/v", "cephfs.v.ec4.2.qlc.data")])
+        with self.assertRaises(vct.InvalidLayout):
+            vct.tmpdir_conflicts(self._args(dirs=["/w", "/v"], stage_in_tmpdir=True),
+                                 "cephfs.v.ec4.2.qlc.data")
 
 
 class TargetPoolKindFailsClosed(unittest.TestCase):
