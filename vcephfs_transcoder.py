@@ -6143,6 +6143,9 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots):
                         f"<mount root>)")
                 with stats._lock:
                     stats.files_skipped_layout_missing += 1
+                # Named per file, like every other skip class: a chain that
+                # rebuilds its next list from the log must not lose these.
+                logging.info("Skipping %s: no layout for its directory", filepath)
                 continue
             dir_layouts[dirpath] = dir_layout
         layout = target_layout(args, dir_layout)

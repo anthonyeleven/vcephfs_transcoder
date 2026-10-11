@@ -3945,18 +3945,26 @@ class ListModeMissingLayout(unittest.TestCase):
         vct.stats = vct.Stats()
         vct.thread_count = vct.DynamicSemaphore(1)
         vct.run_journal = vct.staging = None
-        vct.get_layout_walking_up = lambda p: None
+        walkups = []
+
+        def walk_up(p):
+            walkups.append(p)
+            return None
+        vct.get_layout_walking_up = walk_up
         args = Args(paths_from=lst, paths_from_pool=None, dirs=[d],
                     max_files=None, source_pool=None, target_pool=None,
                     min_size=0, max_size=None, stage_in_tmpdir=False,
                     log_file=None)
-        with self.assertLogs(level="ERROR") as logs:
+        with self.assertLogs(level="INFO") as logs:
             vct._process_paths(args, {}, None, {}, [os.path.abspath(d)])
         hits = [l for l in logs.output if "Could not determine layout" in l]
         self.assertEqual(len(hits), 1, "not said once per directory")
         self.assertIn("setfattr", hits[0])
         self.assertEqual(vct.stats.files_skipped_layout_missing, 2)
         self.assertEqual(vct.stats.files_failed, 0)
+        self.assertEqual(len(walkups), 1, "the directory was not cached")
+        skips = [l for l in logs.output if "no layout for its directory" in l]
+        self.assertEqual(len(skips), 2, "each skipped file must be named")
 
 
 # --- --target-pool ------------------------------------------------------------
