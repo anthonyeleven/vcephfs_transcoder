@@ -1538,6 +1538,12 @@ class PathsFromList(unittest.TestCase):
         p = self._write(b"/a/one\r\n\n/a/two\n\n")
         self.assertEqual(list(vct._iter_listed_paths(p)), ["/a/one", "/a/two"])
 
+    def test_nul_mode_is_byte_exact(self):
+        """A CR- or LF-edged name must stay targetable from a find -print0
+        list, not be silently retargeted at its clean-named twin."""
+        p = self._write(b"/a/x\r\x00\n/a/y\x00")
+        self.assertEqual(list(vct._iter_listed_paths(p)), ["/a/x\r", "\n/a/y"])
+
     def test_no_trailing_separator(self):
         p = self._write(b"/a/one\n/a/last")
         self.assertEqual(list(vct._iter_listed_paths(p)), ["/a/one", "/a/last"])
@@ -2520,6 +2526,33 @@ class HardlinkStagingOrder(unittest.TestCase):
         os.link(a, c)
         return [a, b, c]
 
+    def test_a_secondary_name_replaced_under_a_renamed_dir_is_kept(self):
+        """Renaming an ancestor of one link does not touch the inode, so the
+        mtime/ctime re-check on the first name cannot see it. Without the
+        per-name inode re-check, the staged rename replaces whatever now
+        sits at the old path -- someone else's file."""
+        a = os.path.join(self.d, "a")
+        with open(a, "wb") as f:
+            f.write(b"payload" * 100)
+        sub = os.path.join(self.d, "sub")
+        os.mkdir(sub)
+        b = os.path.join(sub, "b")
+        os.link(a, b)
+        st = os.lstat(a)
+        os.rename(sub, os.path.join(self.d, "sub2"))
+        os.mkdir(sub)
+        with open(b, "wb") as f:
+            f.write(b"innocent bystander")
+        before = vct.stats.files_skipped_changed
+        vct.process_file(self._args(), [a, b], st, self._Layout(),
+                         self._Layout())
+        with open(b, "rb") as f:
+            self.assertEqual(f.read(), b"innocent bystander")
+        self.assertEqual(os.lstat(a).st_ino, st.st_ino, "a was replaced")
+        self.assertEqual(vct.stats.files_skipped_changed, before + 1)
+        self.assertEqual([n for d in (self.d, sub) for n in os.listdir(d)
+                          if vct.TMP_SUFFIX in n], [], "temp left behind")
+
     def test_a_failed_link_renames_nothing(self):
         paths = self._three_links()
         st = os.lstat(paths[0])
@@ -2955,6 +2988,58 @@ class OpenForWriteElsewhere(_ProcessFileHarness):
         self.assertNotEqual(os.lstat(self.src).st_ino, ino)
 
 
+    def test_a_local_writer_before_the_copy(self):
+        self._run(self.LOCAL)
+        self.assertKept()
+
+    def test_no_file_caps_at_all_is_a_writer(self):
+        """No F caps on a file we hold open read-only means the MDS is
+        holding them back for someone: treated as a writer, skipped."""
+        self._run("pAsLsXs/0x155")
+        self.assertKept()
+
+    def test_unparseable_caps_disable_the_check(self):
+        ino = os.lstat(self.src).st_ino
+        self.caps = ["what even is this"]
+        with self.assertLogs(level="WARNING") as logs:
+            self._process()
+        self.assertIn("cannot parse ceph.caps", "\n".join(logs.output))
+        self.assertFalse(vct.caps_check)
+        self.assertNotEqual(os.lstat(self.src).st_ino, ino, "not moved")
+        self.assertEqual(vct.stats.files_skipped_open_elsewhere, 0)
+
+    def test_the_startup_probe_leaves_it_on(self):
+        self.caps = [self.NONE]
+        vct._probe_caps(self.d)
+        self.assertTrue(vct.caps_check)
+        self.assertEqual(self.caps, [], "the probe did not read ceph.caps")
+
+
+class WalkUpStopsOffCephfs(unittest.TestCase):
+    """A volume root with no explicit layout anywhere reads ENODATA all the
+    way up, and the walk then leaves the mount: the autofs parent answers
+    getxattr with EOPNOTSUPP. That is "no layout", not a crash."""
+
+    def setUp(self):
+        self._saved = vct._read_layout
+        self.addCleanup(setattr, vct, "_read_layout", self._saved)
+
+    def test_eopnotsupp_above_the_mount_is_none(self):
+        def read(path, xattr):
+            if path == "/shared/ceph/vol" or path.startswith("/shared/ceph/vol/"):
+                return None
+            raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+        vct._read_layout = read
+        self.assertIsNone(vct.get_layout_walking_up("/shared/ceph/vol/a/b"))
+
+    def test_any_other_error_still_raises(self):
+        def read(path, xattr):
+            raise OSError(errno.EIO, "Input/output error")
+        vct._read_layout = read
+        with self.assertRaises(OSError):
+            vct.get_layout_walking_up("/shared/ceph/vol/a")
+
+
 class ChownBeforeCopystat(_ProcessFileHarness):
     """The kernel clears setuid/setgid (and drops security.capability) on
     chown, so a chown after copystat stripped the bits copystat had copied."""
@@ -3013,13 +3098,13 @@ class OrphanAgeIsCtime(unittest.TestCase):
 
     def test_cleanup_tmpdir_still_reclaims_aged_temps(self):
         """Control: only the age changed, not what counts as ours."""
-        ours = [self._temp("a" * 32),
-                self._temp("." + "a" * 32 + vct.TMP_SUFFIX)]
-        theirs = self._temp("results.parquet")
+        ours = [self._temp("." + "a" * 32 + vct.TMP_SUFFIX)]
+        theirs = [self._temp("results.parquet"),
+                  self._temp("a" * 32)]    # md5-shaped user file, not ours
         vct.TMP_ORPHAN_MIN_AGE_S = 0
         vct.cleanup_tmpdir(self.d)
         self.assertEqual([p for p in ours if os.path.exists(p)], [])
-        self.assertTrue(os.path.exists(theirs))
+        self.assertEqual([p for p in theirs if not os.path.exists(p)], [])
 
 
 class FileDelayWakes(unittest.TestCase):

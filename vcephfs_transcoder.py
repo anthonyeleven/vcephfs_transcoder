@@ -32,6 +32,7 @@ thread_count = None
 file_delay_ms = 0
 MIN_AGE_DAYS = 2
 min_age_days = MIN_AGE_DAYS
+THREADS_DEFAULT = 4
 
 # --- staging: the temp copy goes beside its target, not in a shared tmpdir ---
 #
@@ -167,7 +168,7 @@ def config_example(volume="VOLUME"):
         "",
         "# Concurrent copies. Bounds the copier, not the walker. 0 pauses the job",
         "# (in-flight copies finish); set > 0 to resume.",
-        "threads         = 1",
+        "threads         = %d" % THREADS_DEFAULT,
         "",
         "# --- how the delay signals move ---------------------------------------",
         "# SIGRTMIN multiplies the delay, SIGRTMIN+1 divides it. Separate rates",
@@ -284,8 +285,6 @@ def _delay_up(old):
 def _delay_down(old):
     """One step faster. Stops at DELAY_MIN_MS, which is 0 (unthrottled) unless
     the config raises it. Same minimum-movement guard."""
-    if old <= DELAY_MIN_MS:
-        return DELAY_MIN_MS
     if old <= max(1, DELAY_MIN_MS):
         return DELAY_MIN_MS
     return max(min(int(old / DELAY_STEP_DOWN), old - 1), DELAY_MIN_MS)
@@ -1078,11 +1077,21 @@ class CephLayout:
 
 
 def get_layout_walking_up(path):
-    layout = CephLayout.from_dir(path)
-    parent = path
-    while layout is None and parent != "/":
-        parent = os.path.split(parent)[0]
-        layout = CephLayout.from_dir(parent)
+    try:
+        layout = CephLayout.from_dir(path)
+        parent = path
+        while layout is None and parent != "/":
+            parent = os.path.split(parent)[0]
+            layout = CephLayout.from_dir(parent)
+    except OSError as e:
+        if e.errno != errno.EOPNOTSUPP:
+            raise
+        # The walk left CephFS: a volume root with no explicit layout reads
+        # ENODATA and the walk climbs past it onto the autofs parent, whose
+        # getxattr answers EOPNOTSUPP. That is "no layout to be found" --
+        # callers handle None -- not a crash. Give the root an explicit
+        # layout (setfattr ceph.dir.layout.pool) for such a volume to run.
+        return None
     return layout
 
 
@@ -3300,7 +3309,9 @@ class JobStaging:
         try:
             base = get_layout_walking_up(self.root)
             if base is None:
-                return f"cannot read the layout of {self.root}"
+                return (f"no explicit layout at or above {self.root}; set one "
+                        f"on the volume root (setfattr -n ceph.dir.layout.pool "
+                        f"-v <default pool> {self.root})")
             path = self.path_for(self.root, base.with_pool(pool))
         except (OSError, RuntimeError) as e:
             return f"staging directory under {self.root}: {e}"
@@ -4320,10 +4331,8 @@ def _tmp_path_for(args, target):
     Beside the target, so the later rename is intra-directory -- see the header.
     Hidden and suffixed so an orphan left behind by a hard kill is recognizable.
     """
-    if args.stage_in_tmpdir:
-        return os.path.join(args.tmpdir, uuid.uuid4().hex)
-    return os.path.join(os.path.dirname(target),
-                        f".{uuid.uuid4().hex}{TMP_SUFFIX}")
+    base = args.tmpdir if args.stage_in_tmpdir else os.path.dirname(target)
+    return os.path.join(base, f".{uuid.uuid4().hex}{TMP_SUFFIX}")
 
 
 def _apply_and_verify_layout(layout, path):
@@ -4438,20 +4447,33 @@ def _skip_if_open_for_write(path):
     then leaves that writer on the old, unlinked inode, and what it writes
     next is lost. A writer idle for about a minute drops its wanted caps and
     is invisible here, so this does not replace --min-age."""
+    global caps_check
     if not caps_check:
         return False
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         try:
-            caps = os.getxattr(fd, "ceph.caps").decode().split("/")[0]
+            caps = os.getxattr(fd, "ceph.caps").decode()
         finally:
             os.close(fd)
-    except (OSError, AttributeError):
+    except (OSError, AttributeError) as e:
+        logging.debug(f"No open-for-write check for {path}: {e}")
         return False
-    m = re.search(r"F([a-z]*)", caps)
-    if m and "c" in m.group(1) and "w" not in m.group(1):
+    # "<letters>/0x<issued mask>": test the mask, not the letters, so a caps
+    # string this code does not recognize reads as "check unavailable", said
+    # once, rather than as a writer on every file of the pass. Bits from
+    # ceph_fs.h: Fc = CEPH_CAP_FILE_CACHE 0x400, Fw = CEPH_CAP_FILE_WR 0x1000.
+    try:
+        issued = int(caps.split("/")[1], 16)
+    except (IndexError, ValueError):
+        caps_check = False
+        logging.warning(f"No open-for-write check: cannot parse ceph.caps "
+                        f"{caps!r} on {path}")
         return False
-    logging.warning(f"Skipping {path}: open for write elsewhere (caps {caps})")
+    if issued & 0x400 and not issued & 0x1000:
+        return False
+    logging.warning(f"Skipping {path}: open for write elsewhere "
+                    f"(caps {caps.partition('/')[0]})")
     with stats._lock:
         stats.files_skipped_open_elsewhere += 1
     return True
@@ -4522,6 +4544,11 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
         if reclaim_orphans(os.path.dirname(filepaths[0])):
             touched.add(filepaths[0])
 
+    # Before the temp exists: a file skipped here changes nothing at all --
+    # no temp to unlink, no rctime move, no journal pin, pass after pass.
+    if _skip_if_open_for_write(filepaths[0]):
+        return
+
     if stage_dir is not None:
         tmp_file = os.path.join(stage_dir, f".{uuid.uuid4().hex}{TMP_SUFFIX}")
     else:
@@ -4578,9 +4605,6 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
                     )
                     with stats._lock:
                         stats.files_skipped_open += 1
-                    os.unlink(tmp_file)
-                    return
-                if _skip_if_open_for_write(filepaths[0]):
                     os.unlink(tmp_file)
                     return
                 copy_start = time.monotonic()
@@ -4655,6 +4679,26 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
             if _skip_if_open_for_write(filepaths[0]):
                 os.unlink(tmp_file)
                 return
+
+            # Each extra hard-link name is re-checked against the original
+            # inode. Unlinking or replacing a NAME moves the inode's ctime,
+            # which the re-check above catches, but renaming an ANCESTOR of
+            # one name does not touch the inode: the old path can then hold
+            # someone else's new file, which the staged rename would replace.
+            for path in filepaths[1:]:
+                try:
+                    s = os.stat(path, follow_symlinks=False)
+                except OSError:
+                    s = None
+                if s is None or (s.st_dev, s.st_ino) != (st.st_dev, st.st_ino):
+                    logging.error(
+                        f"Failed to replace {filepaths[0]} "
+                        f"(+ {len(filepaths) - 1} hardlink(s)): {path} no "
+                        f"longer holds the original inode")
+                    os.unlink(tmp_file)
+                    with stats._lock:
+                        stats.files_skipped_changed += 1
+                    return
 
             # The file's mtime is kept (copystat): archive_* and rsync key on
             # it. The parent directory's is not restored: os.utime() moves its
@@ -5664,22 +5708,28 @@ def _iter_listed_paths(src):
         sep = b"\0" if b"\0" in first else b"\n"
         logging.info("--paths-from %s: %s-delimited", src,
                      "NUL" if sep == b"\0" else "newline")
+
+        def _entry(raw):
+            # surrogateescape: a path the filesystem accepts is not always
+            # valid UTF-8, and refusing to process it would be worse than
+            # round-tripping the bytes. A NUL list (find -print0) is read
+            # byte-exact, so a name's own CR or LF survives and stays
+            # targetable; a newline list drops one trailing CR, for CRLF.
+            t = raw.decode("utf-8", "surrogateescape")
+            return t.removesuffix("\r") if sep == b"\n" else t
         buf = first
         while True:
             parts = buf.split(sep)
             buf = parts.pop()
             for raw in parts:
-                # surrogateescape: a path the filesystem accepts is not always
-                # valid UTF-8, and refusing to process it would be worse than
-                # round-tripping the bytes.
-                t = raw.decode("utf-8", "surrogateescape").strip("\r\n")
+                t = _entry(raw)
                 if t:
                     yield t
             chunk = fh.read(1 << 20)
             if not chunk:
                 break
             buf += chunk
-        t = buf.decode("utf-8", "surrogateescape").strip("\r\n")
+        t = _entry(buf)
         if t:
             yield t
     finally:
@@ -6167,6 +6217,7 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
     def _limit_reached():
         return args.max_files is not None and stats.files_submitted >= args.max_files
 
+    start_dev = os.stat(start_dir).st_dev
     for dirpath, dirnames, filenames in os.walk(start_dir, topdown=True):
         if do_exit.is_set() or _limit_reached():
             return
@@ -6183,6 +6234,27 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             logging.warning(f"Skipping {dirpath}: path is a mountpoint")
             del dirnames[:]
             continue
+        try:
+            dev = os.stat(dirpath).st_dev
+        except OSError:
+            del dirnames[:]
+            continue
+        if dev != start_dev:
+            # A mount that appeared here after the startup mountpoint
+            # snapshot. Its directories would inherit layouts walked up from
+            # OUR side of the boundary, aiming a foreign filesystem's files
+            # at this one's pool. An autofs root that expired and remounted
+            # mid-walk changes st_dev too, so the root is re-read before the
+            # subtree is pruned.
+            try:
+                start_dev = os.stat(start_dir).st_dev
+            except OSError:
+                pass
+            if dev != start_dev:
+                logging.warning(f"Skipping {dirpath}: on another filesystem "
+                                f"than {start_dir}")
+                del dirnames[:]
+                continue
         if dirpath == args.tmpdir:
             logging.info(f"Skipping {dirpath}: path is the temporary dir")
             del dirnames[:]
@@ -6479,11 +6551,13 @@ def cleanup_tmpdir(tmpdir):
     for entry in os.scandir(tmpdir):
         if entry.is_file(follow_symlinks=False):
             try:
-                # Both staging shapes: the bare UUID hex used by --stage-in-tmpdir,
-                # and the ".<hex>.vcephfs-tc-tmp" a sibling-staged run leaves if
-                # --tmpdir happens to sit inside the tree being walked.
+                # Only this tool's one temp shape, ".<hex>.vcephfs-tc-tmp".
+                # The bare-hex names older --stage-in-tmpdir runs used are no
+                # longer taken: uuid.UUID() also accepted any 32-hex name,
+                # which is an md5-named user file in a shared --tmpdir. An old
+                # bare-hex orphan is left for removal by hand.
                 if not TMP_RE.match(entry.name):
-                    uuid.UUID(entry.name)
+                    continue
                 if (now - entry.stat(follow_symlinks=False).st_ctime
                         < TMP_ORPHAN_MIN_AGE_S):
                     continue
@@ -6933,7 +7007,8 @@ def main():
     parser.add_argument(
         "--paths-from", metavar="FILE",
         help="Transcode exactly the files listed in FILE ('-' for stdin; NUL- "
-             "or newline-delimited) instead of walking. A path outside the "
+             "or newline-delimited; a NUL list is read byte-exact) instead of "
+             "walking. A path outside the "
              "given directories is refused, as is one reached through a "
              "symlinked directory under them or on another filesystem (the "
              "walk never follows a symlink either). Every path is re-checked, "
@@ -6973,7 +7048,7 @@ def main():
     )
     parser.add_argument(
         "--threads",
-        default=4,
+        default=THREADS_DEFAULT,
         type=int,
         help="Number of threads for data copying",
     )
@@ -6990,8 +7065,8 @@ def main():
         "--config",
         default=None,
         metavar="PATH",
-        help="key=value file of live tunables (file_delay_ms, threads, min_age_days, "
-             "min_size, prune_dir_regex), re-read when its mtime changes. Keep it on "
+        help="key=value file of live tunables, re-read when its mtime changes; "
+             "the example at the end of this help lists every key. Keep it on "
              "local disk, NOT in the CephFS volume: a stat there is an MDS round trip.",
     )
     parser.add_argument(
@@ -7281,6 +7356,9 @@ def main():
 
     if not args.dirs:
         parser.error("the following arguments are required: dirs")
+    for _d in args.dirs:
+        if not os.path.isdir(_d):
+            parser.error(f"not a directory: {_d}")
 
     try:
         validate_size_bounds(args.min_size, args.max_size)

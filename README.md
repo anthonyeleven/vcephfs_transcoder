@@ -71,7 +71,7 @@ pool on SSDs.
 
 **1. Create and attach the pool.** Run the setup script with `--skip-layout` on a
 host with the admin keyring where the volume is mounted at the `--mount` path:
-under `--execute` it checks that path with `ls -l` and stops if it is missing. It
+under `--execute` it checks that path is a mountpoint and stops if it is not. It
 is a dry run unless given `--execute`, and it prints every command it would run.
 
 ```
@@ -83,6 +83,12 @@ vcephfs-transcode-setup.sh --mount /mnt/myvol --ec-k 4 --ec-m 2 \
 It reuses or creates the profile `ec4.2ssd` and the rule `ec4.2-rule-ssd`, creates
 `cephfs.myvol.ec4.2.ssd.data` and adds it to the filesystem. With `--skip-layout`
 it touches no layout.
+
+The volume root must already carry an explicit layout naming its default pool
+(`getfattr -n ceph.dir.layout /shared/ceph/myvol`; if it shows none, set it:
+`setfattr -n ceph.dir.layout.pool -v cephfs.myvol.data /shared/ceph/myvol`,
+which changes where no file lands). With no explicit layout anywhere, the
+transcoder cannot resolve a directory's layout and refuses to start.
 
 **2. Write the job's config file**, on local disk, never inside CephFS:
 
@@ -106,10 +112,8 @@ regulate_slo_ms   = 15
 `min_size = 614400` keeps small files off EC. The regulator pauses the job while
 the volume's MDS reply latency is above `regulate_pause_ms`. Every key in the file
 is applied at startup, over the command line, and again whenever you change it.
-The same settings exist as options (`--min-age`, `--min-size`, `--threads`,
-`--file-delay`, `--regulate-prometheus-url`, `--regulate-query`,
-`--regulate-pause-ms`, `--regulate-slo-ms`); the file is the one you can edit
-while the job runs.
+The same settings exist as options; the file is the one you can edit while the
+job runs.
 
 **3. Try it, then run it.** The transcode host needs the volume mounted as a CephX
 user with the `p` cap, and runs as root. `--target-pool` removes its staging
@@ -152,9 +156,9 @@ once.
 
 A file whose directory layout reads back invalid (all zeros, `pool=-1`) is
 skipped and counted as `invalid layout`; in a walk, the directory's whole subtree
-is skipped and counted in the `(+N subtrees)` beside it. The next pass retries
-them. If the same paths are skipped pass after pass, look at the directory by
-hand (`getfattr -n ceph.dir.layout DIR`).
+is skipped and counted in the `(+N subtrees)` beside it. If the same paths are
+skipped pass after pass, look at the directory by hand
+(`getfattr -n ceph.dir.layout DIR`).
 
 **5. Add EC layouts on exception subtrees.** Where a subtree's new files are
 mostly large, point it at the EC pool so they land there directly:
@@ -198,7 +202,9 @@ Before the copy and again right before the swap, the transcoder reads its own
 client's caps on the file (`ceph.caps`). No `Fc` means another client has it open
 for write; `Fw` means a process on this host does. Either way the file is skipped
 and counted as "open for write elsewhere", and a later pass retries it. The
-mtime/ctime/size re-check before the swap catches a write during the copy. Neither
+mtime/ctime/size re-check before the swap catches a write during the copy; a
+writer that opens the path in the microseconds between that check and the rename
+is the one case both miss. Neither
 check sees a writer that keeps the file open and sits idle: the kernel client drops
 its wanted caps on an open file left idle for about a minute. When that writer
 writes again, it writes to the replaced, unlinked inode, and those writes never
@@ -211,16 +217,11 @@ transcoder says so once at startup and runs without the check.
 
 For special cases a first pass is unlikely to hit. `--help` describes each.
 
-Setup script:
-
-* `--replicated`: target a replicated pool (`cephfs.<vol>.rdata`) instead of EC.
-* `--ec-plugin`, `--fastec`, `--compression`, `--compression-algorithm`,
-  `--pg-autoscale-mode`: pool properties other than the defaults (isa, no FastEC,
-  aggressive snappy, autoscale off).
-* `--skip-pool-setup`: redo only the layout step.
-* `--subdir`, `--transcode`, `--min-age`, `--min-size`, `--log-file`, `--tmpdir`:
-  have the setup script launch the transcoder itself instead of launching it by
-  hand as above.
+Setup script: `--replicated` targets a replicated pool instead of EC;
+`--ec-plugin`, `--fastec`, `--compression`, `--compression-algorithm` and
+`--pg-autoscale-mode` change pool properties; `--skip-pool-setup` redoes only
+the layout step; `--subdir` with `--transcode` has it launch the transcoder
+itself. The generated help below glosses each.
 
 Transcoder:
 
@@ -245,7 +246,8 @@ Transcoder:
   `--regulate-quiet-ticks`, `--regulate-max-threads`, `--regulate-blind-resume-s`,
   `--regulate-blind-throttle-s`, `--regulate-blind-delay-ms`; `--no-regulate` runs
   unregulated on purpose.
-* Logs and limits: `--log-rotate-lines`, `--log-rotate-time`, `--max-files`,
+* Logs and limits: `--log-rotate-lines`, `--log-rotate-time`,
+  `--log-rotate-size`, `--max-files`,
   `--config-poll-seconds`, `--debug`, `--no-run-journal`.
 
 ## Full option reference
@@ -345,12 +347,13 @@ options:
                         the user of --target-pool's staging-removal session,
                         which otherwise is the mount's name=.
   --paths-from FILE     Transcode exactly the files listed in FILE ('-' for
-                        stdin; NUL- or newline-delimited) instead of walking.
-                        A path outside the given directories is refused, as is
-                        one reached through a symlinked directory under them
-                        or on another filesystem (the walk never follows a
-                        symlink either). Every path is re-checked, so a stale
-                        list is safe; multiply-linked files are declined.
+                        stdin; NUL- or newline-delimited; a NUL list is read
+                        byte-exact) instead of walking. A path outside the
+                        given directories is refused, as is one reached
+                        through a symlinked directory under them or on another
+                        filesystem (the walk never follows a symlink either).
+                        Every path is re-checked, so a stale list is safe;
+                        multiply-linked files are declined.
   --tmpdir TMPDIR       Temporary directory to which to copy files. Important:
                         This directory should have its layout set to the
                         *default* data pool for the FS, to avoid excess
@@ -372,11 +375,10 @@ options:
                         its target or, with --target-pool, in a staging
                         directory, which moves that directory's rctime, so the
                         run journal records that pin.
-  --config PATH         key=value file of live tunables (file_delay_ms,
-                        threads, min_age_days, min_size, prune_dir_regex), re-
-                        read when its mtime changes. Keep it on local disk,
-                        NOT in the CephFS volume: a stat there is an MDS round
-                        trip.
+  --config PATH         key=value file of live tunables, re-read when its
+                        mtime changes; the example at the end of this help
+                        lists every key. Keep it on local disk, NOT in the
+                        CephFS volume: a stat there is an MDS round trip.
   --print-config-example [VOLUME]
                         print a fully-populated --config file for VOLUME and
                         exit
@@ -591,7 +593,7 @@ example --config file (every key at its default):
     
     # Concurrent copies. Bounds the copier, not the walker. 0 pauses the job
     # (in-flight copies finish); set > 0 to resume.
-    threads         = 1
+    threads         = 4
     
     # --- how the delay signals move ---------------------------------------
     # SIGRTMIN multiplies the delay, SIGRTMIN+1 divides it. Separate rates
