@@ -4656,13 +4656,17 @@ def _replace_file(args, filepaths, st, layout, file_layout, touched,
             # belt-and-suspenders.
             signal.pthread_sigmask(signal.SIG_BLOCK, _EXIT_SIGNALS)
             st2 = os.stat(filepaths[0], follow_symlinks=False)
-            # Check mtime, ctime, and size for a more robust change-detection
+            # Check inode, mtime, ctime and size for a more robust
+            # change-detection
             if (
-                st2.st_mtime_ns != st.st_mtime_ns
+                (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino)
+                or st2.st_mtime_ns != st.st_mtime_ns
                 or st2.st_ctime_ns != st.st_ctime_ns
                 or st2.st_size != st.st_size
             ):
-                if st2.st_mtime_ns != st.st_mtime_ns:
+                if (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino):
+                    logging.error(f"... inode changed")
+                elif st2.st_mtime_ns != st.st_mtime_ns:
                     logging.error(f"... mtime changed")
                 elif st2.st_ctime_ns != st.st_ctime_ns:
                     logging.error(f"... ctime changed (metadata-only change?)")
@@ -6236,7 +6240,12 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             continue
         try:
             dev = os.stat(dirpath).st_dev
-        except OSError:
+        except OSError as e:
+            if e.errno in _VANISHED_ERRNOS:
+                logging.info(f"Skipping {dirpath}: no longer exists")
+            else:
+                logging.warning(f"Skipping {dirpath} and everything under "
+                                f"it: {e}")
             del dirnames[:]
             continue
         if dev != start_dev:
@@ -6829,8 +6838,11 @@ def _check_tmpdir_and_target(args):
 
     if layout is None:
         logging.error(
-            f"Could not determine layout for tmpdir {args.tmpdir}. Is this a CephFS mount?"
-        )
+            f"Could not determine layout for tmpdir {args.tmpdir}: no explicit "
+            f"ceph.dir.layout at or above it. Either this is not a CephFS "
+            f"mount, or no directory up to the volume root carries a layout "
+            f"-- set one on the root (setfattr -n ceph.dir.layout.pool -v "
+            f"<default pool> <mount root>) and run again.")
         sys.exit(1)
 
     logging.info(f"Temporary directory is {args.tmpdir} with pool {layout.pool}")

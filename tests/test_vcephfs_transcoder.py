@@ -3107,6 +3107,81 @@ class OrphanAgeIsCtime(unittest.TestCase):
         self.assertEqual([p for p in theirs if not os.path.exists(p)], [])
 
 
+class WalkPrunesForeignMounts(unittest.TestCase):
+    """A mount appearing under the walk after the startup snapshot is pruned
+    (its layouts would walk up OUR side of the boundary), and an autofs root
+    whose st_dev changed on a mid-walk remount is re-read, not pruned."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.sub = os.path.join(self.d, "sub")
+        os.mkdir(self.sub)
+        with open(os.path.join(self.sub, "f"), "wb") as fh:
+            fh.write(b"x")
+        self._stat = os.stat
+        self.addCleanup(setattr, os, "stat", self._stat)
+        self._saved = (vct.thread_count, vct.run_journal, vct.runtime_config)
+        vct.thread_count = vct.DynamicSemaphore(1)
+        vct.run_journal = vct.runtime_config = None
+        self.addCleanup(self._restore)
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def _restore(self):
+        (vct.thread_count, vct.run_journal, vct.runtime_config) = self._saved
+
+    def _walk(self, fake_stat):
+        os.stat = fake_stat
+        args = Args(dirs=[self.d], tmpdir="/nonexistent-tmp",
+                    stage_in_tmpdir=False, max_files=None, min_size=0,
+                    max_size=None, source_pool=None, target_pool=None,
+                    process_hardlinks=False, dry_run=True, prune_re=None,
+                    prune_small_subtrees=False)
+        saved_walk = vct.get_layout_walking_up
+        self.addCleanup(setattr, vct, "get_layout_walking_up", saved_walk)
+        vct.get_layout_walking_up = lambda d: vct.CephLayout(_L)
+        saved_from = vct.CephLayout.from_dir
+        self.addCleanup(setattr, vct.CephLayout, "from_dir", saved_from)
+        vct.CephLayout.from_dir = classmethod(lambda cls, d: vct.CephLayout(_L))
+
+        class _Exec:
+            def submit(self, fn, *a, **kw):
+                raise AssertionError("a file on the foreign mount was submitted")
+        vct.process_dir(args, self.d, {}, _Exec(), set(), {})
+
+    def test_a_mount_appearing_mid_walk_is_pruned(self):
+        real = self._stat
+
+        def fake(path, **kw):
+            r = real(path, **kw)
+            if path == self.sub:
+                return os.stat_result(
+                    (r.st_mode, r.st_ino, r.st_dev + 1, r.st_nlink, r.st_uid,
+                     r.st_gid, r.st_size, r.st_atime, r.st_mtime, r.st_ctime))
+            return r
+        with self.assertLogs(level="WARNING") as logs:
+            self._walk(fake)
+        self.assertIn("on another filesystem", "\n".join(logs.output))
+
+    def test_an_autofs_remount_is_rescanned_not_pruned(self):
+        real = self._stat
+        shift = {"on": False}
+
+        def fake(path, **kw):
+            r = real(path, **kw)
+            if shift["on"] or path == self.sub:
+                shift["on"] = True        # from the subdir on, a new st_dev
+                return os.stat_result(
+                    (r.st_mode, r.st_ino, r.st_dev + 1, r.st_nlink, r.st_uid,
+                     r.st_gid, r.st_size, r.st_atime, r.st_mtime, r.st_ctime))
+            return r
+        # The re-stat of the root sees the same new device, so nothing is
+        # pruned and the walk reaches the file (skipped as a non-candidate,
+        # not refused as foreign).
+        before = vct.stats.files_outside_root
+        self._walk(fake)
+        self.assertEqual(vct.stats.files_outside_root, before)
+
+
 class FileDelayWakes(unittest.TestCase):
     """time.sleep(file_delay) could not be interrupted, so at DELAY_MAX_MS an
     exit, or a --config edit lowering the delay, waited up to 10 minutes."""

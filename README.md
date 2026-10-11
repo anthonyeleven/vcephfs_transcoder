@@ -203,8 +203,8 @@ client's caps on the file (`ceph.caps`). No `Fc` means another client has it ope
 for write; `Fw` means a process on this host does. Either way the file is skipped
 and counted as "open for write elsewhere", and a later pass retries it. The
 mtime/ctime/size re-check before the swap catches a write during the copy; a
-writer that opens the path in the microseconds between that check and the rename
-is the one case both miss. Neither
+writer that opens the path between that check and the rename -- a window a few
+MDS round trips wide -- is missed. Neither
 check sees a writer that keeps the file open and sits idle: the kernel client drops
 its wanted caps on an open file left idle for about a minute. When that writer
 writes again, it writes to the replaced, unlinked inode, and those writes never
