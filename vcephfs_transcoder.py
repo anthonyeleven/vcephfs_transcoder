@@ -12,7 +12,7 @@ import os, re, stat, time, signal, shutil, logging, sys, fcntl, dataclasses
 from concurrent.futures import ThreadPoolExecutor
 import threading, uuid, argparse, heapq, tempfile, hashlib, select, subprocess
 
-_VERSION = "2112"
+_VERSION = "1999"
 
 # Replacing a file must be serialized against another worker replacing the
 # SAME file -- that is the only invariant here. A single global lock would
@@ -4514,10 +4514,32 @@ def process_file(args, filepaths, st, layout, file_layout, stage=False):
         logging.warning(f"Skipping {filepaths[0]}: {e}")
         with stats._lock:
             stats.files_skipped_layout_invalid += 1
+    except OSError as e:
+        # The file, or its directory, was deleted after the copy began; the
+        # temp went with it, or _replace_file already removed it. Only when
+        # every name of the source is confirmed gone: a temp that vanished
+        # under a file that is still there is somebody else's cleanup, and
+        # that stays an error.
+        if e.errno not in _VANISHED_ERRNOS or not all(
+                _path_gone(p) for p in filepaths):
+            raise
+        with stats._lock:
+            stats.files_vanished += 1
+        logging.info("Skipping %s: no longer exists", filepaths[0])
     finally:
         if run_journal is not None:
             for path in touched:
                 run_journal.note_write(path)
+
+
+def _path_gone(path):
+    """True only when lstat confirms path is absent. Any other failure (EIO,
+    EACCES, a timeout in an MDS hiccup) is not a confirmation."""
+    try:
+        os.lstat(path)
+    except OSError as e:
+        return e.errno in _VANISHED_ERRNOS
+    return False
 
 
 def _exdev_restage(err, stage_dir, target, layout):
