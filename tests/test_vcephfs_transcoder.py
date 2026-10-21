@@ -2553,6 +2553,140 @@ class HardlinkStagingOrder(unittest.TestCase):
         self.assertEqual([n for d in (self.d, sub) for n in os.listdir(d)
                           if vct.TMP_SUFFIX in n], [], "temp left behind")
 
+    def test_a_file_deleted_after_the_copy_began_is_vanished(self):
+        """ENOENT on the temp (a directory removed under the copy) with the
+        source gone is a vanished file, not a worker error that stops a chain."""
+        a = os.path.join(self.d, "a")
+        with open(a, "wb") as f:
+            f.write(b"payload" * 100)
+        st = os.lstat(a)
+
+        def chown_after_delete(path, *args, **kw):
+            os.unlink(a)
+            os.unlink(path)
+            raise FileNotFoundError(2, "No such file or directory", path)
+        os.chown = chown_after_delete
+        before = vct.stats.files_vanished
+        vct.process_file(self._args(), [a], st, self._Layout(), self._Layout())
+        self.assertEqual(vct.stats.files_vanished, before + 1)
+        self.assertEqual(os.listdir(self.d), [], "temp left behind")
+
+    def test_a_temp_that_vanished_under_a_live_file_is_still_an_error(self):
+        a = os.path.join(self.d, "a")
+        with open(a, "wb") as f:
+            f.write(b"payload" * 100)
+        st = os.lstat(a)
+
+        def chown_after_reaped(path, *args, **kw):
+            os.unlink(path)
+            raise FileNotFoundError(2, "No such file or directory", path)
+        os.chown = chown_after_reaped
+        before = vct.stats.files_vanished
+        with self.assertRaises(FileNotFoundError):
+            vct.process_file(self._args(), [a], st, self._Layout(),
+                             self._Layout())
+        self.assertEqual(vct.stats.files_vanished, before)
+
+    def test_another_error_with_the_source_gone_is_still_an_error(self):
+        a = os.path.join(self.d, "a")
+        with open(a, "wb") as f:
+            f.write(b"payload" * 100)
+        st = os.lstat(a)
+
+        def chown_eio(path, *args, **kw):
+            os.unlink(a)
+            raise OSError(errno.EIO, "Input/output error", path)
+        os.chown = chown_eio
+        before = vct.stats.files_vanished
+        with self.assertRaises(OSError):
+            vct.process_file(self._args(), [a], st, self._Layout(),
+                             self._Layout())
+        self.assertEqual(vct.stats.files_vanished, before)
+        self.assertEqual(os.listdir(self.d), [], "temp left behind")
+
+    def test_a_surviving_temp_is_removed_when_the_source_vanished(self):
+        """The stub leaves the temp in place: the cleanup is _replace_file's."""
+        a = os.path.join(self.d, "a")
+        with open(a, "wb") as f:
+            f.write(b"payload" * 100)
+        st = os.lstat(a)
+
+        def chown_source_gone(path, *args, **kw):
+            os.unlink(a)
+            raise FileNotFoundError(2, "No such file or directory", path)
+        os.chown = chown_source_gone
+        before = vct.stats.files_vanished
+        vct.process_file(self._args(), [a], st, self._Layout(), self._Layout())
+        self.assertEqual(vct.stats.files_vanished, before + 1)
+        self.assertEqual(os.listdir(self.d), [], "temp left behind")
+
+    def test_a_source_deleted_before_the_rename_is_vanished(self):
+        """The re-stat under the replace lock is the other place the source
+        can vanish between the copy and the swap."""
+        a = os.path.join(self.d, "a")
+        with open(a, "wb") as f:
+            f.write(b"payload" * 100)
+        st = os.lstat(a)
+        copied = []
+        real_copystat = shutil.copystat
+
+        def copystat_then_delete(src, dst, **kw):
+            real_copystat(src, dst, **kw)
+            os.unlink(src)
+            copied.append(dst)
+        shutil.copystat = copystat_then_delete
+        self.addCleanup(setattr, shutil, "copystat", real_copystat)
+        before = vct.stats.files_vanished
+        vct.process_file(self._args(), [a], st, self._Layout(), self._Layout())
+        self.assertTrue(copied, "the copy never ran")
+        self.assertEqual(vct.stats.files_vanished, before + 1)
+        self.assertEqual(os.listdir(self.d), [], "temp left behind")
+
+    def test_a_hardlink_set_with_a_surviving_name_is_still_an_error(self):
+        a = os.path.join(self.d, "a")
+        with open(a, "wb") as f:
+            f.write(b"payload" * 100)
+        sub = os.path.join(self.d, "sub")
+        os.mkdir(sub)
+        b = os.path.join(sub, "b")
+        os.link(a, b)
+        st = os.lstat(a)
+
+        def chown_first_name_gone(path, *args, **kw):
+            os.unlink(a)
+            raise FileNotFoundError(2, "No such file or directory", path)
+        os.chown = chown_first_name_gone
+        before = vct.stats.files_vanished
+        with self.assertRaises(FileNotFoundError):
+            vct.process_file(self._args(), [a, b], st, self._Layout(),
+                             self._Layout())
+        self.assertEqual(vct.stats.files_vanished, before)
+        self.assertTrue(os.path.exists(b), "the live name was lost")
+
+    def test_a_recheck_that_fails_is_not_a_confirmed_absence(self):
+        a = os.path.join(self.d, "a")
+        with open(a, "wb") as f:
+            f.write(b"payload" * 100)
+        st = os.lstat(a)
+
+        def chown_gone(path, *args, **kw):
+            os.unlink(a)
+            raise FileNotFoundError(2, "No such file or directory", path)
+        os.chown = chown_gone
+        real_lstat = os.lstat
+
+        def flaky_lstat(p, *args, **kw):
+            if p == a:
+                raise OSError(errno.EIO, "Input/output error", p)
+            return real_lstat(p, *args, **kw)
+        os.lstat = flaky_lstat
+        self.addCleanup(setattr, os, "lstat", real_lstat)
+        before = vct.stats.files_vanished
+        with self.assertRaises(FileNotFoundError):
+            vct.process_file(self._args(), [a], st, self._Layout(),
+                             self._Layout())
+        self.assertEqual(vct.stats.files_vanished, before)
+
     def test_a_failed_link_renames_nothing(self):
         paths = self._three_links()
         st = os.lstat(paths[0])
@@ -4568,6 +4702,21 @@ class JobStagedReplace(_ProcessFileHarness):
         self.assertEqual(os.listdir(self._stage_dir()), [])
         self.assertEqual(sorted(os.listdir(self.art)),
                          sorted([vct.RETENTION_MARKER, "data.parquet"]))
+
+    def test_a_staged_copy_whose_directory_is_deleted_is_vanished(self):
+        """The temp is in the staging directory, so deleting the file's
+        directory leaves it behind: the vanished path must still remove it."""
+        real = vct._copy_file_data
+
+        def copy_then_rmdir(*a):
+            out = real(*a)
+            shutil.rmtree(self.art)
+            return out
+        vct._copy_file_data = copy_then_rmdir
+        before = vct.stats.files_vanished
+        self._staged()
+        self.assertEqual(vct.stats.files_vanished, before + 1)
+        self.assertEqual(os.listdir(self._stage_dir()), [], "temp left behind")
 
     def test_a_staged_dry_run_leaves_the_files_directory_alone(self):
         """The temp is not in the file's directory, so nothing there changes
