@@ -188,6 +188,27 @@ class PruneBudget(unittest.TestCase):
         self.assertEqual(st.bytes_pruned, 1024)
 
 
+class ProgressTimer(unittest.TestCase):
+    """Progress is timed across the run, so many short directories still log."""
+
+    def _run(self, seconds):
+        st = vct.Stats()
+        now = [1000.0]
+        with unittest.mock.patch.object(vct.time, "monotonic", lambda: now[0]), \
+                unittest.mock.patch.object(st, "log_progress") as logged:
+            st._last_progress = now[0]
+            for _ in range(seconds):  # one call per 1-second directory
+                now[0] += 1
+                st.log_progress_if_due()
+        return logged.call_count
+
+    def test_logs_once_per_minute(self):
+        self.assertEqual(self._run(130), 2)
+
+    def test_quiet_inside_the_first_minute(self):
+        self.assertEqual(self._run(59), 0)
+
+
 class RuntimeConfigKeys(unittest.TestCase):
     def test_prune_keys_present(self):
         for k in ("prune_subtree_max_bytes", "prune_budget_bytes"):
@@ -4225,6 +4246,348 @@ class PathsFromPoolSweep(unittest.TestCase):
         self.assertIsNone(vct.write_target_refusal(
             Args(target_pool=None, max_size=None), "P", "/r", "Q"))
 
+    def test_a_size_split_sweeps_one_band_out(self):
+        with self.assertLogs(level="INFO"):
+            self.assertIsNone(vct.write_target_refusal(
+                Args(target_pool=None, max_size=None, small_pool="R"),
+                "P", "/r", "P"))
+        with self.assertLogs(level="INFO"):
+            self.assertIsNone(vct.write_target_refusal(
+                Args(target_pool=None, max_size=None, small_pool="P",
+                     large_pool="E"), "P", "/r", "P"))
+
+    def test_a_size_split_moving_both_bands_out_is_refused(self):
+        # Every file leaves while the root keeps writing new ones there.
+        self.assertIsNotNone(vct.write_target_refusal(
+            Args(target_pool=None, max_size=None, small_pool="R",
+                 large_pool="E"), "P", "/r", "P"))
+
+    def test_a_size_split_into_the_same_pool_is_still_refused(self):
+        self.assertIsNotNone(vct.write_target_refusal(
+            Args(target_pool=None, max_size=None, large_pool="P"),
+            "P", "/r", "P"))
+
+
+_REP = "cephfs.v.data"
+_QLC = "cephfs.v.ec4.2.qlc.data"
+_BIG = vct.YIELD_FLOOR_BYTES
+
+
+class SizeSplitLayout(unittest.TestCase):
+    """--small-pool/--large-pool pick the pool by size, one file at a time; a
+    side left unset keeps the directory's pool, under a root on either tier."""
+
+    def test_small_pool_under_an_ec_root(self):
+        d = vct.CephLayout(_L)
+        a = Args(small_pool=_REP, split_size=_BIG)
+        self.assertEqual(vct.target_layout(a, d, _BIG - 1).pool, _REP)
+        self.assertIs(vct.target_layout(a, d, _BIG), d,
+                      "a file at the split went to --small-pool")
+
+    def test_large_pool_under_a_replicated_root(self):
+        d = vct.CephLayout(_TGT)
+        a = Args(large_pool=_QLC, split_size=_BIG)
+        self.assertIs(vct.target_layout(a, d, 1000), d)
+        self.assertEqual(vct.target_layout(a, d, _BIG).pool, _QLC)
+        self.assertEqual(vct.target_layout(a, d, 10 << 30).pool, _QLC)
+
+    def test_both_sides_under_a_third_pool(self):
+        d = vct.CephLayout(_L.replace(_QLC, "cephfs.v.ec6.3.ssd.data"))
+        a = Args(small_pool=_REP, large_pool=_QLC, split_size=_BIG)
+        self.assertEqual(vct.target_layout(a, d, 0).pool, _REP)
+        self.assertEqual(vct.target_layout(a, d, _BIG).pool, _QLC)
+
+    def test_only_the_pool_changes(self):
+        d = vct.CephLayout(_L)
+        t = vct.target_layout(Args(small_pool=_REP, split_size=_BIG), d, 1)
+        self.assertEqual((t.stripe_unit, t.stripe_count, t.object_size),
+                         (d.stripe_unit, d.stripe_count, d.object_size))
+
+    def test_without_a_size_it_is_the_directory(self):
+        d = vct.CephLayout(_L)
+        self.assertIs(vct.target_layout(Args(small_pool=_REP, large_pool=_QLC,
+                                             split_size=_BIG), d), d)
+
+    def test_another_split(self):
+        d = vct.CephLayout(_L)
+        a = Args(small_pool=_REP, split_size=4096)
+        self.assertEqual(vct.target_layout(a, d, 4095).pool, _REP)
+        self.assertIs(vct.target_layout(a, d, 4096), d)
+
+    def test_target_pool_ignores_the_size(self):
+        d = vct.CephLayout(_L)
+        for size in (None, 0, _BIG, 10 << 30):
+            self.assertEqual(
+                vct.target_layout(Args(target_pool=_REP), d, size).pool, _REP)
+            self.assertIs(vct.target_layout(Args(), d, size), d)
+
+    def test_staging_pools(self):
+        self.assertEqual(vct.staging_pools(Args()), [])
+        self.assertEqual(vct.staging_pools(Args(target_pool=_REP)), [_REP])
+        self.assertEqual(vct.staging_pools(Args(small_pool=_REP, large_pool=_QLC)),
+                         [_REP, _QLC])
+        self.assertEqual(vct.staging_pools(Args(target_pool=_REP,
+                                                stage_in_tmpdir=True)), [])
+
+
+class SizeSplitGates(unittest.TestCase):
+    """A split run is never also a --target-pool run. Any two pools may take
+    the bands; files below the yield floor go only to the first data pool, and
+    a band left empty is refused."""
+
+    def _args(self, **kw):
+        a = dict(small_pool=None, large_pool=None, split_size=None,
+                 target_pool=None, stage_in_tmpdir=False, min_size=0,
+                 max_size=None, small_kind=None, large_kind=None,
+                 small_floor=None, large_floor=None, small_first=False,
+                 large_first=False, first_pool=None)
+        a.update(kw)
+        return Args(**a)
+
+    def test_no_split_is_left_alone(self):
+        a = self._args()
+        vct.validate_size_split(a)
+        self.assertIsNone(a.split_size)
+
+    def test_the_split_defaults_to_the_yield_floor(self):
+        a = self._args(small_pool=_REP)
+        vct.validate_size_split(a)
+        self.assertEqual(a.split_size, _BIG)
+
+    def test_combinations_refused(self):
+        for kw in (dict(split_size=4096),
+                   dict(small_files_to_any_pool=True),
+                   dict(small_pool=_REP, target_pool=_REP),
+                   dict(large_pool=_QLC, target_pool=_QLC),
+                   dict(small_pool=_REP, stage_in_tmpdir=True),
+                   dict(small_pool=_REP, large_pool=_REP),
+                   dict(large_pool=_QLC, split_size=0)):
+            with self.assertRaises(ValueError, msg=str(kw)):
+                vct.validate_size_split(self._args(**kw))
+
+    def test_below_the_yield_floor_only_the_first_pool(self):
+        r = vct.size_split_refusal
+        self.assertIsNone(r(self._args(small_pool=_REP, small_first=True,
+                                       split_size=_BIG)))
+        self.assertIsNone(r(self._args(small_pool=_REP, small_first=True,
+                                       split_size=4096)))
+        self.assertIn("first data pool",
+                      r(self._args(small_pool="cephfs.v.hdd.data",
+                                   split_size=_BIG)),
+                      "small files sent to a replicated pool that is not the first")
+        self.assertIsNotNone(r(self._args(small_pool=_QLC, split_size=_BIG)),
+                             "small files sent to EC")
+        self.assertIsNotNone(r(self._args(large_pool=_QLC, split_size=_BIG - 1)),
+                             "the large band reaches below the yield floor")
+
+    def test_small_files_to_any_pool(self):
+        # Allowed below the yield floor, with the cost named at startup.
+        r, w = vct.size_split_refusal, vct.size_split_warnings
+        for kw in (dict(small_pool=_QLC), dict(small_pool="cephfs.v.hdd.data"),
+                   dict(large_pool=_QLC, split_size=4096),
+                   dict(small_pool=_REP, small_first=None)):
+            a = self._args(small_files_to_any_pool=True, **kw)
+            self.assertIsNone(r(a), msg=str(kw))
+            self.assertIn("costs objects in both", " ".join(w(a)), msg=str(kw))
+        # The first pool itself draws no warning.
+        self.assertEqual(w(self._args(small_files_to_any_pool=True,
+                                      small_pool=_REP, small_first=True)), [])
+
+    def test_any_pool_above_the_yield_floor(self):
+        r = vct.size_split_refusal
+        # Two replicated pools on different media, and two EC profiles.
+        self.assertIsNone(r(self._args(small_pool=_REP, small_first=True,
+                                       large_pool="cephfs.v.hdd.data",
+                                       split_size=_BIG)))
+        self.assertIsNone(r(self._args(small_pool="cephfs.v.ec4.2.ssd.data",
+                                       large_pool="cephfs.v.ec8.2.hdd.data",
+                                       min_size=_BIG, split_size=16 << 20)))
+
+    def test_an_empty_band_is_refused(self):
+        r = vct.size_split_refusal
+        self.assertIn("takes no files",
+                      r(self._args(small_pool=_REP, small_first=True,
+                                   min_size=_BIG, split_size=_BIG)))
+        self.assertIn("takes no files",
+                      r(self._args(large_pool=_QLC, max_size=_BIG - 1,
+                                   split_size=_BIG)))
+        self.assertIsNone(r(self._args(small_pool=_REP, small_first=True,
+                                       min_size=512000, split_size=_BIG)))
+
+    def test_bands(self):
+        self.assertEqual(
+            vct.split_bands(self._args(small_pool=_REP, large_pool=_QLC,
+                                       min_size=4096, max_size=1 << 30,
+                                       split_size=_BIG)),
+            [("small", _REP, 4096, _BIG), ("large", _QLC, _BIG, (1 << 30) + 1)])
+
+    def test_an_ec_band_below_its_floor_is_an_advisory(self):
+        w = vct.size_split_warnings
+        self.assertEqual(w(self._args(large_pool=_QLC, large_floor=_BIG,
+                                      split_size=_BIG)), [])
+        msgs = w(self._args(large_pool=_QLC, large_floor=_BIG + 4096,
+                            split_size=_BIG))
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("cost more raw space", msgs[0])
+        self.assertIsNone(vct.size_split_refusal(
+            self._args(large_pool=_QLC, large_floor=_BIG + 4096, split_size=_BIG)))
+
+
+class SizeSplitStartup(unittest.TestCase):
+    """Each side's kind and floor are decided at startup, from the cluster when
+    the ceph CLI answers, else by name; its first-data-pool status only from
+    the cluster."""
+
+    def setUp(self):
+        self._saved = (vct._pool_scheme, vct.get_layout_walking_up, vct.caps_check,
+                       vct.first_data_pools, vct._mds_namespace_for)
+        vct._pool_scheme = lambda pool: None
+        vct.first_data_pools = lambda: None
+        vct._mds_namespace_for = lambda d: None
+        vct.get_layout_walking_up = lambda d: vct.CephLayout(_L)
+
+    def tearDown(self):
+        (vct._pool_scheme, vct.get_layout_walking_up, vct.caps_check,
+         vct.first_data_pools, vct._mds_namespace_for) = self._saved
+
+    def _args(self, **kw):
+        a = dict(tmpdir="/v/tmp", dirs=["/v"], target_pool=None,
+                 target_pool_kind=None, source_pool=None, stage_in_tmpdir=False,
+                 force_tmpdir_pool=False, min_size=0, max_size=None,
+                 small_pool=None, large_pool=None, split_size=_BIG)
+        a.update(kw)
+        return Args(**a)
+
+    def _check(self, args):
+        with self.assertLogs(level="INFO") as logs:
+            vct._check_tmpdir_and_target(args)
+        return "\n".join(logs.output)
+
+    def test_kinds_and_floor(self):
+        vct.first_data_pools = lambda: {"v": _REP}
+        vct._mds_namespace_for = lambda d: "v"
+        a = self._args(small_pool=_REP, large_pool=_QLC)
+        out = self._check(a)
+        self.assertEqual((a.small_kind, a.large_kind, a.large_floor),
+                         ("rep", "ec", _BIG))
+        self.assertEqual((a.small_first, a.large_first), (True, False))
+        self.assertIn("--small-pool %s: replicated" % _REP, out)
+        self.assertIn("--large-pool %s: EC" % _QLC, out)
+        self.assertIsNone(vct.size_split_refusal(a))
+
+    def test_without_the_cluster_no_pool_is_first(self):
+        # cephfs.v.data reads like a first pool, but the volume may have
+        # cephfs.v.rdata too, and the name cannot say which one is first.
+        a = self._args(small_pool=_REP)
+        self.assertIn("unknown if it is the first data pool", self._check(a))
+        self.assertIsNone(a.small_first)
+        self.assertIn("--rados-name", vct.size_split_refusal(a))
+        # A band above the yield floor needs no answer.
+        a = self._args(large_pool=_QLC)
+        self._check(a)
+        self.assertIsNone(vct.size_split_refusal(a))
+
+    def test_an_ec_small_pool_is_refused_after_startup(self):
+        a = self._args(small_pool=_QLC)
+        self._check(a)
+        self.assertIn("first data pool", vct.size_split_refusal(a))
+
+    def test_an_unreadable_name(self):
+        # Allowed above the yield floor, where the kind decides nothing...
+        a = self._args(large_pool="fastpool")
+        self.assertIn("kind unknown", self._check(a))
+        self.assertIsNone(vct.size_split_refusal(a))
+        # ...but never as the first data pool.
+        a = self._args(small_pool="fastpool")
+        self._check(a)
+        self.assertIn("first data pool", vct.size_split_refusal(a))
+
+    def test_the_cluster_names_the_first_pool(self):
+        vct.first_data_pools = lambda: {"v": "cephfs.v.rdata", "w": "cephfs.w.data"}
+        vct._mds_namespace_for = lambda d: "v"
+        a = self._args(small_pool=_REP)
+        out = self._check(a)
+        self.assertFalse(a.small_first, "cephfs.v.data is not v's first pool")
+        self.assertIn("cluster: v -> cephfs.v.rdata", out)
+        self.assertIn("(cephfs.v.rdata)", vct.size_split_refusal(a))
+        a = self._args(small_pool="cephfs.v.rdata")
+        self._check(a)
+        self.assertTrue(a.small_first)
+        self.assertIsNone(vct.size_split_refusal(a))
+
+    def test_small_files_left_on_a_replicated_root_draw_no_advisory(self):
+        vct._pool_scheme = lambda pool: (("ec", 4, 2, 4096) if ".ec" in pool
+                                         else ("rep", 3))
+        saved = vct._min_alloc_hint
+        self.addCleanup(setattr, vct, "_min_alloc_hint", saved)
+        vct._min_alloc_hint = lambda: 4096
+        vct.get_layout_walking_up = lambda d: vct.CephLayout(_TGT)
+        out = self._check(self._args(large_pool=_QLC,
+                                     source_pool="cephfs.v.ec6.3.ssd.data"))
+        self.assertNotIn("crossover", out)
+        self.assertNotIn("never saves space", out)
+
+
+class CephCliUsesTheRunsCluster(unittest.TestCase):
+    """The startup ceph CLI checks run with the --rados-* conffile, name and
+    keyring: the transcode hosts have only per-cluster files in /etc/ceph."""
+
+    def tearDown(self):
+        vct.set_ceph_cli(Args())
+
+    def test_flags(self):
+        vct.set_ceph_cli(Args())
+        self.assertEqual(vct.CEPH_CLI, ["ceph"])
+        vct.set_ceph_cli(Args(rados_conffile="/etc/ceph/c1.conf",
+                              rados_name="client.cephfsadmin",
+                              rados_keyring="/etc/ceph/c1.keyring"))
+        self.assertEqual(vct.CEPH_CLI, ["ceph", "-c", "/etc/ceph/c1.conf", "-n",
+                                        "client.cephfsadmin", "-k",
+                                        "/etc/ceph/c1.keyring"])
+
+    def test_without_flags_the_mounts_identity(self):
+        saved = (vct._ceph_mount_for, vct.RemovalSession._identity)
+        self.addCleanup(setattr, vct, "_ceph_mount_for", saved[0])
+        self.addCleanup(setattr, vct.RemovalSession, "_identity", saved[1])
+        seen = []
+        vct._ceph_mount_for = lambda p: ("/", "m:/v", {"name": "cephfs"})
+        vct.RemovalSession._identity = staticmethod(
+            lambda args, root, opts, src: seen.append((root, opts, src)) or (
+                "/etc/ceph/c1.conf", {"keyring": "/etc/ceph/c1.client.cephfs.keyring"},
+                "client.cephfs"))
+        vct.set_ceph_cli(Args(dirs=["/"]))
+        self.assertEqual(vct.CEPH_CLI, ["ceph", "-c", "/etc/ceph/c1.conf", "-n",
+                                        "client.cephfs", "-k",
+                                        "/etc/ceph/c1.client.cephfs.keyring"])
+        self.assertEqual(seen, [("/", {"name": "cephfs"}, "m:/v")])
+        # No way to the cluster: the flags there are.
+        for exc in (ValueError("no keyring"), SystemExit("no conf")):
+            vct.RemovalSession._identity = staticmethod(
+                lambda *a, e=exc: (_ for _ in ()).throw(e))
+            vct.set_ceph_cli(Args(dirs=["/"], rados_conffile="/c"))
+            self.assertEqual(vct.CEPH_CLI, ["ceph", "-c", "/c"])
+
+    def test_with_flags_the_sessions_cluster(self):
+        # --rados-name with --rados-keyring, found the way the session finds
+        # its cluster: --rados-mon-host, then --rados-conffile.
+        saved = vct._ceph_mount_for
+        self.addCleanup(setattr, vct, "_ceph_mount_for", saved)
+        vct._ceph_mount_for = lambda p: None
+        flags = dict(dirs=["/"], rados_name="client.a", rados_keyring="/k",
+                     rados_conffile=None, rados_mon_host=None)
+        vct.set_ceph_cli(Args(**dict(flags, rados_mon_host="10.0.0.1:6789")))
+        self.assertEqual(vct.CEPH_CLI, ["ceph", "-c", "/dev/null", "-m",
+                                        "10.0.0.1:6789", "-n", "client.a",
+                                        "-k", "/k"])
+        vct.set_ceph_cli(Args(**dict(flags, rados_conffile="/c")))
+        self.assertEqual(vct.CEPH_CLI, ["ceph", "-c", "/c", "-n", "client.a",
+                                        "-k", "/k"])
+
+    def test_no_cli_reads_as_none(self):
+        vct.set_ceph_cli(Args(rados_conffile="/nonexistent/x.conf"))
+        self.assertIsNone(vct.first_data_pools())
+        self.assertIsNone(vct._pool_scheme("cephfs.v.data"))
+
 
 _TGT = _L.replace("cephfs.v.ec4.2.qlc.data", "cephfs.v.data")
 _FAKE_CEPHFS = r"""
@@ -5141,10 +5504,9 @@ class _FakeRemovalSession:
         self.closed = True
 
 
-class StagingOnlyWithTargetPool(unittest.TestCase):
-    """Without --target-pool nothing is staged: the regular replicated -> EC
-    path stays exactly what it was. With it, only files whose directory points
-    elsewhere are."""
+class _StagingFixture:
+    """A temp directory with one small file, and the module state a walk or a
+    path list touches, for the staging tests."""
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
@@ -5194,6 +5556,13 @@ class StagingOnlyWithTargetPool(unittest.TestCase):
         ex = _FakeExecutor()
         vct.process_dir(args, self.d, {}, ex, set(), {})
         return ex.calls
+
+
+
+class StagingOnlyWithTargetPool(_StagingFixture, unittest.TestCase):
+    """Without --target-pool nothing is staged: the regular replicated -> EC
+    path stays exactly what it was. With it, only files whose directory points
+    elsewhere are."""
 
     def test_no_target_pool_never_stages(self):
         vct.staging = None
@@ -5290,6 +5659,69 @@ class StagingOnlyWithTargetPool(unittest.TestCase):
             vct.process_paths(self._args(), {}, ex, {}, [self.d])
         self.assertEqual([c[1][0] for c in ex.calls], [self.f])
         self.assertTrue(any("inside a staging directory" in m for m in cm.output))
+
+
+class SizeSplitStaging(_StagingFixture, unittest.TestCase):
+    """One run, both bands: each file goes to the pool its size picks, staged
+    only when its directory points elsewhere, under a root on either tier."""
+
+    def setUp(self):
+        super().setUp()
+        self.big = os.path.join(self.d, "g")
+        with open(self.big, "wb") as fh:
+            fh.write(b"x" * (_BIG + 1000))
+        old = time.time() - 30 * 86400
+        os.utime(self.big, (old, old))
+        vct.staging = vct.JobStaging("c" * 16, self.d)
+
+    def _paths(self, args):
+        ex = _FakeExecutor()
+        vct._path_source = lambda a, r: iter([self.f, self.big])
+        vct.process_paths(args, {}, ex, {}, [self.d])
+        return ex.calls
+
+    def _by_name(self, calls):
+        return {os.path.basename(c[1][0]): (c[3].pool, c[5], len(c[1]))
+                for c in calls}
+
+    def test_small_pool_under_an_ec_root(self):
+        for run in (self._paths, self._walk):
+            got = self._by_name(run(self._args(small_pool=_REP, split_size=_BIG)))
+            self.assertEqual(got, {"f": (_REP, True, 1), "g": (_QLC, False, 1)},
+                             run.__name__)
+
+    def test_large_pool_under_a_replicated_root(self):
+        self.dir_layout = vct.CephLayout(_TGT)
+        for run in (self._paths, self._walk):
+            got = self._by_name(run(self._args(large_pool=_QLC, split_size=_BIG)))
+            self.assertEqual(got, {"f": (_REP, False, 1), "g": (_QLC, True, 1)},
+                             run.__name__)
+
+    def test_both_sides_under_a_third_pool(self):
+        self.dir_layout = vct.CephLayout(_L.replace(_QLC, "cephfs.v.ec8.2.hdd.data"))
+        for run in (self._paths, self._walk):
+            got = self._by_name(run(self._args(small_pool=_REP, large_pool=_QLC,
+                                               split_size=_BIG)))
+            self.assertEqual(got, {"f": (_REP, True, 1), "g": (_QLC, True, 1)},
+                             run.__name__)
+
+    def test_files_already_in_their_pool_are_matched(self):
+        there = {self.f: vct.CephLayout(_TGT), self.big: vct.CephLayout(_L)}
+        vct.CephLayout.from_file = classmethod(lambda cls, p: there[p])
+        for run in (self._paths, self._walk):
+            self.assertEqual(run(self._args(small_pool=_REP, split_size=_BIG)), [],
+                             run.__name__)
+
+    def test_a_hard_link_set_is_one_decision(self):
+        os.link(self.big, os.path.join(self.d, "g2"))
+        os.link(self.f, os.path.join(self.d, "f2"))
+        calls = self._walk(self._args(small_pool=_REP, split_size=_BIG,
+                                      process_hardlinks=True))
+        self.assertEqual(len(calls), 2)
+        got = {frozenset(map(os.path.basename, c[1])): (c[3].pool, c[5])
+               for c in calls}
+        self.assertEqual(got, {frozenset({"f", "f2"}): (_REP, True),
+                               frozenset({"g", "g2"}): (_QLC, False)})
 
 
 class ListedPathsStayOnTheVolume(unittest.TestCase):
@@ -6909,6 +7341,32 @@ class RemovalThroughASecondSession(unittest.TestCase):
         self.assertEqual(cm.exception.code, 0)
         self.assertEqual(sess.calls, [sd])
         self.assertTrue(sess.closed)
+
+    @unittest.skipUnless(hasattr(signal, "SIGRTMIN"),
+                         "main() installs the real-time signal handlers")
+    def test_the_ceph_cli_is_set_after_logging(self):
+        """set_ceph_cli() can log (monitors found from the mount). Before
+        basicConfig() that set up a default WARNING handler, and the run lost
+        --log-file and every INFO line."""
+        class Stop(Exception):
+            pass
+
+        order = []
+        saved = (vct.set_ceph_cli, vct._check_tmpdir_and_target,
+                 logging.basicConfig)
+
+        def restore():
+            (vct.set_ceph_cli, vct._check_tmpdir_and_target,
+             logging.basicConfig) = saved
+        self.addCleanup(restore)
+        logging.basicConfig = lambda **kw: order.append("logging")
+        vct.set_ceph_cli = lambda a: order.append("ceph cli")
+        vct._check_tmpdir_and_target = lambda a: (_ for _ in ()).throw(Stop())
+        self._cli_cleanups()
+        sys.argv = ["tc", "--tmpdir", self.d, self.d]
+        with self.assertLogs(level="INFO"), self.assertRaises(Stop):
+            vct.main()
+        self.assertEqual(order, ["logging", "ceph cli"])
 
     def _cli_cleanups(self):
         """Undo what a reap through main() sets: argv, euid, every signal
