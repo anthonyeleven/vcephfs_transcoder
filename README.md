@@ -236,6 +236,11 @@ Transcoder:
 * `--reap-staging`, `--reap-staging-min-age`: remove staging directories a killed
   `--target-pool` run left behind.
 * `--max-size`: an upper size bound; a replicated `--target-pool` needs one.
+* Both size bands in one run: `--small-pool` and `--large-pool` send each file by
+  its size, below or at and above `--split-size` (default 614400), so a single walk
+  moves small files to the replicated first data pool and large ones to EC, and
+  sees every name of a hard-link set. `--small-files-to-any-pool` lets files below
+  614400 bytes go to a pool other than the first.
 * `--process-hardlinks`: move multiply-linked files, which are skipped by default.
   Every link has to be under the directories given.
 * `--stage-in-tmpdir`, `--force-tmpdir-pool`: escape hatches, slow or unsafe for
@@ -292,6 +297,8 @@ usage: vcephfs_transcoder.py [-h] [--version] [--paths-from-pool POOL]
                              [--regulate-blind-throttle-s SEC]
                              [--regulate-blind-delay-ms MS]
                              [--source-pool POOL] [--target-pool POOL]
+                             [--small-pool POOL] [--large-pool POOL]
+                             [--small-files-to-any-pool] [--split-size SIZE]
                              [--reap-staging] [--reap-staging-min-age SEC]
                              [--target-pool-kind {rep,ec}]
                              [--prune-small-subtrees]
@@ -335,19 +342,26 @@ options:
                         from the mount. Containerized hosts often have no
                         ceph.conf at all, hence the fallbacks. With --rados-
                         name and --rados-keyring, this and --rados-mon-host
-                        also locate the cluster for --target-pool's staging-
-                        removal session.
+                        also locate the cluster for the staging-removal
+                        session of a run that stages (--target-pool, --small-
+                        pool, --large-pool), and of the startup ceph CLI
+                        checks (pool kinds, the first data pool). Without
+                        them, those checks use the identity that session
+                        would: the first root's mount name= and its cluster's
+                        conf and keyring.
   --rados-mon-host ADDRS
                         Comma-separated monitor addresses for --paths-from-
                         pool, used instead of a conffile.
   --rados-keyring PATH  Keyring for --paths-from-pool. Default: whatever the
                         conffile says. Given with --rados-name, also the
-                        keyring of --target-pool's staging-removal session.
+                        keyring of a staging run's staging-removal session and
+                        of the startup ceph CLI checks.
   --rados-name NAME     RADOS client name for --paths-from-pool (default
                         client.admin). Needs read access to the pool and to
                         its objects' xattrs. Given with --rados-keyring, also
-                        the user of --target-pool's staging-removal session,
-                        which otherwise is the mount's name=.
+                        the user of a staging run's staging-removal session,
+                        which otherwise is the mount's name=, and of the
+                        startup ceph CLI checks.
   --paths-from FILE     Transcode exactly the files listed in FILE ('-' for
                         stdin; NUL- or newline-delimited; a NUL list is read
                         byte-exact) instead of walking. A path outside the
@@ -374,9 +388,10 @@ options:
   --threads THREADS     Number of threads for data copying
   --dry-run, -n         Perform transcode but do not replace files. Without
                         --stage-in-tmpdir each copy is still staged, beside
-                        its target or, with --target-pool, in a staging
-                        directory, which moves that directory's rctime, so the
-                        run journal records that pin.
+                        its target or, with --target-pool, --small-pool or
+                        --large-pool, in a staging directory, which moves that
+                        directory's rctime, so the run journal records that
+                        pin.
   --config PATH         key=value file of live tunables, re-read when its
                         mtime changes; the example at the end of this help
                         lists every key. Keep it on local disk, NOT in the
@@ -484,6 +499,36 @@ options:
                         from or --paths-from-pool the list is grouped by
                         directory first, spilling ~100 bytes per path beside
                         --log-file (else in the system temp directory).
+  --small-pool POOL     Send files below --split-size to POOL, in the same run
+                        as the larger ones: with --large-pool those go there,
+                        without it to their directory's layout pool. Files
+                        below 614400 bytes may go only to the volume's first
+                        data pool, so POOL must be that pool unless --min-size
+                        starts the band at or above 614400 or --small-files-
+                        to-any-pool is given. A file whose directory points at
+                        its pool is copied beside itself as usual; one whose
+                        directory points elsewhere is staged as with --target-
+                        pool, and --paths-from/--paths-from-pool lists are
+                        grouped by directory the same way. Directory layouts
+                        are never changed. Not with --target-pool or --stage-
+                        in-tmpdir.
+  --large-pool POOL     Send files at or above --split-size to POOL, in the
+                        same run as the smaller ones: with --small-pool those
+                        go there, without it to their directory's layout pool.
+                        Any pool: EC, or a replicated pool on other media;
+                        below 614400 bytes the first-data-pool rule of
+                        --small-pool applies, and so does --small-files-to-
+                        any-pool. Staged like --small-pool.
+  --small-files-to-any-pool
+                        Let --small-pool or --large-pool take files below
+                        614400 bytes when it is not the volume's first data
+                        pool. Each such file then keeps its backtrace in the
+                        first pool and its data in the other, so it costs
+                        objects in both; the startup log says so.
+  --split-size SIZE     Where --small-pool and --large-pool divide (default
+                        614400). --min-size and --max-size still bound the
+                        whole run; a side they leave with no sizes is refused
+                        at startup.
   --reap-staging        Instead of transcoding, remove leftover staging
                         directories (.vcephfs-tc-stage-<id>) through a
                         separate CephFS session: each untouched for --reap-
@@ -552,6 +597,20 @@ files held open for writing:
   stays the main guard: use 2 or more, and keep the tool off
   trees whose writers hold files open for days (long-lived logs,
   databases).
+
+size split (--small-pool, --large-pool):
+  Each file goes by its size: below --split-size (default
+  614400) to --small-pool, at or above it to --large-pool.
+  A side left unset keeps the directory's layout pool. Any two
+  pools may take the bands, replicated or EC, but files below
+  614400 bytes go only to the volume's first data pool, which
+  the cluster must confirm (see --rados-name), unless
+  --small-files-to-any-pool is given. A side that
+  --min-size/--max-size leave empty is refused. The
+  startup log names each side's pool, kind and band. A file
+  already on its pool counts as "already matched" and is left
+  alone, so a second run moves only what is still wrong. A
+  hard-link set gets one decision, from its size.
 
 runtime signals:
   SIGUSR1  (10)  increase thread count by 1 (resumes from pause)

@@ -54,7 +54,8 @@ THREADS_DEFAULT = 4
 # The FIRST data pool (data_pools[0]) is fixed when the fs is created; a
 # directory's DEFAULT pool is its ceph.dir.layout.pool, settable anywhere.
 # Pointing the root at an EC pool changes where new files land, not the first
-# pool. --target-pool overrides the target per run (see below).
+# pool. --target-pool overrides the target per run (see below), and
+# --small-pool/--large-pool per file by size, so one run moves both bands.
 #
 # A backtrace object lives in the first pool, the file's current pool, and every
 # pool in its old_pools, so switching a file's layout after creation leaves one
@@ -890,6 +891,7 @@ class Stats:
     _symlink_batch: int = 0
     _dirs_pruned_batch: int = 0
     _lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    _last_progress: float = dataclasses.field(default_factory=time.monotonic)
 
     def prune_budget_left(self, budget):
         with self._lock:
@@ -909,6 +911,17 @@ class Stats:
             f"{self.bytes_copied / (1024**3):.1f} GiB copied"
             f"{avg}"
         )
+
+    def log_progress_if_due(self, interval=60):
+        """Log progress at most once per interval, timed across the whole run.
+
+        A per-directory timer never fires in a walk through many small
+        directories, so the clock lives here rather than in the loops.
+        """
+        now = time.monotonic()
+        if now - self._last_progress > interval:
+            self.log_progress()
+            self._last_progress = now
 
     def _avg_throughput_str(self):
         """Return a formatted aggregate throughput suffix, or '' if no data."""
@@ -1097,14 +1110,53 @@ def get_layout_walking_up(path):
     return layout
 
 
-def target_layout(args, dir_layout):
+def size_split(args):
+    """(--small-pool, --large-pool), either one None when not given."""
+    return getattr(args, "small_pool", None), getattr(args, "large_pool", None)
+
+
+def staging_pools(args):
+    """The pools this run's temps may be staged into: --target-pool, or the
+    sides of --small-pool/--large-pool that are set. Empty when nothing is
+    staged, which includes --stage-in-tmpdir."""
+    if getattr(args, "stage_in_tmpdir", False):
+        return []
+    return [p for p in (getattr(args, "target_pool", None), *size_split(args)) if p]
+
+
+def _staging_label(args):
+    """How the startup lines name what a run stages for."""
+    if getattr(args, "target_pool", None):
+        return "--target-pool %s" % args.target_pool
+    small, large = size_split(args)
+    split = getattr(args, "split_size", None) or YIELD_FLOOR_BYTES
+    parts = []
+    if small:
+        parts.append("--small-pool %s below %d bytes" % (small, split))
+    if large:
+        parts.append("--large-pool %s from %d bytes" % (large, split))
+    return ", ".join(parts)
+
+
+def target_layout(args, dir_layout, size=None):
     """The layout a file under a directory with dir_layout should end up with.
 
     Normally that is the directory's own layout. --target-pool replaces only the
     pool, so a small-file pass can land on the replicated pool while the volume
     root stays on EC and every other file keeps landing where it should.
+
+    --small-pool and --large-pool replace it by size instead, so both bands move
+    in one run, under a root on either tier: a file below --split-size goes to
+    --small-pool, the rest to --large-pool, and a side left unset keeps the
+    directory's pool. Without a size -- a question about a directory, not a
+    file -- a split run answers with the directory's own layout.
     """
-    pool = getattr(args, "target_pool", None)
+    small, large = size_split(args)
+    if small or large:
+        split = getattr(args, "split_size", None) or YIELD_FLOOR_BYTES
+        pool = None if size is None else (small if size < split else large)
+    else:
+        pool = getattr(args, "target_pool", None)
     if dir_layout is None or not pool:
         return dir_layout
     return dir_layout.with_pool(pool)
@@ -1129,9 +1181,9 @@ def target_pool_kind(pool, declared=None, fs_names=None):
     """("rep" | "ec", how) for a --target-pool, or (None, why not).
 
     The cluster decides when the ceph CLI is usable; a --target-pool-kind that
-    contradicts it is refused. Without the CLI -- the transcode hosts have none
-    -- the operator's --target-pool-kind decides, and failing that the pool's
-    name, but only on a POSITIVE match either way. Guessing is not safe in
+    contradicts it is refused. Without the CLI -- a client with no keyring that
+    set_ceph_cli() can find -- the operator's --target-pool-kind decides, and
+    failing that the pool's name, but only on a POSITIVE match either way. Guessing is not safe in
     either direction: an EC pool read as replicated would be sent exactly the
     small files the yield floor exists to keep off EC. fs_names, the
     filesystems the roots are on, pins the replicated shape to the actual
@@ -1190,6 +1242,105 @@ def target_pool_refusal(kind, floor, min_size, max_size, pool):
     return None
 
 
+def split_bands(args):
+    """[(side, pool, lo, hi)] for each side of a size split that names a pool:
+    the sizes it takes, lo inclusive, hi exclusive, hi None for no top.
+    --min-size and --max-size bound the whole run, so they cut both bands."""
+    small, large = size_split(args)
+    split = args.split_size
+    lo = max(args.min_size or 0, 0)
+    top = None if args.max_size is None else args.max_size + 1
+    out = []
+    if small:
+        out.append(("small", small, lo, split if top is None else min(split, top)))
+    if large:
+        out.append(("large", large, max(lo, split), top))
+    return out
+
+
+def size_split_refusal(args):
+    """Why a --small-pool/--large-pool run must not start, or None.
+
+    Any two pools may take the two bands: replicated and EC, two replicated
+    pools on different media, or two EC profiles. Refused is what is always a
+    mistake: a side whose band is empty, so it moves nothing, and a side that
+    would take files below the yield floor without being the volume's first
+    data pool. A small file anywhere else costs its own objects on top of the
+    backtrace head every file keeps in the first pool, which is the cost the
+    yield floor exists to avoid; --small-files-to-any-pool accepts that cost,
+    and size_split_warnings() names it instead. Reads the <side>_first
+    decisions _check_tmpdir_and_target() made."""
+    for side, pool, lo, hi in split_bands(args):
+        if hi is not None and lo >= hi:
+            return (f"--{side}-pool {pool} takes no files: --min-size "
+                    f"{args.min_size}, --split-size {args.split_size} and "
+                    f"--max-size {args.max_size} leave its band empty")
+        is_first = getattr(args, side + "_first", None)
+        if (lo < YIELD_FLOOR_BYTES and not is_first
+                and not getattr(args, "small_files_to_any_pool", False)):
+            first = getattr(args, "first_pool", None)
+            why = (f"--{side}-pool {pool} would take files from {lo} bytes, but "
+                   f"files below {YIELD_FLOOR_BYTES} go only to the volume's "
+                   f"first data pool" + (f" ({first})" if first else ""))
+            if is_first is None:
+                return why + (", and the cluster could not be asked which pool "
+                              "that is; check that the ceph CLI reaches the "
+                              "cluster as the mount's user or --rados-name, or "
+                              "pass --small-files-to-any-pool")
+            return why + ("; raise --min-size or --split-size, name that pool, "
+                          "or pass --small-files-to-any-pool")
+    return None
+
+
+def size_split_warnings(args):
+    """Advisories for a split run allowed to start: an EC side whose band
+    starts below that pool's floor, where a move costs more raw space than it
+    frees, and a side that --small-files-to-any-pool lets take files below the
+    yield floor outside the first data pool."""
+    out = []
+    for side, pool, lo, hi in split_bands(args):
+        if lo < YIELD_FLOOR_BYTES and not getattr(args, side + "_first", None):
+            out.append(f"--{side}-pool {pool} takes files from {lo} bytes and is "
+                       f"not known to be the first data pool: each such file keeps "
+                       f"its backtrace in the first pool and its data in {pool}, "
+                       f"so it costs objects in both")
+        floor = getattr(args, side + "_floor", None)
+        if floor and lo < floor:
+            out.append(f"--{side}-pool {pool} is EC with a {floor}-byte floor: "
+                       f"its files from {lo} to {floor} bytes cost more raw "
+                       f"space there than they free")
+    return out
+
+
+def validate_size_split(args):
+    """Fill in --split-size and refuse the combinations a split run cannot take.
+
+    One run moves both size bands, so it is never also a --target-pool run.
+    --stage-in-tmpdir is refused too: it sets a temp's pool after creation, the
+    one move that leaves a backtrace behind in the old pool for good.
+    Raises ValueError."""
+    small, large = size_split(args)
+    if not (small or large):
+        if args.split_size is not None:
+            raise ValueError("--split-size needs --small-pool or --large-pool")
+        if getattr(args, "small_files_to_any_pool", False):
+            raise ValueError("--small-files-to-any-pool needs --small-pool or "
+                             "--large-pool")
+        return
+    if args.target_pool:
+        raise ValueError("--target-pool cannot be combined with --small-pool or "
+                         "--large-pool: give each band its pool instead")
+    if args.stage_in_tmpdir:
+        raise ValueError("--stage-in-tmpdir cannot be combined with --small-pool "
+                         "or --large-pool")
+    if small and small == large:
+        raise ValueError(f"--small-pool and --large-pool are both {small}")
+    if args.split_size is None:
+        args.split_size = YIELD_FLOOR_BYTES
+    if args.split_size <= 0:
+        raise ValueError("--split-size must be positive")
+
+
 def alloc_bytes(size, scheme, min_alloc):
     """Allocated bytes for one file under a redundancy scheme on given media.
 
@@ -1221,33 +1372,76 @@ def size_crossover(src_scheme, dst_scheme, min_alloc, step=4096, limit=64 << 20)
     return None
 
 
+# The ceph CLI as this run calls it. The transcode hosts carry only per-cluster
+# files (/etc/ceph/<cluster>.conf and its keyrings), so a bare `ceph` finds no
+# cluster there; set_ceph_cli() adds a conffile, name and keyring.
+CEPH_CLI = ["ceph"]
+_ceph_cache = {}
+
+
+def set_ceph_cli(args):
+    """Point CEPH_CLI where a staging-removal session for the first root would
+    go, as the user it would be (RemovalSession._identity). With --rados-name
+    and --rados-keyring that is those two, at --rados-mon-host, --rados-conffile
+    or the usual conf search. Without them it is the mount's name= with its
+    cluster's conf and keyring, and a lone --rados-conffile is not used. When
+    neither works out, whichever --rados-* flags there are."""
+    def where(conf, mon_host):
+        # Monitors win, as in _ceph_connect_args(). The CLI still insists on
+        # reading a conf file, so it gets an empty one.
+        if mon_host:
+            return ["-c", "/dev/null", "-m", mon_host]
+        return ["-c", conf] if conf else []
+    cli = ["ceph"] + where(getattr(args, "rados_conffile", None),
+                           getattr(args, "rados_mon_host", None))
+    for flag, attr in (("-n", "rados_name"), ("-k", "rados_keyring")):
+        if getattr(args, attr, None):
+            cli += [flag, getattr(args, attr)]
+    try:
+        root = args.dirs[0]
+        os.stat(root)        # an idle autofs volume is mounted on access
+        _mp, src, opts = _ceph_mount_for(root) or (None, "", {})
+        conf, over, who = RemovalSession._identity(args, root, opts, src)
+        cli = (["ceph"] + where(conf, over.get("mon_host"))
+               + ["-n", who, "-k", over["keyring"]])
+    except (Exception, SystemExit):
+        # _ceph_connect_args() exits when it finds no way to the cluster.
+        pass
+    CEPH_CLI[:] = cli
+    _ceph_cache.clear()
+
+
+def _ceph_json(*cmd):
+    """Parsed `ceph <cmd> -f json`, or None when the CLI is missing or fails.
+    Cached: these answers do not change during a run's startup checks."""
+    if cmd not in _ceph_cache:
+        try:
+            import subprocess
+            out = subprocess.run(CEPH_CLI + list(cmd) + ["-f", "json"],
+                                 capture_output=True, text=True, timeout=15)
+            _ceph_cache[cmd] = json.loads(out.stdout) if out.returncode == 0 else None
+        except Exception:
+            _ceph_cache[cmd] = None
+    return _ceph_cache[cmd]
+
+
 def _pool_scheme(pool):
     """Best-effort ("rep", n) / ("ec", k, m, su) for a pool name, else None.
 
-    Needs the ceph CLI and a usable keyring. The transcoder runs on clients that
-    often have neither, so every failure path returns None and the caller simply
-    skips the advisory. This must never be load-bearing.
+    Needs the ceph CLI and a usable keyring, so every failure path returns None
+    and the caller falls back to the pool's name or skips the advisory.
     """
     try:
-        import subprocess
-        out = subprocess.run(
-            ["ceph", "osd", "pool", "ls", "detail", "-f", "json"],
-            capture_output=True, text=True, timeout=15)
-        if out.returncode != 0:
-            return None
-        for pd in json.loads(out.stdout):
+        for pd in _ceph_json("osd", "pool", "ls", "detail") or []:
             if pd.get("pool_name") != pool:
                 continue
             if pd.get("type") == 1 or pd.get("erasure_code_profile") in (None, "", "replicated_rule"):
                 return ("rep", int(pd.get("size", 3)))
             sw = int(pd.get("stripe_width", 0))
-            prof = subprocess.run(
-                ["ceph", "osd", "erasure-code-profile", "get",
-                 pd["erasure_code_profile"], "-f", "json"],
-                capture_output=True, text=True, timeout=15)
-            if prof.returncode != 0:
+            pj = _ceph_json("osd", "erasure-code-profile", "get",
+                            pd["erasure_code_profile"])
+            if pj is None:
                 return None
-            pj = json.loads(prof.stdout)
             k, m = int(pj["k"]), int(pj["m"])
             su = (sw // k) if (sw and k) else 4096
             return ("ec", k, m, su)
@@ -1256,20 +1450,45 @@ def _pool_scheme(pool):
     return None
 
 
+def first_data_pools():
+    """{filesystem: its first data pool} from the cluster, or None without the
+    ceph CLI. The first pool (data_pools[0]) holds every file's backtrace and
+    cannot be changed or removed."""
+    fss = _ceph_json("fs", "ls")
+    if fss is None:
+        return None
+    return {f["name"]: (f.get("data_pools") or [None])[0] for f in fss}
+
+
+def first_data_pool_check(pool, fs_names):
+    """(True | False | None, how): is pool the first data pool of every
+    filesystem the roots are on? Only the cluster can say; None when the ceph
+    CLI does not answer. A name cannot: a volume may have both cephfs.<fs>.data
+    and cephfs.<fs>.rdata, and only one of them is first."""
+    firsts = first_data_pools()
+    if not firsts:
+        return None, "the ceph CLI did not answer"
+    mine = {n: firsts.get(n) for n in fs_names} if fs_names else firsts
+    ok = pool in mine.values() if not fs_names else all(p == pool for p in mine.values())
+    return ok, "cluster: " + ", ".join("%s -> %s" % kv for kv in sorted(mine.items()))
+
+
 def _min_alloc_hint():
     """Cluster-configured bluestore_min_alloc_size_ssd, or None."""
     try:
         import subprocess
-        out = subprocess.run(["ceph", "config", "get", "osd",
-                              "bluestore_min_alloc_size_ssd"],
+        out = subprocess.run(CEPH_CLI + ["config", "get", "osd",
+                                         "bluestore_min_alloc_size_ssd"],
                              capture_output=True, text=True, timeout=15)
         return int(out.stdout.strip()) if out.returncode == 0 else None
     except Exception:
         return None
 
 
-def crossover_warning(src_pool, dst_pool, min_size):
+def crossover_warning(src_pool, dst_pool, min_size, what="--min-size"):
     """Advisory if min_size sits below the size where the move starts paying.
+
+    what names the bound min_size came from, for the message.
 
     Returns a message or None. Advisory only: below the crossover a transcode
     consumes MORE raw space than it frees, which no other check would catch.
@@ -1286,10 +1505,10 @@ def crossover_warning(src_pool, dst_pool, min_size):
                 % (src_pool, dst_pool, ma))
     if min_size and min_size >= x:
         return None
-    return ("--min-size %d is below the %d-byte crossover for %s -> %s at "
+    return ("%s %d is below the %d-byte crossover for %s -> %s at "
             "min_alloc %d. Files under %d bytes cost MORE raw space after "
             "transcoding than before."
-            % (min_size, x, src_pool, dst_pool, ma, x))
+            % (what, min_size, x, src_pool, dst_pool, ma, x))
 
 
 def _prune_inert_warning(args):
@@ -4019,7 +4238,7 @@ def start_removal_session(args):
     kernel mount the copies use can deadlock against that client's own caps.
     """
     global removal_session
-    if not (args.reap_staging or (args.target_pool and not args.stage_in_tmpdir)):
+    if not (args.reap_staging or staging_pools(args)):
         return None
     try:
         s = _open_removal_session(args)
@@ -4027,8 +4246,9 @@ def start_removal_session(args):
         logging.error(
             "Refusing to start: %s needs a separate CephFS session, and none "
             "could be opened: %s"
-            % ("--reap-staging" if args.reap_staging else "--target-pool staging",
-               e))
+            % ("--reap-staging" if args.reap_staging
+               else "--target-pool staging" if args.target_pool
+               else "--small-pool/--large-pool staging", e))
         sys.exit(1)
     # The session maps one kernel mount, the one args.dirs[0] is on. A root on
     # another mount would have every staging directory under it fail to be
@@ -4129,7 +4349,7 @@ def tmpdir_conflicts(args, tmpdir_pool):
     And its usual target, the replicated pool, IS the default pool the tmpdir
     is supposed to be on, so checking it would refuse the main use case.
     """
-    if getattr(args, "target_pool", None) and not args.stage_in_tmpdir:
+    if staging_pools(args):
         return []
     out = []
     for d in args.dirs:
@@ -4489,7 +4709,8 @@ def process_file(args, filepaths, st, layout, file_layout, stage=False):
     # the call's last change, whether or not the replace went through.
     #
     # stage: the file's directory does not point at layout's pool (only ever
-    # under --target-pool), so the temp is made in the run's staging directory.
+    # under --target-pool, --small-pool or --large-pool), so the temp is made
+    # in the run's staging directory.
     touched = set()
     try:
         stage_dir = None
@@ -5387,8 +5608,9 @@ def write_target_refusal(args, pool, root, cur):
 
     cur is root's ceph.dir.layout.pool. A pool that is still the default write
     target cannot be DRAINED -- new files keep landing in it -- so that is
-    refused. A --target-pool sweep of small files is the exception: it is not
-    meant to converge to empty, only to take what is there now.
+    refused. A --target-pool sweep of small files is the exception, and so is
+    a --small-pool/--large-pool run that sends one band out of the pool: neither
+    is meant to converge to empty, only to take what is there now.
     """
     if cur != pool:
         return None
@@ -5398,6 +5620,15 @@ def write_target_refusal(args, pool, root, cur):
             "--paths-from-pool %s is still the default write target of %s; "
             "allowed for a --target-pool %s sweep of files up to %d bytes",
             pool, root, args.target_pool, args.max_size)
+        return None
+    # A size split sweeps too: the side left to the directory's layout matches
+    # where its files already are, and the named side moves out of the pool.
+    # Both sides away from the pool is a drain of it again.
+    away = [p for p in size_split(args) if p and p != pool]
+    if len(away) == 1:
+        logging.info(
+            "--paths-from-pool %s is still the default write target of %s; "
+            "allowed for a sweep of one size band into %s", pool, root, away[0])
         return None
     return ("--paths-from-pool %s is still the default write target of %s, "
             "so a drain cannot converge. Repoint ceph.dir.layout.pool first."
@@ -6016,7 +6247,6 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots):
     def _limit_reached():
         return args.max_files is not None and stats.files_submitted >= args.max_files
 
-    last_progress = time.monotonic()
     outside_logged = 0
     real_dirs = {}
     root_dev = {r: os.stat(r).st_dev for r in roots}
@@ -6052,9 +6282,7 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots):
         if file_delay_ms > 0:
             _file_delay()
 
-        if time.monotonic() - last_progress > 60:
-            stats.log_progress()
-            last_progress = time.monotonic()
+        stats.log_progress_if_due()
 
         filepath = os.path.abspath(filepath)
 
@@ -6170,7 +6398,7 @@ def _process_paths(args, hard_links, executor, dir_layouts, roots):
                 logging.info("Skipping %s: no layout for its directory", filepath)
                 continue
             dir_layouts[dirpath] = dir_layout
-        layout = target_layout(args, dir_layout)
+        layout = target_layout(args, dir_layout, st.st_size)
 
         # Layout is checked BEFORE size here, the reverse of the walker. The
         # walker tests size first because that is the cheaper rejection: most of
@@ -6420,11 +6648,10 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
         )
         dir_layouts[dirpath] = layout
         # dir_layouts keeps the directory's own layout, which is what its
-        # children inherit; from here on `layout` is where files go.
+        # children inherit; each file's target is worked out from it below.
         dir_layout = layout
-        layout = target_layout(args, dir_layout)
 
-        def submit(filepaths, st, file_layout, stage, _layout=layout):
+        def submit(filepaths, st, file_layout, stage, _layout):
             if do_exit.is_set() or _limit_reached():
                 return
             if not thread_count.acquire(
@@ -6441,8 +6668,6 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
                 thread_count.release()
                 raise
 
-        last_progress = time.monotonic()
-
         for filename in filenames:
             if do_exit.is_set() or _limit_reached():
                 return
@@ -6455,9 +6680,7 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             if file_delay_ms > 0:
                 _file_delay()
 
-            if time.monotonic() - last_progress > 60:
-                stats.log_progress()
-                last_progress = time.monotonic()
+            stats.log_progress_if_due()
 
             filepath = os.path.join(dirpath, filename)
             # Listed by os.walk, gone by the stat: deleted under the walk.
@@ -6522,8 +6745,11 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
                 with stats._lock:
                     stats.files_failed += 1
                 continue
+            # Per file, not per directory: under --small-pool/--large-pool the
+            # size picks the pool. Every other run gets the directory's target.
+            target = target_layout(args, dir_layout, st.st_size)
             # if there is a layout match, don't count skipping as a failure
-            if file_layout == layout:
+            if file_layout == target:
                 with stats._lock:
                     stats.files_skipped_layout_match += 1
                 continue
@@ -6536,7 +6762,7 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
                 continue
             if st.st_nlink == 1:
                 submit([filepath], st, file_layout,
-                       layout.pool != dir_layout.pool)
+                       target.pool != dir_layout.pool, target)
             elif not args.process_hardlinks:
                 logging.info(
                     f"Skipping {filepath}: has {st.st_nlink} hard links (--skip-hardlinks)"
@@ -6547,15 +6773,20 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
             else:
                 file_id = (st.st_dev, st.st_ino)
                 if file_id not in hard_links:
-                    hard_links[file_id] = ([filepath], [layout], [dir_layout])
+                    hard_links[file_id] = ([filepath], [target], [dir_layout])
                 else:
                     hard_links[file_id][0].append(filepath)
-                    hard_links[file_id][1].append(layout)
+                    hard_links[file_id][1].append(target)
                     hard_links[file_id][2].append(dir_layout)
 
                 if len(hard_links[file_id][0]) == st.st_nlink:
                     filepaths = hard_links[file_id][0]
-                    layouts = hard_links[file_id][1]
+                    # One decision for the set, from this last stat. Each
+                    # name's target came from its own stat, and a size that
+                    # crossed --split-size between two of them would read as
+                    # "inconsistent directory layouts".
+                    layouts = [target_layout(args, dl, st.st_size)
+                               for dl in hard_links[file_id][2]]
                     # Staged by where the first name lives: that is the
                     # directory the new inode is created and renamed into.
                     stage = layouts[0].pool != hard_links[file_id][2][0].pool
@@ -6583,7 +6814,9 @@ def process_dir(args, start_dir, hard_links, executor, mountpoints, dir_layouts)
                         with stats._lock:
                             stats.files_skipped_large += 1
                     else:
-                        submit(filepaths, st, file_layout, stage)
+                        # One size for the whole set, so one pool: layouts[0]
+                        # is every name's target.
+                        submit(filepaths, st, file_layout, stage, layouts[0])
                 else:
                     logging.info(
                         f"Deferring {filepath} due to hardlinks ({st.st_nlink - len(hard_links[file_id][0])} link(s) left)"
@@ -6628,8 +6861,8 @@ def start_job_staging(args):
     a caller that skipped it, so staging never removes through the kernel
     mount."""
     if removal_session is None:
-        raise SystemExit("--target-pool staging needs a separate removal "
-                         "session; none is open")
+        raise SystemExit("staging (--target-pool, --small-pool, --large-pool) "
+                         "needs a separate removal session; none is open")
     return JobStaging(uuid.uuid4().hex[:16], removal_session.mountpoint,
                       session=removal_session)
 
@@ -6643,7 +6876,13 @@ def _start_staging(args):
     at the end of a run."""
     global staging
     staging = start_job_staging(args)
-    why = staging.probe(args.target_pool)
+    why = None
+    for pool in staging_pools(args):
+        # Each pool a temp may be born in, so a bad --small-pool is not found
+        # only once the walk reaches its first small file.
+        why = staging.probe(pool)
+        if why:
+            break
     if why:
         for p in staging._paths:
             logging.warning(f"Staging directory {p} left by the refused "
@@ -6665,15 +6904,15 @@ def process_files(args):
     roots_seen = []
 
     global staging
-    if getattr(args, "target_pool", None) and not args.stage_in_tmpdir:
+    if staging_pools(args):
         if staging is None:
             # main() makes and probes it; this is for a caller that skipped it.
             staging = start_job_staging(args)
         staging.start_keepalive(REAP_STAGING_MIN_AGE_S / 4)
-        logging.info("--target-pool %s: files whose directory points elsewhere "
+        logging.info("%s: files whose directory points elsewhere "
                      "are staged in %s%s under %s, removed when the run ends",
-                     args.target_pool, STAGE_PREFIX, staging.run_id[:8] + "*",
-                     staging.root)
+                     _staging_label(args), STAGE_PREFIX,
+                     staging.run_id[:8] + "*", staging.root)
     else:
         staging = None
 
@@ -6915,6 +7154,38 @@ def _check_tmpdir_and_target(args):
             "replicated" if args.target_kind == "rep" else "EC", _how,
             f", floor {args.target_floor} bytes" if args.target_floor else "")
 
+    # For each side of a size split: whether its pool is the volume's first
+    # data pool, which size_split_refusal() needs for any band reaching below
+    # the yield floor, and for an EC pool its floor, for the advisory. The kind
+    # is not refused when unknown: the bands no longer depend on it.
+    args.small_kind = args.large_kind = args.small_floor = args.large_floor = None
+    args.small_first = args.large_first = None
+    args.first_pool = None
+    small, large = size_split(args)
+    if small or large:
+        fs_names = {n for n in (_mds_namespace_for(d) for d in args.dirs) if n}
+        firsts = first_data_pools()
+        if firsts and fs_names and len({firsts.get(n) for n in fs_names}) == 1:
+            args.first_pool = firsts.get(next(iter(fs_names)))
+    for side, pool in (("small", small), ("large", large)):
+        if not pool:
+            continue
+        kind, _how = target_pool_kind(pool, None, fs_names)
+        if kind is None:
+            _how = "neither the cluster nor the name says"
+        first, _fhow = first_data_pool_check(pool, fs_names)
+        setattr(args, side + "_kind", kind)
+        setattr(args, side + "_first", first)
+        if kind == "ec":
+            setattr(args, side + "_floor",
+                    target_pool_floor(args.source_pool or layout.pool, pool))
+        logging.info(
+            "--%s-pool %s: %s (decided by %s), %s the first data pool (%s)%s",
+            side, pool, {"rep": "replicated", "ec": "EC"}.get(kind, "kind unknown"),
+            _how, {True: "is", False: "not"}.get(first, "unknown if it is"), _fhow,
+            f", floor {getattr(args, side + '_floor')} bytes"
+            if kind == "ec" else "")
+
     # The tmpdir must not be in a pool we are transcoding INTO: those files
     # would be rewritten for nothing, and a failed apply_file() would go
     # unnoticed, as the temp inherits the target pool. Refused, not prompted,
@@ -6961,7 +7232,19 @@ def _check_tmpdir_and_target(args):
         # enforced by target_pool_refusal(); this advisory is for EC targets.
         if args.target_pool and args.target_kind == "rep":
             continue
-        _msg = crossover_warning(args.source_pool or layout.pool, _t.pool, args.min_size)
+        # A split run's named sides are held to their bands by
+        # size_split_refusal(). _t is the directory's own layout, which takes
+        # only the unnamed side: nothing with both set; the files at and above
+        # the split without --large-pool; those below it without --small-pool,
+        # which on a replicated directory is where small files belong.
+        if small and large:
+            continue
+        _lo, _what = args.min_size, "--min-size"
+        if small and args.split_size > _lo:
+            _lo, _what = args.split_size, "--split-size"
+        if large and (_pool_scheme(_t.pool) or ("",))[0] == "rep":
+            continue
+        _msg = crossover_warning(args.source_pool or layout.pool, _t.pool, _lo, _what)
         if _msg:
             logging.warning(_msg)
 
@@ -6987,6 +7270,19 @@ def main():
             "  stays the main guard: use 2 or more, and keep the tool off\n"
             "  trees whose writers hold files open for days (long-lived logs,\n"
             "  databases).\n\n"
+            "size split (--small-pool, --large-pool):\n"
+            "  Each file goes by its size: below --split-size (default\n"
+            f"  {YIELD_FLOOR_BYTES}) to --small-pool, at or above it to --large-pool.\n"
+            "  A side left unset keeps the directory's layout pool. Any two\n"
+            "  pools may take the bands, replicated or EC, but files below\n"
+            f"  {YIELD_FLOOR_BYTES} bytes go only to the volume's first data pool, which\n"
+            "  the cluster must confirm (see --rados-name), unless\n"
+            "  --small-files-to-any-pool is given. A side that\n"
+            "  --min-size/--max-size leave empty is refused. The\n"
+            "  startup log names each side's pool, kind and band. A file\n"
+            "  already on its pool counts as \"already matched\" and is left\n"
+            "  alone, so a second run moves only what is still wrong. A\n"
+            "  hard-link set gets one decision, from its size.\n\n"
             "runtime signals:\n"
             "  SIGUSR1  (10)  increase thread count by 1 (resumes from pause)\n"
             "  SIGUSR2  (12)  decrease thread count by 1 (0 = pause)\n"
@@ -7049,7 +7345,11 @@ def main():
              "addresses recovered from the mount. Containerized hosts often have "
              "no ceph.conf at all, hence the fallbacks. With --rados-name and "
              "--rados-keyring, this and --rados-mon-host also locate the cluster "
-             "for --target-pool's staging-removal session.")
+             "for the staging-removal session of a run that stages "
+             "(--target-pool, --small-pool, --large-pool), and of the startup "
+             "ceph CLI checks (pool kinds, the first data pool). Without them, "
+             "those checks use the identity that session would: the first "
+             "root's mount name= and its cluster's conf and keyring.")
     parser.add_argument(
         "--rados-mon-host", metavar="ADDRS",
         help="Comma-separated monitor addresses for --paths-from-pool, used "
@@ -7057,14 +7357,15 @@ def main():
     parser.add_argument(
         "--rados-keyring", metavar="PATH",
         help="Keyring for --paths-from-pool. Default: whatever the conffile says. "
-             "Given with --rados-name, also the keyring of --target-pool's "
-             "staging-removal session.")
+             "Given with --rados-name, also the keyring of a staging run's "
+             "staging-removal session and of the startup ceph CLI checks.")
     parser.add_argument(
         "--rados-name", metavar="NAME", default=None,
         help="RADOS client name for --paths-from-pool (default client.admin). "
              "Needs read access to the pool and to its objects' xattrs. Given "
-             "with --rados-keyring, also the user of --target-pool's "
-             "staging-removal session, which otherwise is the mount's name=.")
+             "with --rados-keyring, also the user of a staging run's "
+             "staging-removal session, which otherwise is the mount's name=, "
+             "and of the startup ceph CLI checks.")
     parser.add_argument(
         "--paths-from", metavar="FILE",
         help="Transcode exactly the files listed in FILE ('-' for stdin; NUL- "
@@ -7119,8 +7420,9 @@ def main():
         action="store_true",
         help="Perform transcode but do not replace files. Without "
              "--stage-in-tmpdir each copy is still staged, beside its target "
-             "or, with --target-pool, in a staging directory, which moves "
-             "that directory's rctime, so the run journal records that pin.",
+             "or, with --target-pool, --small-pool or --large-pool, in a "
+             "staging directory, which moves that directory's rctime, so the "
+             "run journal records that pin.",
     )
     parser.add_argument(
         "--config",
@@ -7310,6 +7612,54 @@ def main():
              % (YIELD_FLOOR_BYTES, YIELD_FLOOR_BYTES),
     )
     parser.add_argument(
+        "--small-pool",
+        default=None,
+        metavar="POOL",
+        help="Send files below --split-size to POOL, in the same run as the "
+             "larger ones: with --large-pool those go there, without it to "
+             "their directory's layout pool. Files below %d bytes may go only "
+             "to the volume's first data pool, so POOL must be that pool "
+             "unless --min-size starts the band at or above %d or "
+             "--small-files-to-any-pool is given. A file whose "
+             "directory points at its pool is copied beside itself as usual; "
+             "one whose directory points elsewhere is staged as with "
+             "--target-pool, and --paths-from/--paths-from-pool lists are "
+             "grouped by directory the same way. Directory layouts are never "
+             "changed. Not with --target-pool or --stage-in-tmpdir."
+             % (YIELD_FLOOR_BYTES, YIELD_FLOOR_BYTES),
+    )
+    parser.add_argument(
+        "--large-pool",
+        default=None,
+        metavar="POOL",
+        help="Send files at or above --split-size to POOL, in the same run as "
+             "the smaller ones: with --small-pool those go there, without it to "
+             "their directory's layout pool. Any pool: EC, or a replicated "
+             "pool on other media; below %d bytes the first-data-pool rule of "
+             "--small-pool applies, and so does --small-files-to-any-pool. "
+             "Staged like --small-pool."
+             % YIELD_FLOOR_BYTES,
+    )
+    parser.add_argument(
+        "--small-files-to-any-pool",
+        action="store_true",
+        help="Let --small-pool or --large-pool take files below %d bytes "
+             "when it is not the volume's first data pool. Each such file "
+             "then keeps its backtrace in the first pool and its data in the "
+             "other, so it costs objects in both; the startup log says so."
+             % YIELD_FLOOR_BYTES,
+    )
+    parser.add_argument(
+        "--split-size",
+        default=None,
+        type=parse_byte_size,
+        metavar="SIZE",
+        help="Where --small-pool and --large-pool divide (default %d). "
+             "--min-size and --max-size still bound the whole run; a side "
+             "they leave with no sizes is refused at startup."
+             % YIELD_FLOOR_BYTES,
+    )
+    parser.add_argument(
         "--reap-staging",
         action="store_true",
         help="Instead of transcoding, remove leftover staging directories "
@@ -7436,6 +7786,11 @@ def main():
     except ValueError as e:
         parser.error(str(e))
 
+    try:
+        validate_size_split(args)
+    except ValueError as e:
+        parser.error(str(e))
+
     thread_count = DynamicSemaphore(args.threads)
 
     # None means "not given" -> apply the default set. An explicitly empty
@@ -7534,6 +7889,9 @@ def main():
         logging.warning("Pruning directory names matching: %s", args.prune_dir_regex)
 
     if not args.reap_staging:
+        # After logging is set up: set_ceph_cli() can log, and a log call
+        # before basicConfig() leaves the run on a default WARNING handler.
+        set_ceph_cli(args)
         _check_tmpdir_and_target(args)
 
     global file_delay_ms, min_age_days
@@ -7621,6 +7979,17 @@ def main():
                 "--target-pool %s; keeping %d", cfg['min_size'],
                 args.target_floor, args.target_pool, args.min_size)
             cfg = {k: v for k, v in cfg.items() if k != 'min_size'}
+        # A split run's bands are cut by min_size too: a value that empties a
+        # band, or opens one below the yield floor to a pool that is not the
+        # first data pool, is refused the same way, at startup or later.
+        if ('min_size' in cfg and any(size_split(args))
+                and cfg['min_size'] != args.min_size):
+            why = size_split_refusal(
+                argparse.Namespace(**dict(vars(args), min_size=cfg['min_size'])))
+            if why:
+                logging.error("Config: min-size %d refused: %s; keeping %d",
+                              cfg['min_size'], why, args.min_size)
+                cfg = {k: v for k, v in cfg.items() if k != 'min_size'}
         if 'min_size' in cfg and cfg['min_size'] != args.min_size:
             old_v = args.min_size
             args.min_size = cfg['min_size']
@@ -7716,10 +8085,20 @@ def main():
                 removal_session.close()
 
     # After the config's first read, since min_size may come from it.
-    if args.target_pool:
-        why = target_pool_refusal(args.target_kind, args.target_floor,
-                                  args.min_size, args.max_size, args.target_pool)
-        if why is None and not args.stage_in_tmpdir:
+    if args.target_pool or any(size_split(args)):
+        if args.target_pool:
+            why = target_pool_refusal(args.target_kind, args.target_floor,
+                                      args.min_size, args.max_size,
+                                      args.target_pool)
+        else:
+            why = size_split_refusal(args)
+            if why is None:
+                for side, pool, lo, hi in split_bands(args):
+                    logging.info("--%s-pool %s takes files from %d bytes%s", side,
+                                 pool, lo, " up to %d" % (hi - 1) if hi else " up")
+                for msg in size_split_warnings(args):
+                    logging.warning(msg)
+        if why is None and staging_pools(args):
             why = _start_staging(args)
         if why:
             logging.error("Refusing to start: %s", why)
