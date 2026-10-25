@@ -21,6 +21,8 @@
 #           caps mon = "allow r"
 #           caps osd = "allow rw tag cephfs data=all"
 #   - Run inside a tmux session.  Beware of DoSing other traffic.
+#   - The layout steps mount the volume privately (needs mount.ceph and
+#     the user's keyring here) instead of acting through --mount.
 #
 # Usage:
 #   vcephfs-transcode-setup.sh [OPTIONS]
@@ -454,15 +456,76 @@ else
 fi
 
 # --- Set layouts -------------------------------------------------------------
+# The layout step runs through its own short-lived kernel mount of the volume,
+# never through ${MOUNT}. A kernel client accepts a layout that names a pool only
+# once its osdmap has that pool. An idle autofs mount can hold a map months old,
+# and catching it up makes one mon send every map since: tens of GB, during
+# which that mon stops answering its other sessions. A new client is sent only
+# the current map. noshare keeps the kernel from reusing the existing client.
+# The source, user and file system name are copied from ${MOUNT}'s entry in
+# /proc/self/mounts; mount.ceph finds the secret in the local keyring.
+LAYOUT_MNT=""
+cleanup_layout_mount() {
+    [ -n "$LAYOUT_MNT" ] || return 0
+    if mountpoint -q "$LAYOUT_MNT"; then
+        umount "$LAYOUT_MNT" 2>/dev/null || umount -l "$LAYOUT_MNT" 2>/dev/null ||
+            log_warn "Could not unmount ${LAYOUT_MNT}; unmount it by hand"
+    fi
+    rmdir "$LAYOUT_MNT" 2>/dev/null || true
+    LAYOUT_MNT=""
+}
+trap cleanup_layout_mount EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Prints "<source> <options>" for a private mount of the volume at $1, from its
+# /proc/self/mounts entry: the user and file system name, without the secret.
+layout_mount_args() {
+    awk -v m="$1" '$2 == m && $3 == "ceph" {
+        n = split($4, o, ","); keep = "noshare"
+        for (i = 1; i <= n; i++)
+            if (o[i] ~ /^(name|mds_namespace|fs)=/) keep = keep "," o[i]
+        src = $1
+    } END { if (src != "") print src, keep }' /proc/self/mounts
+}
+
 if [ "$SKIP_LAYOUT" = false ]; then
 
+    # Where the layout commands act: the private mount when executing, ${MOUNT}
+    # in a dry run, which mounts nothing.
+    LROOT="${MOUNT}"
+    if [ "$DRY_RUN" = false ]; then
+        read -r LSRC LOPTS <<< "$(layout_mount_args "$(realpath "${MOUNT}")")"
+        if [ -z "${LSRC:-}" ]; then
+            log_err "No ceph mount at '${MOUNT}' in /proc/self/mounts; can't make the layout mount"
+            exit 1
+        fi
+        LAYOUT_MNT=$(mktemp -d /run/vcephfs-setup-layout.XXXXXX)
+        log_info "Layout 0: Mount '${VOLUME}' privately at ${LAYOUT_MNT} for the layout steps"
+        run mount -t ceph "${LSRC}" "${LAYOUT_MNT}" -o "${LOPTS}" ||
+            { log_err "Private mount failed; no layout was changed"; exit 1; }
+        LROOT="${LAYOUT_MNT}"
+    else
+        log_info "Layout 0: Mount '${VOLUME}' privately for the layout steps"
+        log_cmd "mount -t ceph <source of ${MOUNT}> /run/vcephfs-setup-layout.XXXXXX -o noshare,<name and fs of ${MOUNT}>"
+        echo "         (dry-run, not executed; below, ${MOUNT} stands for that mount)"
+    fi
+    # The temp dir, as seen through the layout mount. One outside ${MOUNT} is
+    # not on this volume's layout mount, so it is pinned by its own path.
+    case "${TRANSCODE_TMPDIR}" in
+        "${MOUNT}"|"${MOUNT}"/*) LTMPDIR="${LROOT}${TRANSCODE_TMPDIR#"${MOUNT}"}" ;;
+        *) LTMPDIR="${TRANSCODE_TMPDIR}"
+           log_warn "Temp dir '${TRANSCODE_TMPDIR}' is outside '${MOUNT}'; pinning it by its own path" ;;
+    esac
+
     # Detect the current/old data pool BEFORE changing the volume root layout.
-    # Reading from ${MOUNT} gives the pool that existing files live on.
+    # Reading the volume root gives the pool that existing files live on.
     # This matters for EC 4+2 -> EC 8+2 transcoding where the old pool
     # is not the conventional cephfs.<vol>.data.
     OLD_POOL=""
     if command -v getfattr >/dev/null 2>&1; then
-        OLD_POOL=$(getfattr -n ceph.dir.layout.pool --only-values "${MOUNT}" 2>/dev/null || true)
+        OLD_POOL=$(getfattr -n ceph.dir.layout.pool --only-values "${LROOT}" 2>/dev/null || true)
     fi
     if [ -z "$OLD_POOL" ]; then
         OLD_POOL="cephfs.${VOLUME}.data"
@@ -483,24 +546,25 @@ if [ "$SKIP_LAYOUT" = false ]; then
     fi
 
     log_info "Layout 1: Create temp directory and pin it to old pool '${OLD_POOL}'"
-    run mkdir -p "${TRANSCODE_TMPDIR}"
-    run setfattr -n ceph.dir.layout.pool -v "${OLD_POOL}" "${TRANSCODE_TMPDIR}"
+    run mkdir -p "${LTMPDIR}"
+    run setfattr -n ceph.dir.layout.pool -v "${OLD_POOL}" "${LTMPDIR}"
 
     log_info "Layout 2: Set default layout on volume root to new pool"
-    run setfattr -n ceph.dir.layout.pool -v "${POOL_NAME}" "${MOUNT}"
+    run setfattr -n ceph.dir.layout.pool -v "${POOL_NAME}" "${LROOT}"
 
     # --- Verify --------------------------------------------------------------
     log_info "Layout 3: Verify layouts"
     if [ "$DRY_RUN" = false ]; then
         echo "  Volume root:"
-        getfattr -n ceph.dir.layout.pool "${MOUNT}" 2>&1 | sed 's/^/    /'
+        getfattr -n ceph.dir.layout.pool "${LROOT}" 2>&1 | sed 's/^/    /'
         echo "  Temp dir:"
-        getfattr -n ceph.dir.layout.pool "${TRANSCODE_TMPDIR}" 2>&1 | sed 's/^/    /'
+        getfattr -n ceph.dir.layout.pool "${LTMPDIR}" 2>&1 | sed 's/^/    /'
     else
-        log_cmd "getfattr -n ceph.dir.layout.pool ${MOUNT}"
-        log_cmd "getfattr -n ceph.dir.layout.pool ${TRANSCODE_TMPDIR}"
+        log_cmd "getfattr -n ceph.dir.layout.pool ${LROOT}"
+        log_cmd "getfattr -n ceph.dir.layout.pool ${LTMPDIR}"
         echo "         (dry-run, not executed)"
     fi
+    cleanup_layout_mount
 else
     log_info "Skipping layout steps (--skip-layout)"
 fi

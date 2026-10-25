@@ -185,7 +185,10 @@ Run the setup script without `--skip-layout`. It also makes
 `/mnt/myvol/tmp` on the old pool and points the root's layout at the new
 pool, so every new file, small ones included, lands there. That needs the volume
 mounted on the setup host as a CephX user with the `p` cap, besides the admin
-keyring. The transcoder then moves files to their directories' layouts, with no
+keyring. The layout commands run through a short-lived private mount of the
+volume that the script makes for them (same source and user, `noshare`), which
+starts with the current osdmap however long the shared mount has been idle, so
+that user's keyring must be in `/etc/ceph` too. The transcoder then moves files to their directories' layouts, with no
 `--target-pool`:
 
 ```
