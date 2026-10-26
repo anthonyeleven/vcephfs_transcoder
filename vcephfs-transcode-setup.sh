@@ -23,6 +23,11 @@
 #   - Run inside a tmux session.  Beware of DoSing other traffic.
 #   - The layout steps mount the volume privately (needs mount.ceph and
 #     the user's keyring here) instead of acting through --mount.
+#   - --transcode writes through --mount, so it first checks that the
+#     kernel client behind it is not far behind on osdmaps (needs debugfs).
+#     Other hosts' idle mounts of the volume are not checked: once the root
+#     points at the new pool, each one catches up on its first write there,
+#     so remount any that have sat idle for weeks before changing the root.
 #
 # Usage:
 #   vcephfs-transcode-setup.sh [OPTIONS]
@@ -64,6 +69,9 @@
 #   --skip-pool-setup      Skip pool creation (already done)
 #   --skip-layout          Skip layout / setfattr steps
 #   --transcode            Run the transcoder (off by default)
+#   --max-map-lag N        Refuse --transcode when the client behind --mount
+#                          is more than N osdmaps behind the cluster
+#                          (default: 1000). "any" skips the check.
 #   --execute              Actually run commands (default: dry-run)
 #   --help                 Show this help
 #
@@ -80,6 +88,7 @@ DRY_RUN=true
 SKIP_POOL_SETUP=false
 SKIP_LAYOUT=false
 SKIP_TRANSCODE=true
+MAX_MAP_LAG=1000
 TRANSCODE_TMPDIR_OVERRIDE=""
 SUBDIR=""
 LOG_FILE=""
@@ -252,6 +261,7 @@ while [ $# -gt 0 ]; do
         --skip-pool-setup)   SKIP_POOL_SETUP=true;     shift   ;;
         --skip-layout)       SKIP_LAYOUT=true;         shift   ;;
         --transcode)         SKIP_TRANSCODE=false;     shift   ;;
+        --max-map-lag)       MAX_MAP_LAG="$2";         shift 2 ;;
         --execute)           DRY_RUN=false;            shift   ;;
         --help|-h)           usage; exit 0 ;;
         *) log_err "Unknown option: $1"; exit 1 ;;
@@ -264,10 +274,14 @@ require_arg MOUNT
 [[ "$PG_NUM" =~ ^[1-9][0-9]*$ ]] || { log_err "--pg-num must be a positive integer"; exit 1; }
 (( (PG_NUM & (PG_NUM - 1)) == 0 )) || { log_err "--pg-num must be a power of 2 (got ${PG_NUM})"; exit 1; }
 [[ "$PG_AUTOSCALE_MODE" =~ ^(on|off|warn)$ ]] || { log_err "--pg-autoscale-mode must be 'on', 'off', or 'warn'"; exit 1; }
+[[ "$MAX_MAP_LAG" =~ ^([0-9]+|any)$ ]] || { log_err "--max-map-lag must be a number or 'any'"; exit 1; }
 
 # Derive volume name from the last component of the mount path
 # e.g. /shared/cephlab/howie -> howie
 VOLUME=$(basename "${MOUNT}")
+# From here on, compare paths as the kernel shows them: no trailing slash,
+# no symlinks. The volume name above comes from the path as typed.
+MOUNT=$(realpath -m "${MOUNT}")
 
 # --- Mode: replicated vs erasure-coded --------------------------------------
 if [ "$REPLICATED" = true ]; then
@@ -296,7 +310,7 @@ else
     POOL_NAME="cephfs.${VOLUME}.ec${EC_K}.${EC_M}.${CRUSH_DEVICE_CLASS}.data"
 fi
 
-TRANSCODE_TMPDIR="${TRANSCODE_TMPDIR_OVERRIDE:-${MOUNT}/tmp}"
+TRANSCODE_TMPDIR=$(realpath -m "${TRANSCODE_TMPDIR_OVERRIDE:-${MOUNT}/tmp}")
 
 # Auto-select minimum file size based on EC width if not specified
 if [ -z "$MIN_SIZE" ]; then
@@ -462,8 +476,13 @@ fi
 # and catching it up makes one mon send every map since: tens of GB, during
 # which that mon stops answering its other sessions. A new client is sent only
 # the current map. noshare keeps the kernel from reusing the existing client.
-# The source, user and file system name are copied from ${MOUNT}'s entry in
-# /proc/self/mounts; mount.ceph finds the secret in the local keyring.
+# The source, user, file system name, messenger mode and mon addresses are
+# copied from ${MOUNT}'s entry in /proc/self/mounts; mount.ceph finds the
+# secret in the local keyring.
+# This protects the layout step only. Any client writes its first file to the
+# new pool only after catching up to a map that has the pool, so the
+# --transcode step checks ${MOUNT}'s client first (see check_map_lag), and
+# other hosts' long-idle mounts of the volume should be remounted beforehand.
 LAYOUT_MNT=""
 cleanup_layout_mount() {
     [ -n "$LAYOUT_MNT" ] || return 0
@@ -480,14 +499,51 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # Prints "<source> <options>" for a private mount of the volume at $1, from its
-# /proc/self/mounts entry: the user and file system name, without the secret.
+# /proc/self/mounts entry: the user, file system name, messenger mode and mon
+# addresses, without the secret. /proc/self/mounts writes a space as \040.
 layout_mount_args() {
-    awk -v m="$1" '$2 == m && $3 == "ceph" {
+    awk -v m="$1" '{ p = $2; gsub(/\\040/, " ", p) }
+    p == m && $3 == "ceph" {
         n = split($4, o, ","); keep = "noshare"
         for (i = 1; i <= n; i++)
-            if (o[i] ~ /^(name|mds_namespace|fs)=/) keep = keep "," o[i]
+            if (o[i] ~ /^(name|mds_namespace|fs|ms_mode|mon_addr)=/) keep = keep "," o[i]
         src = $1
     } END { if (src != "") print src, keep }' /proc/self/mounts
+}
+
+# Prints how many osdmap epochs the kernel client behind mount $1 is behind
+# the cluster, or nothing when that can't be read: no debugfs, or a kernel
+# without the ceph.client_id and ceph.cluster_fsid xattrs.
+map_lag() {
+    local client fsid have cur
+    client=$(getfattr -n ceph.client_id --only-values "$1" 2>/dev/null) || return 0
+    fsid=$(getfattr -n ceph.cluster_fsid --only-values "$1" 2>/dev/null) || return 0
+    have=$(awk 'NR == 1 && $1 == "epoch" { print $2 }' \
+        "/sys/kernel/debug/ceph/${fsid}.${client}/osdmap" 2>/dev/null)
+    cur=$(ceph osd dump 2>/dev/null | awk '$1 == "epoch" { print $2; exit }')
+    if [[ "$have" =~ ^[0-9]+$ && "$cur" =~ ^[0-9]+$ ]]; then echo $(( cur - have )); fi
+}
+
+# Exits unless the client behind ${MOUNT} is within --max-map-lag maps of the
+# cluster. Its first write to the new pool would otherwise make one mon send
+# it every map since its own, as in the layout step above.
+check_map_lag() {
+    local lag
+    [ "$MAX_MAP_LAG" = any ] && { log_warn "Skipping the osdmap check of '${MOUNT}' (--max-map-lag any)"; return 0; }
+    lag=$(map_lag "${MOUNT}")
+    if [ -z "$lag" ]; then
+        log_err "Can't read the osdmap epoch of the client behind '${MOUNT}'"
+        log_err "(needs debugfs at /sys/kernel/debug and the ceph.client_id xattr)."
+        log_err "Check it by hand, then re-run with --max-map-lag any."
+        exit 1
+    elif (( lag > MAX_MAP_LAG )); then
+        log_err "The client behind '${MOUNT}' is ${lag} osdmaps behind the cluster (limit ${MAX_MAP_LAG})."
+        log_err "Its first write to '${POOL_NAME}' would make one mon send it all of them."
+        log_err "Unmount '${MOUNT}' and any other mount on this host that shares its client,"
+        log_err "let autofs mount it again (a new client gets only the current map), and re-run."
+        exit 1
+    fi
+    log_info "The client behind '${MOUNT}' is ${lag} osdmaps behind the cluster (limit ${MAX_MAP_LAG})"
 }
 
 if [ "$SKIP_LAYOUT" = false ]; then
@@ -496,7 +552,7 @@ if [ "$SKIP_LAYOUT" = false ]; then
     # in a dry run, which mounts nothing.
     LROOT="${MOUNT}"
     if [ "$DRY_RUN" = false ]; then
-        read -r LSRC LOPTS <<< "$(layout_mount_args "$(realpath "${MOUNT}")")"
+        read -r LSRC LOPTS <<< "$(layout_mount_args "${MOUNT}")"
         if [ -z "${LSRC:-}" ]; then
             log_err "No ceph mount at '${MOUNT}' in /proc/self/mounts; can't make the layout mount"
             exit 1
@@ -508,7 +564,7 @@ if [ "$SKIP_LAYOUT" = false ]; then
         LROOT="${LAYOUT_MNT}"
     else
         log_info "Layout 0: Mount '${VOLUME}' privately for the layout steps"
-        log_cmd "mount -t ceph <source of ${MOUNT}> /run/vcephfs-setup-layout.XXXXXX -o noshare,<name and fs of ${MOUNT}>"
+        log_cmd "mount -t ceph <source of ${MOUNT}> /run/vcephfs-setup-layout.XXXXXX -o noshare,<name, fs, ms_mode and mon_addr of ${MOUNT}>"
         echo "         (dry-run, not executed; below, ${MOUNT} stands for that mount)"
     fi
     # The temp dir, as seen through the layout mount. One outside ${MOUNT} is
@@ -530,8 +586,9 @@ if [ "$SKIP_LAYOUT" = false ]; then
     if [ -z "$OLD_POOL" ]; then
         OLD_POOL="cephfs.${VOLUME}.data"
         log_warn "Could not detect old pool; assuming '${OLD_POOL}'"
-        log_warn "If this is wrong, manually run:"
-        log_warn "  setfattr -n ceph.dir.layout.pool -v <OLD_POOL> ${TRANSCODE_TMPDIR}"
+        log_warn "If this is wrong, set it on the temp dir by hand, through a fresh"
+        log_warn "mount (mount -o noshare), not through '${MOUNT}':"
+        log_warn "  setfattr -n ceph.dir.layout.pool -v <OLD_POOL> <temp dir>"
     fi
     if [ "$OLD_POOL" = "$POOL_NAME" ]; then
         # A re-run: run 1 already pointed the root at the new pool, so the
@@ -587,6 +644,12 @@ if [ "$SKIP_TRANSCODE" = false ]; then
             TRANSCODER_ARGS+=(--log-file "${LOG_FILE}")
         fi
 
+        if [ "$DRY_RUN" = false ]; then
+            check_map_lag
+        elif [ "$MAX_MAP_LAG" != any ]; then
+            NOW_LAG=$(map_lag "${MOUNT}")
+            log_info "Would check that the client behind '${MOUNT}' is within ${MAX_MAP_LAG} osdmaps of the cluster (now: ${NOW_LAG:-unreadable})"
+        fi
         run "${TRANSCODER_ARGS[@]}"
 
         echo ""
