@@ -395,6 +395,56 @@ if [ "$DRY_RUN" = false ] && ! mountpoint -q "${MOUNT}"; then
     exit 1
 fi
 
+# Prints how many osdmap epochs the kernel client behind mount $1 is behind
+# the cluster, or nothing when that can't be read: no debugfs, a kernel
+# without the ceph.client_id and ceph.cluster_fsid xattrs, or a local ceph
+# CLI that talks to another cluster.
+map_lag() {
+    local client fsid have cur
+    client=$(getfattr -n ceph.client_id --only-values "$1" 2>/dev/null) || return 0
+    fsid=$(getfattr -n ceph.cluster_fsid --only-values "$1" 2>/dev/null) || return 0
+    [ "$fsid" = "$(ceph fsid 2>/dev/null)" ] || return 0
+    have=$(awk 'NR == 1 && $1 == "epoch" { print $2 }' \
+        "/sys/kernel/debug/ceph/${fsid}.${client}/osdmap" 2>/dev/null)
+    cur=$(ceph osd dump 2>/dev/null | awk '$1 == "epoch" { print $2; exit }')
+    if [[ "$have" =~ ^[0-9]+$ && "$cur" =~ ^[0-9]+$ ]] && (( cur >= have )); then
+        echo $(( cur - have ))
+    fi
+}
+
+# Exits unless the client behind ${MOUNT} is within --max-map-lag maps of the
+# cluster. Its first write to the new pool would otherwise make one mon send
+# it every map since its own (see the layout step below).
+check_map_lag() {
+    local lag
+    [ "$MAX_MAP_LAG" = any ] && { log_warn "Skipping the osdmap check of '${MOUNT}' (--max-map-lag any)"; return 0; }
+    lag=$(map_lag "${MOUNT}")
+    if [ -z "$lag" ]; then
+        log_err "Can't read the osdmap epoch of the client behind '${MOUNT}'"
+        log_err "(needs debugfs at /sys/kernel/debug and the ceph.client_id xattr)."
+        log_err "Check it by hand, then re-run with --max-map-lag any."
+        exit 1
+    elif (( lag > MAX_MAP_LAG )); then
+        log_err "The client behind '${MOUNT}' is ${lag} osdmaps behind the cluster (limit ${MAX_MAP_LAG})."
+        log_err "Its first write to '${POOL_NAME}' would make one mon send it all of them."
+        log_err "Unmount '${MOUNT}' and any other mount on this host that shares its client,"
+        log_err "let autofs mount it again (a new client gets only the current map), and re-run."
+        exit 1
+    fi
+    log_info "The client behind '${MOUNT}' is ${lag} osdmaps behind the cluster (limit ${MAX_MAP_LAG})"
+}
+
+# --transcode writes through ${MOUNT}, so check its client before anything
+# changes: a refused run then leaves the pool and layouts as they were.
+if [ "$SKIP_TRANSCODE" = false ] && [ -n "$TRANSCODE_PATH" ]; then
+    if [ "$DRY_RUN" = false ]; then
+        check_map_lag
+    elif [ "$MAX_MAP_LAG" != any ]; then
+        NOW_LAG=$(map_lag "${MOUNT}")
+        log_info "Would check that the client behind '${MOUNT}' is within ${MAX_MAP_LAG} osdmaps of the cluster (now: ${NOW_LAG:-unreadable})"
+    fi
+fi
+
 # --- Pool setup --------------------------------------------------------------
 if [ "$SKIP_POOL_SETUP" = false ]; then
 
@@ -511,41 +561,6 @@ layout_mount_args() {
     } END { if (src != "") print src, keep }' /proc/self/mounts
 }
 
-# Prints how many osdmap epochs the kernel client behind mount $1 is behind
-# the cluster, or nothing when that can't be read: no debugfs, or a kernel
-# without the ceph.client_id and ceph.cluster_fsid xattrs.
-map_lag() {
-    local client fsid have cur
-    client=$(getfattr -n ceph.client_id --only-values "$1" 2>/dev/null) || return 0
-    fsid=$(getfattr -n ceph.cluster_fsid --only-values "$1" 2>/dev/null) || return 0
-    have=$(awk 'NR == 1 && $1 == "epoch" { print $2 }' \
-        "/sys/kernel/debug/ceph/${fsid}.${client}/osdmap" 2>/dev/null)
-    cur=$(ceph osd dump 2>/dev/null | awk '$1 == "epoch" { print $2; exit }')
-    if [[ "$have" =~ ^[0-9]+$ && "$cur" =~ ^[0-9]+$ ]]; then echo $(( cur - have )); fi
-}
-
-# Exits unless the client behind ${MOUNT} is within --max-map-lag maps of the
-# cluster. Its first write to the new pool would otherwise make one mon send
-# it every map since its own, as in the layout step above.
-check_map_lag() {
-    local lag
-    [ "$MAX_MAP_LAG" = any ] && { log_warn "Skipping the osdmap check of '${MOUNT}' (--max-map-lag any)"; return 0; }
-    lag=$(map_lag "${MOUNT}")
-    if [ -z "$lag" ]; then
-        log_err "Can't read the osdmap epoch of the client behind '${MOUNT}'"
-        log_err "(needs debugfs at /sys/kernel/debug and the ceph.client_id xattr)."
-        log_err "Check it by hand, then re-run with --max-map-lag any."
-        exit 1
-    elif (( lag > MAX_MAP_LAG )); then
-        log_err "The client behind '${MOUNT}' is ${lag} osdmaps behind the cluster (limit ${MAX_MAP_LAG})."
-        log_err "Its first write to '${POOL_NAME}' would make one mon send it all of them."
-        log_err "Unmount '${MOUNT}' and any other mount on this host that shares its client,"
-        log_err "let autofs mount it again (a new client gets only the current map), and re-run."
-        exit 1
-    fi
-    log_info "The client behind '${MOUNT}' is ${lag} osdmaps behind the cluster (limit ${MAX_MAP_LAG})"
-}
-
 if [ "$SKIP_LAYOUT" = false ]; then
 
     # Where the layout commands act: the private mount when executing, ${MOUNT}
@@ -644,12 +659,6 @@ if [ "$SKIP_TRANSCODE" = false ]; then
             TRANSCODER_ARGS+=(--log-file "${LOG_FILE}")
         fi
 
-        if [ "$DRY_RUN" = false ]; then
-            check_map_lag
-        elif [ "$MAX_MAP_LAG" != any ]; then
-            NOW_LAG=$(map_lag "${MOUNT}")
-            log_info "Would check that the client behind '${MOUNT}' is within ${MAX_MAP_LAG} osdmaps of the cluster (now: ${NOW_LAG:-unreadable})"
-        fi
         run "${TRANSCODER_ARGS[@]}"
 
         echo ""
