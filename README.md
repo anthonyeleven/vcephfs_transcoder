@@ -185,7 +185,15 @@ Run the setup script without `--skip-layout`. It also makes
 `/mnt/myvol/tmp` on the old pool and points the root's layout at the new
 pool, so every new file, small ones included, lands there. That needs the volume
 mounted on the setup host as a CephX user with the `p` cap, besides the admin
-keyring. The transcoder then moves files to their directories' layouts, with no
+keyring. The layout commands run through a short-lived private mount of the
+volume that the script makes for them (same source and user, `noshare`), which
+starts with the current osdmap however long the shared mount has been idle, so
+that user's keyring must be in `/etc/ceph` too. That covers the layout step
+only: every other client catches up on its osdmap the first time it writes to
+the new pool, so remount long-idle mounts of the volume before changing its
+root. With `--transcode`, the script refuses to start when the client behind
+`--mount` is more than `--max-map-lag` maps behind (default 1000), and a layout
+run without it warns about that client. The transcoder then moves files to their directories' layouts, with no
 `--target-pool`:
 
 ```
@@ -795,6 +803,10 @@ Options:
   --skip-pool-setup      Skip pool creation (already done)
   --skip-layout          Skip layout / setfattr steps
   --transcode            Run the transcoder (off by default)
+  --max-map-lag N        Refuse --transcode when the client behind --mount
+                         is more than N osdmaps behind the cluster, and
+                         warn on a layout run without it (default: 1000).
+                         "any" skips the check.
   --execute              Actually run commands (default: dry-run)
   --help                 Show this help
 ```
