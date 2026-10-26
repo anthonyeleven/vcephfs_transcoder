@@ -192,7 +192,8 @@ that user's keyring must be in `/etc/ceph` too. That covers the layout step
 only: every other client catches up on its osdmap the first time it writes to
 the new pool, so remount long-idle mounts of the volume before changing its
 root. With `--transcode`, the script refuses to start when the client behind
-`--mount` is more than `--max-map-lag` maps behind (default 1000). The transcoder then moves files to their directories' layouts, with no
+`--mount` is more than `--max-map-lag` maps behind (default 1000), and a layout
+run without it warns about that client. The transcoder then moves files to their directories' layouts, with no
 `--target-pool`:
 
 ```
@@ -803,8 +804,9 @@ Options:
   --skip-layout          Skip layout / setfattr steps
   --transcode            Run the transcoder (off by default)
   --max-map-lag N        Refuse --transcode when the client behind --mount
-                         is more than N osdmaps behind the cluster
-                         (default: 1000). "any" skips the check.
+                         is more than N osdmaps behind the cluster, and
+                         warn on a layout run without it (default: 1000).
+                         "any" skips the check.
   --execute              Actually run commands (default: dry-run)
   --help                 Show this help
 ```

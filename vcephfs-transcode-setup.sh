@@ -25,6 +25,7 @@
 #     the user's keyring here) instead of acting through --mount.
 #   - --transcode writes through --mount, so it first checks that the
 #     kernel client behind it is not far behind on osdmaps (needs debugfs).
+#     A layout run without --transcode only warns about that client.
 #     Other hosts' idle mounts of the volume are not checked: once the root
 #     points at the new pool, each one catches up on its first write there,
 #     so remount any that have sat idle for weeks before changing the root.
@@ -70,8 +71,9 @@
 #   --skip-layout          Skip layout / setfattr steps
 #   --transcode            Run the transcoder (off by default)
 #   --max-map-lag N        Refuse --transcode when the client behind --mount
-#                          is more than N osdmaps behind the cluster
-#                          (default: 1000). "any" skips the check.
+#                          is more than N osdmaps behind the cluster, and
+#                          warn on a layout run without it (default: 1000).
+#                          "any" skips the check.
 #   --execute              Actually run commands (default: dry-run)
 #   --help                 Show this help
 #
@@ -418,8 +420,10 @@ map_lag() {
         cur=$(ceph $id osd dump 2>/dev/null | awk '$1 == "epoch" { print $2; exit }')
         [[ "$cur" =~ ^[0-9]+$ ]] && break
     done
-    if ! [[ "${cur:-}" =~ ^[0-9]+$ ]]; then
-        echo "unreadable: 'ceph${user:+ -n client.${user}} osd dump' failed or names another cluster than ${fsid}"
+    if ! [[ "${cur:-}" =~ ^[0-9]+$ ]] && [ -n "$user" ]; then
+        echo "unreadable: 'ceph -n client.${user} osd dump' and 'ceph osd dump' both failed or name another cluster than ${fsid}"
+    elif ! [[ "${cur:-}" =~ ^[0-9]+$ ]]; then
+        echo "unreadable: 'ceph osd dump' failed or names another cluster than ${fsid}"
     elif (( cur < have )); then
         echo "unreadable: the client reports epoch ${have}, newer than the cluster's ${cur}"
     else
@@ -429,11 +433,25 @@ map_lag() {
 
 # Exits unless the client behind ${MOUNT} is within --max-map-lag maps of the
 # cluster. Its first write to the new pool would otherwise make one mon send
-# it every map since its own (see the layout step below).
+# it every map since its own (see the layout step below). With "warn" it only
+# warns.
 check_map_lag() {
     local lag
     [ "$MAX_MAP_LAG" = any ] && { log_warn "Skipping the osdmap check of '${MOUNT}' (--max-map-lag any)"; return 0; }
     lag=$(map_lag "${MOUNT}")
+    if [ "${1:-}" = warn ]; then
+        if ! [[ "$lag" =~ ^[0-9]+$ ]]; then
+            log_warn "Can't tell how far behind the client behind '${MOUNT}' is: ${lag#unreadable: }."
+        elif (( lag > MAX_MAP_LAG )); then
+            log_warn "The client behind '${MOUNT}' is ${lag} osdmaps behind the cluster (limit ${MAX_MAP_LAG})."
+            log_warn "Its first write to '${POOL_NAME}' would make one mon send it all of them."
+            log_warn "Before writing under '${MOUNT}', unmount it and any other mount on this"
+            log_warn "host that shares its client, and let autofs mount it again."
+        else
+            log_info "The client behind '${MOUNT}' is ${lag} osdmaps behind the cluster (limit ${MAX_MAP_LAG})"
+        fi
+        return 0
+    fi
     if ! [[ "$lag" =~ ^[0-9]+$ ]]; then
         log_err "Can't tell how far behind the client behind '${MOUNT}' is: ${lag#unreadable: }."
         log_err "Fix that, or check the client's epoch by hand and re-run with --max-map-lag any."
@@ -449,7 +467,9 @@ check_map_lag() {
 }
 
 # --transcode writes through ${MOUNT}, so check its client before anything
-# changes: a refused run then leaves the pool and layouts as they were.
+# changes: a refused run then leaves the pool and layouts as they were. A
+# layout run without --transcode writes nothing there, but the next write
+# through ${MOUNT} after it will, so that run only warns.
 if [ "$SKIP_TRANSCODE" = false ] && [ -n "$TRANSCODE_PATH" ]; then
     if [ "$DRY_RUN" = false ]; then
         check_map_lag
@@ -457,6 +477,8 @@ if [ "$SKIP_TRANSCODE" = false ] && [ -n "$TRANSCODE_PATH" ]; then
         NOW_LAG=$(map_lag "${MOUNT}")
         log_info "Would check that the client behind '${MOUNT}' is within ${MAX_MAP_LAG} osdmaps of the cluster (now: ${NOW_LAG})"
     fi
+elif [ "$SKIP_LAYOUT" = false ]; then
+    check_map_lag warn
 fi
 
 # --- Pool setup --------------------------------------------------------------
