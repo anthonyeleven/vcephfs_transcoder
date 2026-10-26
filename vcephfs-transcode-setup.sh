@@ -274,7 +274,7 @@ require_arg MOUNT
 [[ "$PG_NUM" =~ ^[1-9][0-9]*$ ]] || { log_err "--pg-num must be a positive integer"; exit 1; }
 (( (PG_NUM & (PG_NUM - 1)) == 0 )) || { log_err "--pg-num must be a power of 2 (got ${PG_NUM})"; exit 1; }
 [[ "$PG_AUTOSCALE_MODE" =~ ^(on|off|warn)$ ]] || { log_err "--pg-autoscale-mode must be 'on', 'off', or 'warn'"; exit 1; }
-[[ "$MAX_MAP_LAG" =~ ^([0-9]+|any)$ ]] || { log_err "--max-map-lag must be a number or 'any'"; exit 1; }
+[[ "$MAX_MAP_LAG" =~ ^(0|[1-9][0-9]*|any)$ ]] || { log_err "--max-map-lag must be a number or 'any'"; exit 1; }
 
 # Derive volume name from the last component of the mount path
 # e.g. /shared/cephlab/howie -> howie
@@ -396,18 +396,33 @@ if [ "$DRY_RUN" = false ] && ! mountpoint -q "${MOUNT}"; then
 fi
 
 # Prints how many osdmap epochs the kernel client behind mount $1 is behind
-# the cluster, or nothing when that can't be read: no debugfs, a kernel
-# without the ceph.client_id and ceph.cluster_fsid xattrs, or a local ceph
-# CLI that talks to another cluster.
+# the cluster, or "unreadable: <why>" when that can't be read. The ceph CLI
+# runs as the mount's own user (its name= option), whose keyring mount.ceph
+# already needs here, and falls back to the CLI's default user.
 map_lag() {
-    local client fsid have cur
-    client=$(getfattr -n ceph.client_id --only-values "$1" 2>/dev/null) || return 0
-    fsid=$(getfattr -n ceph.cluster_fsid --only-values "$1" 2>/dev/null) || return 0
-    [ "$fsid" = "$(ceph fsid 2>/dev/null)" ] || return 0
+    local client fsid have cur user id
+    client=$(getfattr -n ceph.client_id --only-values "$1" 2>/dev/null) ||
+        { echo "unreadable: no ceph.client_id xattr on $1"; return 0; }
+    fsid=$(getfattr -n ceph.cluster_fsid --only-values "$1" 2>/dev/null) ||
+        { echo "unreadable: no ceph.cluster_fsid xattr on $1"; return 0; }
     have=$(awk 'NR == 1 && $1 == "epoch" { print $2 }' \
         "/sys/kernel/debug/ceph/${fsid}.${client}/osdmap" 2>/dev/null)
-    cur=$(ceph osd dump 2>/dev/null | awk '$1 == "epoch" { print $2; exit }')
-    if [[ "$have" =~ ^[0-9]+$ && "$cur" =~ ^[0-9]+$ ]] && (( cur >= have )); then
+    [[ "$have" =~ ^[0-9]+$ ]] ||
+        { echo "unreadable: can't read /sys/kernel/debug/ceph/${fsid}.${client}/osdmap (debugfs mounted?)"; return 0; }
+    user=$(awk -v m="$1" '{ p = $2; gsub(/\\040/, " ", p) } p == m && $3 == "ceph" {
+        n = split($4, o, ","); for (i = 1; i <= n; i++) if (o[i] ~ /^name=/) print substr(o[i], 6) }' /proc/self/mounts)
+    for id in ${user:+"-n client.${user}"} ""; do
+        # shellcheck disable=SC2086
+        [ "$(ceph $id fsid 2>/dev/null)" = "$fsid" ] || continue
+        # shellcheck disable=SC2086
+        cur=$(ceph $id osd dump 2>/dev/null | awk '$1 == "epoch" { print $2; exit }')
+        [[ "$cur" =~ ^[0-9]+$ ]] && break
+    done
+    if ! [[ "${cur:-}" =~ ^[0-9]+$ ]]; then
+        echo "unreadable: 'ceph${user:+ -n client.${user}} osd dump' failed or names another cluster than ${fsid}"
+    elif (( cur < have )); then
+        echo "unreadable: the client reports epoch ${have}, newer than the cluster's ${cur}"
+    else
         echo $(( cur - have ))
     fi
 }
@@ -419,10 +434,9 @@ check_map_lag() {
     local lag
     [ "$MAX_MAP_LAG" = any ] && { log_warn "Skipping the osdmap check of '${MOUNT}' (--max-map-lag any)"; return 0; }
     lag=$(map_lag "${MOUNT}")
-    if [ -z "$lag" ]; then
-        log_err "Can't read the osdmap epoch of the client behind '${MOUNT}'"
-        log_err "(needs debugfs at /sys/kernel/debug and the ceph.client_id xattr)."
-        log_err "Check it by hand, then re-run with --max-map-lag any."
+    if ! [[ "$lag" =~ ^[0-9]+$ ]]; then
+        log_err "Can't tell how far behind the client behind '${MOUNT}' is: ${lag#unreadable: }."
+        log_err "Fix that, or check the client's epoch by hand and re-run with --max-map-lag any."
         exit 1
     elif (( lag > MAX_MAP_LAG )); then
         log_err "The client behind '${MOUNT}' is ${lag} osdmaps behind the cluster (limit ${MAX_MAP_LAG})."
@@ -441,7 +455,7 @@ if [ "$SKIP_TRANSCODE" = false ] && [ -n "$TRANSCODE_PATH" ]; then
         check_map_lag
     elif [ "$MAX_MAP_LAG" != any ]; then
         NOW_LAG=$(map_lag "${MOUNT}")
-        log_info "Would check that the client behind '${MOUNT}' is within ${MAX_MAP_LAG} osdmaps of the cluster (now: ${NOW_LAG:-unreadable})"
+        log_info "Would check that the client behind '${MOUNT}' is within ${MAX_MAP_LAG} osdmaps of the cluster (now: ${NOW_LAG})"
     fi
 fi
 
